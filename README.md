@@ -248,7 +248,6 @@ and background derivation jobs is enough to start proving the contract.
 More detailed thinking lives under:
 
 - [`docs/core/what_and_why.md`](docs/core/what_and_why.md)
-- [`references/llm-aiops/janus_takeaways.md`](references/llm-aiops/janus_takeaways.md)
 
 ## License
 
@@ -256,4 +255,3 @@ License is not finalized yet.
 
 Until the project is ready for broader use, treat this repository as exploratory
 design and prototype work.
-
