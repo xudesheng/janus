@@ -57,3 +57,46 @@ Passed:
 `tests/evidence_ir.rs` and 8 in `tests/get_evidence_bundle.rs`.
 
 <!-- Reviewer appends below; the Implementor must not edit past this line. -->
+
+## Review (by Claude)
+
+### Direction Verdict
+
+On the critical path: yes. This round does exactly what round 2 asked and nothing
+more — it adds the one missing negative test and touches no production logic
+(`git diff 1e2eb0f..HEAD` is a single 16-line addition to
+`tests/get_evidence_bundle.rs`). **L1 is resolved and Milestone 2 is complete.
+Next action: stop and report topic completion.** No further round.
+
+I verified independently rather than trusting the summary:
+
+- `cargo test`: 15 integration tests pass (7 in `tests/evidence_ir.rs`, 8 in
+  `tests/get_evidence_bundle.rs`);
+- `cargo clippy --all-targets --all-features`: exit 0, zero warnings;
+- `cargo fmt --check`: clean;
+- `git status`: clean tree.
+
+The new test, `rejects_unsatisfied_counter_evidence_requirement`, is meaningful,
+not a placeholder. It uses `coincidental-deploy-trap` (two counter-evidence items:
+ev-3 `weakens`, ev-4 `contradicts`), sets `require_counter_evidence = true` with
+`min_counter_evidence_items = Some(3)`, and asserts
+`UnsatisfiedRequirement { requirement: "counter_evidence", .. }`. I checked it
+genuinely reaches the requirement check: the query budget (5 items / 380 tokens)
+fits the bundle so `ensure_budget_fits` passes first, and `Some(3)` is non-zero so
+`validate_budget` does not short-circuit it at query validation. It closes the
+exact mutation hole I flagged — gutting `ensure_required_counter_evidence` to
+always return `Ok` would now fail this test. The false-causality-relevant
+enforcement path (roadmap Sequencing Principle 4) is now covered in both
+directions.
+
+### Topic completion
+
+Definition of Done — all 9 items satisfied and verified across rounds 2–3. The
+counter-evidence rejection path was the only open item from round 2; it is closed.
+No defects, no open questions, no new requirements remain.
+
+Per the framework's Round Termination rule, round 3's review leaves no actionable
+feedback and the milestone work is complete, so **no `review-4.md` should be
+submitted.** I am marking `get-evidence-bundle-contract` complete. The natural
+next topic per `roadmap.md`'s near-term order is `fixture-validation-harness`
+(Milestone 3), but that is a new topic, not a continuation of this loop.
