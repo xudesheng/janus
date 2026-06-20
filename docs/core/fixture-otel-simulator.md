@@ -96,6 +96,23 @@ This topic should not add `opentelemetry-proto`, a network listener, or Collecto
 configuration. Those belong to real ingest. The simulator is allowed to be
 "OTel-shaped" rather than byte-exact OTLP, matching the fixture contract.
 
+## Incremental Replay Requirement
+
+The current hot store already has an all-at-once fixture loader. This topic
+should not make the simulator a thin wrapper around that loader. The simulator
+must build a replay plan and apply events to a fresh `HotContextStore` through an
+incremental ingest boundary.
+
+It is acceptable to use `HotContextStore::load_fixture_case` as a test oracle for
+full-replay compatibility, but not as the main replay implementation. Partial
+replay is a required behavior: before an event is ingested, source refs owned by
+that event should be missing; after the event is ingested, the same refs should
+be resolvable.
+
+This distinction is what makes the topic useful for later real ingest. A future
+OTLP receiver should be able to feed the same normalized ingest boundary without
+going through fixture-only batch loading.
+
 ## Event Model
 
 Introduce a replay event type with enough structure for deterministic tests and
@@ -177,6 +194,31 @@ key that Evidence IR uses today.
 
 This is the main reason the topic needs an ingest sink instead of only calling
 `HotContextStore::load_fixture_case`.
+
+## Trace And Span Handling
+
+Trace and span replay should follow the same incremental principle as metrics:
+records become resolvable as the relevant simulated event is ingested, not when
+the fixture file is first parsed.
+
+The stored source keys remain compatible with the current hot-store convention:
+
+```text
+trace record:
+  key=t-0001
+
+span record:
+  key=t-0001/s-3
+```
+
+The design should preserve these rules:
+
+- a span source ref does not resolve before that span's event is ingested;
+- a trace source ref resolves only after the trace has observed data;
+- full replay preserves the same trace and span lookup semantics as current
+  fixture loading;
+- trace aggregation can be simple and fixture-shaped for this topic, as long as
+  it does not hide partial-replay behavior.
 
 ## Hot-Store Ingest Boundary
 
@@ -263,6 +305,24 @@ Optional, useful if small:
 
 Do not add wall-clock sleeps in the minimum implementation. A deterministic
 logical clock is easier to test and more useful for review.
+
+## Suggested Implementation Slices After Design Approval
+
+No slice should start until reviewers agree on the design direction, or
+explicitly approve that slice in their `Direction Verdict`.
+
+If reviewers accept phase-by-phase implementation, the recommended slices are:
+
+1. Replay planning and dry-run output: deterministic event extraction, ordering,
+   sequence assignment, and event rendering without mutating a store.
+2. Hot-store ingest boundary: `HotIngestEvent`, incremental record insertion or
+   update behavior, metric-point accumulation, trace/span availability, and
+   partial-replay source-ref tests.
+3. Demo and validation surface: CLI summary, JSONL mode, bundle source-ref
+   validation after replay, and a smoke test.
+
+These are implementation slices only. The topic's Definition Of Done remains the
+full simulator contract below.
 
 ## Tests
 
