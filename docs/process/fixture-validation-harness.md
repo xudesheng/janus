@@ -185,7 +185,28 @@ When `scenario.expected` includes `evidence_bundle`, `expected.json` must includ
 This reuses Milestone 1 instead of duplicating Evidence IR validation. Any
 Evidence IR error should be reported with fixture id and JSON path context.
 
-### 4. Reference Index Construction
+### 4. Derived Artifact Shape And Vocabulary Validation
+
+The harness should validate lightweight shape and vocabulary rules for expected
+derived artifacts before source-reference closure. This catches drift between
+`fixtures.md` and the corpus without attempting to prove semantic correctness.
+
+Required checks for each registered fixture:
+
+- `relationships[*].type` is one of the relationship types listed in
+  `fixtures.md`;
+- `timeline[*].marker` is one of the marker values listed in `fixtures.md`,
+  including `data-gap`;
+- `anomaly_windows[*].signal` is a non-empty signal name, not a closed enum;
+- when `input.metrics` contains a series for the same `entity`, an
+  `anomaly_windows[*].signal` value should match that metric series `name`.
+
+The anomaly-window signal check is intentionally not a global vocabulary check:
+metric names are fixture data and will vary by scenario. A mismatch with present
+input metrics should be reported because it usually means the gold anomaly
+cannot be traced back to the fixture's telemetry.
+
+### 5. Reference Index Construction
 
 For each fixture, build a reference index from input and expected artifacts.
 Reference validation should use actual ids from JSON, not naming guesses.
@@ -215,7 +236,7 @@ The index should record both the raw ref string and its source category. This
 lets the validator produce useful messages such as "found ref `lp-1` as a log
 pattern, but the source signal says `log`."
 
-### 5. Source Reference Validation
+### 6. Source Reference Validation
 
 The harness should validate known reference-bearing fields first:
 
@@ -252,10 +273,23 @@ Evidence IR enum has `log_pattern`, so the long-term clean form should be
 `signal: "log_pattern"` for derived pattern refs and `signal: "log"` for raw
 log records.
 
-### 6. Capability Exercise Checks
+The warning is a temporary compatibility state, not a permanent acceptance
+state. The issue report should count signal/ref mismatch warnings by category.
+Once the committed corpus has zero signal/ref mismatch warnings, any future
+mismatch should become a hard validation error in the same implementation round
+or the next review round. Milestone 3 should either clean current corpus
+mismatches or keep the warning path covered only by negative test fixtures.
+
+### 7. Capability Exercise Checks
 
 Each declared capability should have a minimal structural witness. The goal is
 not deep semantic proof; it is preventing empty capability declarations.
+
+A witness means the required key exists and is non-empty. Arrays must contain at
+least one item. Objects must contain the fields that make the artifact usable for
+that capability. For `token-budget-retrieval`, the witness is
+`expected.evidence_bundle.budget` with the required budget fields, not merely an
+empty `evidence_bundle` object.
 
 Suggested witness mapping:
 
@@ -279,7 +313,7 @@ Suggested witness mapping:
 If a capability lacks its witness, validation should fail because downstream
 tests will otherwise believe a scenario exercises behavior that is not present.
 
-### 7. Uncertainty And False-Causality Checks
+### 8. Uncertainty And False-Causality Checks
 
 Janus treats false causality and missing data as core failure modes. The harness
 should enforce this structurally:
@@ -298,7 +332,7 @@ should enforce this structurally:
 These checks should stay structural. They should not try to calculate true
 causality from telemetry.
 
-### 8. Coverage Report
+### 9. Coverage Report
 
 The harness should print a coverage report after validation:
 
