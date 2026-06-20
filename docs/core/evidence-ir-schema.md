@@ -26,6 +26,23 @@ The implementation topic should deliver:
 - tests that deserialize current fixture evidence bundles;
 - at least one serialized example bundle or evidence item.
 
+## Design Review Gate
+
+No Rust implementation should start for this topic until every active reviewer
+has agreed on the design direction in their `Direction Verdict`. Until then,
+review rounds for `evidence-ir-schema` are design-only or diagnosis-only rounds.
+
+After reviewer agreement, the implementation can land as one small milestone or
+as phase-by-phase review rounds:
+
+1. Rust Evidence IR types, enum vocabulary, and validation helpers.
+2. Narrow fixture loader plus tests against current `expected.json` bundles.
+3. Generated JSON Schema artifacts and repeatability tests.
+
+The phases are sequencing guidance, not separate product milestones. All three
+remain part of Milestone 1, and none should pull `EvidenceQuery`,
+`get_evidence_bundle`, MCP tools, or full fixture validation into this topic.
+
 ## Scope
 
 In scope for this topic:
@@ -212,6 +229,12 @@ Current fixtures use `trace`, `metric`, `log`, `change`, `anomaly_window`,
 
 External backend pointers can use `external` later, but source resolution is not
 part of this milestone.
+
+Fixture compatibility note: current fixtures sometimes use `signal: "log"` with
+refs to log-pattern ids such as `lp-1`. Milestone 1 should accept that current
+shape unless reviewers explicitly choose a fixture migration. The `log_pattern`
+signal value is reserved for a more precise future split, not a reason to churn
+fixtures during the first executable contract.
 
 ### `EvidenceBudget`
 
@@ -434,4 +457,3 @@ The review for this topic should focus on:
   that current fixtures need unnecessary churn;
 - whether the fixture loader stays narrow and does not pull Milestone 3 forward;
 - whether schema generation is repeatable and testable.
-
