@@ -13,7 +13,7 @@ ROLE_IMPLEMENTOR = "codex"   # writes {TOPIC}-review-{n+1}.md
 ROLE_REVIEWERS = "claude"
 
 # Review-doc topic: files are {TOPIC}-review-{n}.md under docs/under-review.
-TOPIC = "sample"
+TOPIC = "get-evidence-bundle-contract"
 
 # Repo the loop drives. If omitted, the current working directory is used.
 # TOML literal strings (single quotes) need no backslash escaping on Windows.
