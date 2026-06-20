@@ -1,5 +1,6 @@
 use janus::{
-    evidence::{EvidenceDirection, EvidenceKind, TimeWindow},
+    evidence::{EvidenceBundle, EvidenceDirection, EvidenceKind, TimeWindow},
+    fixture_validation::{FixtureCase, FixtureCorpus},
     fixtures::load_bundle_by_scenario_id,
     query::{
         EvidenceQuery, EvidenceQueryBudget, EvidenceQueryIntent, FreshnessPreference,
@@ -140,6 +141,71 @@ fn serializes_returned_bundle_to_json() {
 }
 
 #[test]
+fn store_aware_path_resolves_source_refs_for_all_current_fixtures() {
+    let corpus = FixtureCorpus::load(repo_root()).unwrap();
+
+    for case in &corpus.cases {
+        let bundle = get_evidence_bundle(query_for_case(case)).unwrap_or_else(|error| {
+            panic!(
+                "get_evidence_bundle failed for {}: {error}",
+                case.registry_entry.id
+            )
+        });
+        let expected: EvidenceBundle =
+            serde_json::from_value(case.expected["evidence_bundle"].clone()).unwrap();
+
+        assert_eq!(bundle, expected);
+    }
+}
+
+#[test]
+fn entity_selector_is_checked_without_rewriting_gold_bundle() {
+    let mut query = deploy_bad_rollout_query();
+    query.entities = vec!["service:checkout".to_string()];
+
+    let bundle = get_evidence_bundle(query).unwrap();
+    let expected = load_bundle_by_scenario_id("deploy-bad-rollout").unwrap();
+
+    assert_eq!(bundle, expected);
+}
+
+#[test]
+fn query_time_and_entity_must_match_same_hot_context_record() {
+    let mut query = deploy_bad_rollout_query();
+    query.time_window = TimeWindow {
+        start: "2026-06-01T14:03:20Z".to_string(),
+        end: "2026-06-01T14:03:22Z".to_string(),
+    };
+    query.entities = vec!["res:api-gateway".to_string()];
+
+    let error = get_evidence_bundle(query).unwrap_err();
+
+    assert!(matches!(
+        error,
+        GetEvidenceBundleError::UnsatisfiedRequirement {
+            requirement: "hot_context_time_window_entities",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn query_entity_without_hot_context_match_fails() {
+    let mut query = deploy_bad_rollout_query();
+    query.entities = vec!["service:not-present".to_string()];
+
+    let error = get_evidence_bundle(query).unwrap_err();
+
+    assert!(matches!(
+        error,
+        GetEvidenceBundleError::UnsatisfiedRequirement {
+            requirement: "hot_context_entities",
+            ..
+        }
+    ));
+}
+
+#[test]
 fn query_schema_requires_core_fields_not_fixture_selector() {
     let schema = serde_json::to_value(evidence_query_schema()).unwrap();
     let required = schema
@@ -151,6 +217,32 @@ fn query_schema_requires_core_fields_not_fixture_selector() {
     assert!(required.iter().any(|value| value == "time_window"));
     assert!(required.iter().any(|value| value == "budget"));
     assert!(!required.iter().any(|value| value == "scenario_id"));
+}
+
+fn repo_root() -> &'static std::path::Path {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn query_for_case(case: &FixtureCase) -> EvidenceQuery {
+    EvidenceQuery {
+        intent: EvidenceQueryIntent {
+            question: Some(case.manifest.question.clone()),
+            hypothesis: None,
+        },
+        time_window: serde_json::from_value(case.manifest.time_window.clone()).unwrap(),
+        budget: EvidenceQueryBudget {
+            max_items: 50,
+            max_tokens: 10_000,
+            min_counter_evidence_items: None,
+            reserve_tokens_for_raw_refs: None,
+        },
+        scenario_id: Some(case.registry_entry.id.clone()),
+        entities: Vec::new(),
+        require_counter_evidence: false,
+        require_raw_refs: true,
+        freshness: FreshnessPreference::Any,
+        privacy_scope: None,
+    }
 }
 
 fn deploy_bad_rollout_query() -> EvidenceQuery {
