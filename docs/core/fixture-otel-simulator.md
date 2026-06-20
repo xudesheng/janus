@@ -159,14 +159,20 @@ invent source ids that differ from fixture conventions.
 Replay order should be deterministic:
 
 1. preload records without event time, such as resources, before timed records;
-2. order timed records by comparable fixture timestamp strings;
+2. order timed records by normalized UTC fixture timestamp keys;
 3. use fixture file order as the stable tie-breaker;
 4. use event `sequence` as the final tie-breaker.
 
-The current fixtures use UTC RFC3339-like strings that compare lexicographically.
-This topic can keep that convention rather than adding a time library. If a
-future fixture needs offsets, fractional formats, or one-sided windows, that
-should be a separate timestamp-normalization topic.
+The current fixtures use UTC RFC3339-like strings with a `Z` suffix and optional
+fractional seconds. Replay planning should normalize those forms for ordering
+while preserving the original timestamp string on the emitted event. If a future
+fixture needs offsets or one-sided windows, that should be a separate timestamp
+normalization topic.
+
+Tests should assert that produced plans are monotonic when timestamps are parsed
+for the current fixture corpus. Before adding time-slicing features such as
+`--until`, any broader timestamp formats should be normalized or rejected rather
+than relying on accidental lexical order.
 
 Suggested event timing:
 
@@ -179,6 +185,10 @@ Suggested event timing:
 - prior incidents: preload, or `first_seen` if the simulator is running a
   warm-context scenario;
 - telemetry gaps: gap `start`, carrying the full gap payload.
+
+For this topic, timed signal events are invalid if the required timestamp field
+is missing. Prior incidents are the exception in the current corpus because they
+may represent warm-context memory instead of a replay-time signal.
 
 ## Metric Handling
 
@@ -234,6 +244,9 @@ The design should preserve these rules:
 
 - the `Trace` event makes the trace source key resolvable and should be emitted
   when the trace first has observable data, normally the earliest span time;
+- if a trace has no span start time, including an empty `spans` array, the
+  trace event uses a trace-level `start` field when present; otherwise it is an
+  untimed preload event;
 - a span source ref does not resolve before that span's event is ingested;
 - full replay preserves the same trace and span lookup semantics as current
   fixture loading;
@@ -251,7 +264,7 @@ pub enum HotIngestEvent {
     Resource(serde_json::Value),
     Trace(serde_json::Value),
     Span { trace_id: String, payload: serde_json::Value },
-    MetricPoint { series: MetricSeriesKey, point: serde_json::Value },
+    MetricPoint { series: MetricSeriesKey, payload: serde_json::Value },
     Log(serde_json::Value),
     Change(serde_json::Value),
     PriorIncident(serde_json::Value),
@@ -319,6 +332,8 @@ Minimum useful behavior:
 - `--dry-run` prints event order without mutating the store;
 - `--jsonl` prints one event per line as JSON for inspection or later scripts.
 
+`--dry-run` and `--jsonl` are mutually exclusive render modes.
+
 Optional, useful if small:
 
 - `--until <timestamp>` replays only through a simulated time;
@@ -366,6 +381,10 @@ the old fixture loader:
 
 The partial replay tests are important. They prove this is a stream simulator,
 not just another all-at-once fixture loader.
+
+Implementation slices may prove raw source refs before the final demo validation
+slice. Derived evidence refs, such as anomaly windows and log patterns, still
+need the final validation path to prove the full Definition Of Done.
 
 ## Definition Of Done
 

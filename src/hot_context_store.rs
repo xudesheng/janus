@@ -5,7 +5,7 @@ use crate::{
         RefCategory, categories_for_signal, metric_series_ref, resolve_ref_map, span_ref,
     },
 };
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::{
     collections::BTreeMap,
     fmt,
@@ -45,6 +45,42 @@ pub struct StoredRecord {
     pub time_window: Option<TimeWindow>,
     pub entities: Vec<String>,
     pub payload: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetricSeriesKey {
+    name: String,
+    entity: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum HotIngestEvent {
+    Resource(Value),
+    Trace(Value),
+    Span {
+        trace_id: String,
+        payload: Value,
+    },
+    MetricPoint {
+        series: MetricSeriesKey,
+        payload: Value,
+    },
+    Log(Value),
+    Change(Value),
+    PriorIncident(Value),
+    TelemetryGap(Value),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IngestOutcome {
+    Inserted {
+        kind: StoredRecordKind,
+        key: SourceKey,
+    },
+    Updated {
+        kind: StoredRecordKind,
+        key: SourceKey,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -169,6 +205,27 @@ impl SourceKey {
     }
 }
 
+impl MetricSeriesKey {
+    pub fn new(name: impl Into<String>, entity: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            entity: entity.into(),
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn entity(&self) -> &str {
+        &self.entity
+    }
+
+    fn source_key(&self) -> SourceKey {
+        SourceKey::new(metric_series_ref(&self.name, &self.entity))
+    }
+}
+
 impl HotContextStore {
     pub fn new() -> Self {
         Self::default()
@@ -188,6 +245,69 @@ impl HotContextStore {
 
     pub fn insert_record(&mut self, record: StoredRecord) -> Result<(), HotStoreError> {
         self.insert_record_with_context(record, None, None, None)
+    }
+
+    pub fn ingest(&mut self, event: HotIngestEvent) -> Result<IngestOutcome, HotStoreError> {
+        match event {
+            HotIngestEvent::Resource(payload) => self.ingest_record(
+                StoredRecordKind::Resource,
+                required_str("ingest", ingest_path(), &payload, "$", "id")?.to_string(),
+                None,
+                Vec::new(),
+                payload,
+            ),
+            HotIngestEvent::Trace(payload) => {
+                let trace_id = required_str("ingest", ingest_path(), &payload, "$", "trace_id")?;
+                self.ingest_record(
+                    StoredRecordKind::Trace,
+                    trace_id.to_string(),
+                    trace_time_window("ingest", ingest_path(), &payload, "$")?,
+                    trace_entities(&payload),
+                    payload,
+                )
+            }
+            HotIngestEvent::Span { trace_id, payload } => {
+                let span_id = required_str("ingest", ingest_path(), &payload, "$", "span_id")?;
+                self.ingest_record(
+                    StoredRecordKind::Span,
+                    span_ref(&trace_id, span_id),
+                    time_window_from_start_end("ingest", ingest_path(), &payload, "$")?,
+                    entities_from_common_fields(&payload),
+                    payload,
+                )
+            }
+            HotIngestEvent::MetricPoint { series, payload } => {
+                self.ingest_metric_point(series, payload)
+            }
+            HotIngestEvent::Log(payload) => self.ingest_record(
+                StoredRecordKind::Log,
+                required_str("ingest", ingest_path(), &payload, "$", "id")?.to_string(),
+                time_window_from_t("ingest", ingest_path(), &payload, "$")?,
+                entities_from_common_fields(&payload),
+                payload,
+            ),
+            HotIngestEvent::Change(payload) => self.ingest_record(
+                StoredRecordKind::Change,
+                required_str("ingest", ingest_path(), &payload, "$", "id")?.to_string(),
+                time_window_from_t("ingest", ingest_path(), &payload, "$")?,
+                entities_from_common_fields(&payload),
+                payload,
+            ),
+            HotIngestEvent::PriorIncident(payload) => self.ingest_record(
+                StoredRecordKind::PriorIncident,
+                required_str("ingest", ingest_path(), &payload, "$", "id")?.to_string(),
+                time_window_from_first_seen("ingest", ingest_path(), &payload, "$")?,
+                entities_from_common_fields(&payload),
+                payload,
+            ),
+            HotIngestEvent::TelemetryGap(payload) => self.ingest_record(
+                StoredRecordKind::TelemetryGap,
+                required_str("ingest", ingest_path(), &payload, "$", "id")?.to_string(),
+                time_window_from_start_end("ingest", ingest_path(), &payload, "$")?,
+                entities_from_common_fields(&payload),
+                payload,
+            ),
+        }
     }
 
     pub fn resolve_source_ref(&self, source_ref: &SourceRef) -> SourceResolution<'_> {
@@ -593,6 +713,92 @@ impl HotContextStore {
         )
     }
 
+    fn ingest_record(
+        &mut self,
+        kind: StoredRecordKind,
+        key: String,
+        time_window: Option<TimeWindow>,
+        entities: Vec<String>,
+        payload: Value,
+    ) -> Result<IngestOutcome, HotStoreError> {
+        let record = StoredRecord {
+            key: SourceKey::new(key),
+            kind,
+            time_window,
+            entities,
+            payload,
+        };
+        let outcome = IngestOutcome::Inserted {
+            kind: record.kind,
+            key: record.key.clone(),
+        };
+
+        self.insert_record(record)?;
+
+        Ok(outcome)
+    }
+
+    fn ingest_metric_point(
+        &mut self,
+        series: MetricSeriesKey,
+        payload: Value,
+    ) -> Result<IngestOutcome, HotStoreError> {
+        let key = series.source_key();
+        let (metadata, point) = metric_point_parts(&series, &payload)?;
+        let point_window = point_time_window(&point)?;
+        let primary_key = (StoredRecordKind::MetricSeries, key.clone());
+
+        if let Some(index) = self.primary_keys.get(&primary_key).copied() {
+            let record = &mut self.records[index];
+            let existing_metadata = metric_series_metadata(&record.payload)?;
+
+            if existing_metadata != metadata {
+                return Err(HotStoreError::DuplicatePrimaryKey {
+                    fixture_id: Some("ingest".to_string()),
+                    file_path: Some(ingest_path().to_path_buf()),
+                    json_path: Some("$".to_string()),
+                    kind: StoredRecordKind::MetricSeries,
+                    key,
+                });
+            }
+
+            let points = record
+                .payload
+                .get_mut("points")
+                .and_then(Value::as_array_mut)
+                .ok_or_else(|| HotStoreError::InvalidShape {
+                    fixture_id: "ingest".to_string(),
+                    file_path: ingest_path().to_path_buf(),
+                    json_path: "$.points".to_string(),
+                    message: "must be an array".to_string(),
+                })?;
+            points.push(point);
+            record.time_window = Some(merge_time_window(record.time_window.clone(), point_window));
+
+            return Ok(IngestOutcome::Updated {
+                kind: StoredRecordKind::MetricSeries,
+                key,
+            });
+        }
+
+        let mut record_payload = Value::Object(metadata);
+        record_payload["points"] = Value::Array(vec![point]);
+        let record = StoredRecord {
+            key: key.clone(),
+            kind: StoredRecordKind::MetricSeries,
+            time_window: Some(point_window),
+            entities: vec![series.entity().to_string()],
+            payload: record_payload,
+        };
+
+        self.insert_record(record)?;
+
+        Ok(IngestOutcome::Inserted {
+            kind: StoredRecordKind::MetricSeries,
+            key,
+        })
+    }
+
     fn insert_record_with_context(
         &mut self,
         record: StoredRecord,
@@ -992,6 +1198,109 @@ fn metric_time_window(
     }))
 }
 
+fn metric_point_parts(
+    series: &MetricSeriesKey,
+    payload: &Value,
+) -> Result<(Map<String, Value>, Value), HotStoreError> {
+    let object = payload
+        .as_object()
+        .ok_or_else(|| HotStoreError::InvalidShape {
+            fixture_id: "ingest".to_string(),
+            file_path: ingest_path().to_path_buf(),
+            json_path: "$".to_string(),
+            message: "metric point payload must be an object".to_string(),
+        })?;
+    let point = object
+        .get("point")
+        .cloned()
+        .ok_or_else(|| HotStoreError::MissingField {
+            fixture_id: "ingest".to_string(),
+            file_path: ingest_path().to_path_buf(),
+            json_path: "$".to_string(),
+            field: "point",
+        })?;
+    let mut metadata = object.clone();
+    metadata.remove("point");
+    ensure_metric_identity(series, &metadata)?;
+
+    Ok((metadata, point))
+}
+
+fn metric_series_metadata(payload: &Value) -> Result<Map<String, Value>, HotStoreError> {
+    let object = payload
+        .as_object()
+        .ok_or_else(|| HotStoreError::InvalidShape {
+            fixture_id: "ingest".to_string(),
+            file_path: ingest_path().to_path_buf(),
+            json_path: "$".to_string(),
+            message: "metric series payload must be an object".to_string(),
+        })?;
+    let mut metadata = object.clone();
+    metadata.remove("points");
+
+    Ok(metadata)
+}
+
+fn ensure_metric_identity(
+    series: &MetricSeriesKey,
+    metadata: &Map<String, Value>,
+) -> Result<(), HotStoreError> {
+    match metadata.get("name").and_then(Value::as_str) {
+        Some(name) if name == series.name() => {}
+        Some(_) => {
+            return Err(HotStoreError::InvalidShape {
+                fixture_id: "ingest".to_string(),
+                file_path: ingest_path().to_path_buf(),
+                json_path: "$.name".to_string(),
+                message: "must match metric series name".to_string(),
+            });
+        }
+        None => {
+            return Err(HotStoreError::MissingField {
+                fixture_id: "ingest".to_string(),
+                file_path: ingest_path().to_path_buf(),
+                json_path: "$".to_string(),
+                field: "name",
+            });
+        }
+    }
+
+    match metadata.get("entity").and_then(Value::as_str) {
+        Some(entity) if entity == series.entity() => Ok(()),
+        Some(_) => Err(HotStoreError::InvalidShape {
+            fixture_id: "ingest".to_string(),
+            file_path: ingest_path().to_path_buf(),
+            json_path: "$.entity".to_string(),
+            message: "must match metric series entity".to_string(),
+        }),
+        None => Err(HotStoreError::MissingField {
+            fixture_id: "ingest".to_string(),
+            file_path: ingest_path().to_path_buf(),
+            json_path: "$".to_string(),
+            field: "entity",
+        }),
+    }
+}
+
+fn point_time_window(point: &Value) -> Result<TimeWindow, HotStoreError> {
+    let timestamp = required_str("ingest", ingest_path(), point, "$.point", "t")?;
+
+    Ok(TimeWindow {
+        start: timestamp.to_string(),
+        end: timestamp.to_string(),
+    })
+}
+
+fn merge_time_window(existing: Option<TimeWindow>, next: TimeWindow) -> TimeWindow {
+    match existing {
+        Some(existing) => TimeWindow {
+            start: existing.start.min(next.start),
+            end: existing.end.max(next.end),
+        },
+        None => next,
+    }
+}
+
 fn ensure_object(
     fixture_id: &str,
     file_path: &Path,
@@ -1105,4 +1414,8 @@ fn record_overlaps_window(record: &StoredRecord, query_window: &TimeWindow) -> b
 
 fn windows_overlap(left: &TimeWindow, right: &TimeWindow) -> bool {
     left.start.as_str() <= right.end.as_str() && right.start.as_str() <= left.end.as_str()
+}
+
+fn ingest_path() -> &'static Path {
+    Path::new("<ingest>")
 }

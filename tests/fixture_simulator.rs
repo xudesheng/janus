@@ -5,7 +5,7 @@ use janus::{
     fixture_validation::{FixtureCase, FixtureCorpus, FixtureSelector},
     hot_context_store::StoredRecordKind,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{path::Path, process::Command};
 
 #[test]
@@ -69,6 +69,32 @@ fn resources_are_emitted_before_timed_records() {
 }
 
 #[test]
+fn timed_events_are_monotonic_by_parsed_fixture_time() {
+    let corpus = FixtureCorpus::load(repo_root()).unwrap();
+
+    for case in &corpus.cases {
+        let plan = plan_fixture_replay(case).unwrap();
+        let mut previous = None;
+
+        for event in plan
+            .events()
+            .iter()
+            .filter(|event| event.simulated_time.is_some())
+        {
+            let current = parse_fixture_time(event.simulated_time.as_deref().unwrap());
+            if let Some(previous) = previous {
+                assert!(
+                    previous <= current,
+                    "non-monotonic timed replay for fixture {}",
+                    case.registry_entry.id
+                );
+            }
+            previous = Some(current);
+        }
+    }
+}
+
+#[test]
 fn metrics_are_replayed_as_ordered_metric_point_events() {
     let case = fixture_case("deploy-bad-rollout");
     let plan = plan_fixture_replay(&case).unwrap();
@@ -110,6 +136,57 @@ fn trace_event_precedes_span_event_at_the_same_timestamp() {
     assert_eq!(
         plan.events()[trace_index].simulated_time,
         plan.events()[span_index].simulated_time
+    );
+}
+
+#[test]
+fn trace_with_empty_spans_uses_trace_level_start_time() {
+    let mut case = fixture_case("deploy-bad-rollout");
+    case.registry_entry.id = "empty-span-trace".to_string();
+    case.input = json!({
+        "traces": [
+            {
+                "trace_id": "t-empty",
+                "start": "2026-06-01T00:00:00Z",
+                "spans": []
+            }
+        ]
+    });
+
+    let plan = plan_fixture_replay(&case).unwrap();
+    let event = plan.events().first().unwrap();
+
+    assert_eq!(plan.events().len(), 1);
+    assert_eq!(event.signal, SimulatedSignal::Trace);
+    assert_eq!(event.source_key, "t-empty");
+    assert_eq!(
+        event.simulated_time.as_deref(),
+        Some("2026-06-01T00:00:00Z")
+    );
+}
+
+#[test]
+fn replay_plan_rejects_empty_fractional_timestamp() {
+    let mut case = fixture_case("deploy-bad-rollout");
+    case.registry_entry.id = "bad-timestamp".to_string();
+    case.input = json!({
+        "logs": [
+            {
+                "id": "log-bad",
+                "t": "2026-06-01T00:00:00.Z",
+                "entity": "service:test",
+                "severity": "ERROR",
+                "body": "bad timestamp"
+            }
+        ]
+    });
+
+    let error = plan_fixture_replay(&case).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("fractional seconds must not be empty")
     );
 }
 
@@ -158,6 +235,20 @@ fn simulate_fixture_cli_dry_run_succeeds_for_one_fixture() {
     assert!(stdout.contains("metric_point metric_series http.server.error_rate@service:checkout"));
 }
 
+#[test]
+fn simulate_fixture_cli_rejects_conflicting_render_modes() {
+    let output = Command::new(env!("CARGO_BIN_EXE_simulate_fixture"))
+        .args(["--fixture", "deploy-bad-rollout", "--dry-run", "--jsonl"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("pass either --dry-run or --jsonl, not both")
+    );
+}
+
 fn repo_root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
 }
@@ -195,4 +286,16 @@ fn event_signature(plan: &janus::fixture_simulator::FixtureReplayPlan) -> Vec<St
             )
         })
         .collect()
+}
+
+fn parse_fixture_time(timestamp: &str) -> (String, u32) {
+    let trimmed = timestamp.strip_suffix('Z').unwrap();
+    let (base, fraction) = trimmed.split_once('.').unwrap_or((trimmed, ""));
+    let mut nanos = fraction.to_string();
+    nanos.truncate(9);
+    while nanos.len() < 9 {
+        nanos.push('0');
+    }
+
+    (base.to_string(), nanos.parse().unwrap_or(0))
 }

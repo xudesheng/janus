@@ -48,6 +48,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .into(),
         );
     }
+    if dry_run && jsonl {
+        return Err("pass either --dry-run or --jsonl, not both".into());
+    }
 
     let fixture_id = fixture_id.ok_or("--fixture requires a value")?;
     let corpus = FixtureCorpus::load(Path::new(env!("CARGO_MANIFEST_DIR")))?;

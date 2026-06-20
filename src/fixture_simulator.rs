@@ -1,6 +1,6 @@
 use crate::{
     fixture_validation::FixtureCase,
-    hot_context_store::StoredRecordKind,
+    hot_context_store::{HotIngestEvent, MetricSeriesKey, StoredRecordKind},
     references::{metric_series_ref, span_ref},
 };
 use serde_json::{Map, Value, json};
@@ -53,10 +53,26 @@ pub enum FixtureSimulationError {
 struct EventDraft {
     input_order: u64,
     simulated_time: Option<String>,
+    time_sort_key: Option<FixtureTimestampSortKey>,
     signal: SimulatedSignal,
     source_key: String,
     record_kind: StoredRecordKind,
     payload: Value,
+}
+
+#[derive(Debug)]
+struct EventDraftBody {
+    simulated_time: Option<String>,
+    signal: SimulatedSignal,
+    source_key: String,
+    record_kind: StoredRecordKind,
+    payload: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct FixtureTimestampSortKey {
+    base: String,
+    nanos: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -65,6 +81,7 @@ struct IdEventSpec {
     signal: SimulatedSignal,
     record_kind: StoredRecordKind,
     time_field: &'static str,
+    time_required: bool,
 }
 
 pub fn plan_fixture_replay(
@@ -118,6 +135,7 @@ impl FixtureReplayPlan {
                 signal: SimulatedSignal::Log,
                 record_kind: StoredRecordKind::Log,
                 time_field: "t",
+                time_required: true,
             },
             &mut input_order,
             &mut drafts,
@@ -130,6 +148,7 @@ impl FixtureReplayPlan {
                 signal: SimulatedSignal::Change,
                 record_kind: StoredRecordKind::Change,
                 time_field: "t",
+                time_required: true,
             },
             &mut input_order,
             &mut drafts,
@@ -142,6 +161,7 @@ impl FixtureReplayPlan {
                 signal: SimulatedSignal::PriorIncident,
                 record_kind: StoredRecordKind::PriorIncident,
                 time_field: "first_seen",
+                time_required: false,
             },
             &mut input_order,
             &mut drafts,
@@ -154,6 +174,7 @@ impl FixtureReplayPlan {
                 signal: SimulatedSignal::TelemetryGap,
                 record_kind: StoredRecordKind::TelemetryGap,
                 time_field: "start",
+                time_required: true,
             },
             &mut input_order,
             &mut drafts,
@@ -219,6 +240,46 @@ impl SimulatedSignal {
     }
 }
 
+impl TryFrom<&SimulationEvent> for HotIngestEvent {
+    type Error = FixtureSimulationError;
+
+    fn try_from(event: &SimulationEvent) -> Result<Self, Self::Error> {
+        match event.signal {
+            SimulatedSignal::Resource => Ok(HotIngestEvent::Resource(event.payload.clone())),
+            SimulatedSignal::Trace => Ok(HotIngestEvent::Trace(event.payload.clone())),
+            SimulatedSignal::Span => {
+                let Some((trace_id, _span_id)) = event.source_key.split_once('/') else {
+                    return Err(FixtureSimulationError::InvalidShape {
+                        fixture_id: event.scenario_id.clone(),
+                        json_path: "$.source_key".to_string(),
+                        message: "span event source_key must be trace_id/span_id".to_string(),
+                    });
+                };
+
+                Ok(HotIngestEvent::Span {
+                    trace_id: trace_id.to_string(),
+                    payload: event.payload.clone(),
+                })
+            }
+            SimulatedSignal::MetricPoint => Ok(HotIngestEvent::MetricPoint {
+                series: MetricSeriesKey::new(
+                    required_str(&event.scenario_id, &event.payload, "$.payload", "name")?,
+                    required_str(&event.scenario_id, &event.payload, "$.payload", "entity")?,
+                ),
+                payload: event.payload.clone(),
+            }),
+            SimulatedSignal::Log => Ok(HotIngestEvent::Log(event.payload.clone())),
+            SimulatedSignal::Change => Ok(HotIngestEvent::Change(event.payload.clone())),
+            SimulatedSignal::PriorIncident => {
+                Ok(HotIngestEvent::PriorIncident(event.payload.clone()))
+            }
+            SimulatedSignal::TelemetryGap => {
+                Ok(HotIngestEvent::TelemetryGap(event.payload.clone()))
+            }
+        }
+    }
+}
+
 impl fmt::Display for SimulatedSignal {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{}", self.as_str())
@@ -261,14 +322,18 @@ fn append_resources(
         let json_path = format!("$.resources[{index}]");
         let id = required_str(fixture_id, resource, &json_path, "id")?;
         push_draft(
+            fixture_id,
+            &json_path,
             drafts,
             input_order,
-            None,
-            SimulatedSignal::Resource,
-            id.to_string(),
-            StoredRecordKind::Resource,
-            resource.clone(),
-        );
+            EventDraftBody {
+                simulated_time: None,
+                signal: SimulatedSignal::Resource,
+                source_key: id.to_string(),
+                record_kind: StoredRecordKind::Resource,
+                payload: resource.clone(),
+            },
+        )?;
     }
 
     Ok(())
@@ -290,14 +355,18 @@ fn append_traces(
         let trace_time = trace_start_time(fixture_id, trace, &trace_path)?;
 
         push_draft(
+            fixture_id,
+            &trace_path,
             drafts,
             input_order,
-            trace_time,
-            SimulatedSignal::Trace,
-            trace_id.to_string(),
-            StoredRecordKind::Trace,
-            trace.clone(),
-        );
+            EventDraftBody {
+                simulated_time: trace_time,
+                signal: SimulatedSignal::Trace,
+                source_key: trace_id.to_string(),
+                record_kind: StoredRecordKind::Trace,
+                payload: trace.clone(),
+            },
+        )?;
 
         let Some(spans) = optional_array_field(fixture_id, trace, &trace_path, "spans")? else {
             continue;
@@ -308,14 +377,20 @@ fn append_traces(
             let span_id = required_str(fixture_id, span, &span_path, "span_id")?;
 
             push_draft(
+                fixture_id,
+                &format!("{span_path}.start"),
                 drafts,
                 input_order,
-                optional_str_field(fixture_id, span, &span_path, "start")?.map(ToString::to_string),
-                SimulatedSignal::Span,
-                span_ref(trace_id, span_id),
-                StoredRecordKind::Span,
-                span.clone(),
-            );
+                EventDraftBody {
+                    simulated_time: Some(
+                        required_str(fixture_id, span, &span_path, "start")?.to_string(),
+                    ),
+                    signal: SimulatedSignal::Span,
+                    source_key: span_ref(trace_id, span_id),
+                    record_kind: StoredRecordKind::Span,
+                    payload: span.clone(),
+                },
+            )?;
         }
     }
 
@@ -344,14 +419,20 @@ fn append_metrics(
         for (point_index, point) in points.iter().enumerate() {
             let point_path = format!("{metric_path}.points[{point_index}]");
             push_draft(
+                fixture_id,
+                &format!("{point_path}.t"),
                 drafts,
                 input_order,
-                optional_str_field(fixture_id, point, &point_path, "t")?.map(ToString::to_string),
-                SimulatedSignal::MetricPoint,
-                source_key.clone(),
-                StoredRecordKind::MetricSeries,
-                metric_point_payload(metric, point),
-            );
+                EventDraftBody {
+                    simulated_time: Some(
+                        required_str(fixture_id, point, &point_path, "t")?.to_string(),
+                    ),
+                    signal: SimulatedSignal::MetricPoint,
+                    source_key: source_key.clone(),
+                    record_kind: StoredRecordKind::MetricSeries,
+                    payload: metric_point_payload(metric, point),
+                },
+            )?;
         }
     }
 
@@ -373,38 +454,63 @@ fn append_id_records(
         let json_path = format!("$.{}[{index}]", spec.key);
         let id = required_str(fixture_id, record, &json_path, "id")?;
         push_draft(
+            fixture_id,
+            &format!("{json_path}.{}", spec.time_field),
             drafts,
             input_order,
-            optional_str_field(fixture_id, record, &json_path, spec.time_field)?
-                .map(ToString::to_string),
-            spec.signal,
-            id.to_string(),
-            spec.record_kind,
-            record.clone(),
-        );
+            EventDraftBody {
+                simulated_time: event_time(fixture_id, record, &json_path, &spec)?,
+                signal: spec.signal,
+                source_key: id.to_string(),
+                record_kind: spec.record_kind,
+                payload: record.clone(),
+            },
+        )?;
     }
 
     Ok(())
 }
 
+fn event_time(
+    fixture_id: &str,
+    value: &Value,
+    json_path: &str,
+    spec: &IdEventSpec,
+) -> Result<Option<String>, FixtureSimulationError> {
+    if spec.time_required {
+        required_str(fixture_id, value, json_path, spec.time_field)
+            .map(|timestamp| Some(timestamp.to_string()))
+    } else {
+        optional_str_field(fixture_id, value, json_path, spec.time_field)
+            .map(|timestamp| timestamp.map(ToString::to_string))
+    }
+}
+
 fn push_draft(
+    fixture_id: &str,
+    time_json_path: &str,
     drafts: &mut Vec<EventDraft>,
     input_order: &mut u64,
-    simulated_time: Option<String>,
-    signal: SimulatedSignal,
-    source_key: String,
-    record_kind: StoredRecordKind,
-    payload: Value,
-) {
+    body: EventDraftBody,
+) -> Result<(), FixtureSimulationError> {
+    let time_sort_key = body
+        .simulated_time
+        .as_deref()
+        .map(|timestamp| fixture_timestamp_sort_key(fixture_id, timestamp, time_json_path))
+        .transpose()?;
+
     drafts.push(EventDraft {
         input_order: *input_order,
-        simulated_time,
-        signal,
-        source_key,
-        record_kind,
-        payload,
+        simulated_time: body.simulated_time,
+        time_sort_key,
+        signal: body.signal,
+        source_key: body.source_key,
+        record_kind: body.record_kind,
+        payload: body.payload,
     });
     *input_order += 1;
+
+    Ok(())
 }
 
 fn compare_drafts(left: &EventDraft, right: &EventDraft) -> std::cmp::Ordering {
@@ -415,8 +521,9 @@ fn compare_drafts(left: &EventDraft, right: &EventDraft) -> std::cmp::Ordering {
         (None, None) => left.input_order.cmp(&right.input_order),
         (None, Some(_)) => std::cmp::Ordering::Less,
         (Some(_), None) => std::cmp::Ordering::Greater,
-        (Some(left_time), Some(right_time)) => left_time
-            .cmp(right_time)
+        (Some(_), Some(_)) => left
+            .time_sort_key
+            .cmp(&right.time_sort_key)
             .then_with(|| left.input_order.cmp(&right.input_order)),
     }
 }
@@ -435,13 +542,67 @@ fn trace_start_time(
     for (span_index, span) in spans.iter().enumerate() {
         let span_path = format!("{trace_path}.spans[{span_index}]");
         if let Some(start) = optional_str_field(fixture_id, span, &span_path, "start")? {
-            starts.push(start.to_string());
+            starts.push((
+                fixture_timestamp_sort_key(fixture_id, start, &format!("{span_path}.start"))?,
+                start.to_string(),
+            ));
         }
     }
 
     starts.sort();
 
-    Ok(starts.into_iter().next())
+    match starts.into_iter().next() {
+        Some((_sort_key, start)) => Ok(Some(start)),
+        None => optional_str_field(fixture_id, trace, trace_path, "start")
+            .map(|value| value.map(ToString::to_string)),
+    }
+}
+
+fn fixture_timestamp_sort_key(
+    fixture_id: &str,
+    timestamp: &str,
+    json_path: &str,
+) -> Result<FixtureTimestampSortKey, FixtureSimulationError> {
+    let Some(trimmed) = timestamp.strip_suffix('Z') else {
+        return Err(FixtureSimulationError::InvalidShape {
+            fixture_id: fixture_id.to_string(),
+            json_path: json_path.to_string(),
+            message: "timestamp must use UTC Z suffix".to_string(),
+        });
+    };
+    let (base, fraction) = trimmed.split_once('.').unwrap_or((trimmed, ""));
+    if base.is_empty() || fraction.contains('.') {
+        return Err(FixtureSimulationError::InvalidShape {
+            fixture_id: fixture_id.to_string(),
+            json_path: json_path.to_string(),
+            message: "timestamp must be a UTC RFC3339-like string".to_string(),
+        });
+    }
+    if timestamp.contains('.') && fraction.is_empty() {
+        return Err(FixtureSimulationError::InvalidShape {
+            fixture_id: fixture_id.to_string(),
+            json_path: json_path.to_string(),
+            message: "timestamp fractional seconds must not be empty".to_string(),
+        });
+    }
+    if !fraction.chars().all(|character| character.is_ascii_digit()) {
+        return Err(FixtureSimulationError::InvalidShape {
+            fixture_id: fixture_id.to_string(),
+            json_path: json_path.to_string(),
+            message: "timestamp fractional seconds must be digits".to_string(),
+        });
+    }
+
+    let mut nanos = fraction.to_string();
+    nanos.truncate(9);
+    while nanos.len() < 9 {
+        nanos.push('0');
+    }
+
+    Ok(FixtureTimestampSortKey {
+        base: base.to_string(),
+        nanos: nanos.parse().unwrap_or(0),
+    })
 }
 
 fn metric_point_payload(metric: &Value, point: &Value) -> Value {
