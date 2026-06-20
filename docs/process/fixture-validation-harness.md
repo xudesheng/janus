@@ -26,6 +26,22 @@ This should happen before the hot store and derivation pipeline, so later
 implementation work has a concrete target and cannot silently drift away from
 the evidence contract.
 
+## Design Review Gate
+
+No Rust implementation should start for this topic until every active reviewer
+has agreed on the design direction in their `Direction Verdict`.
+
+This topic should finalize the Milestone 3 harness design before coding by
+default. Registry validation, source-reference closure, capability witnesses,
+coverage reporting, and uncertainty guards share one corpus model and one issue
+model, so agreeing on the full contract first reduces churn in the implementation
+rounds.
+
+Reviewers may explicitly approve phase-by-phase implementation instead. If they
+do, each phase still remains part of the same Milestone 3 contract and should
+not weaken the Definition Of Done below. Until reviewer agreement exists, review
+rounds for this topic are design-only or diagnosis-only rounds.
+
 ## Scope
 
 In scope:
@@ -310,6 +326,22 @@ The corpus loader should expose selectors for later tests and eval code:
 The command-line tool can use the same selectors for focused runs, but the Rust
 API is the important contract.
 
+## Implementation Phases
+
+After design approval, implementation can land in focused reviewable phases:
+
+1. Corpus model, registry loading, manifest loading, deterministic issue
+   collection, and fixture selectors.
+2. Evidence IR reuse, reference-index construction, and source-reference closure
+   validation.
+3. Capability witness checks, false-causality checks, missing-data checks,
+   coverage reporting, and the validation CLI.
+4. Focused negative tests and cleanup if the earlier phases need to stay small.
+
+These phases are sequencing guidance, not separate product milestones. Phase 1
+is not a complete Milestone 3 outcome if source-reference closure and
+uncertainty checks are still missing.
+
 ## CLI
 
 Add one command, for example:
@@ -373,6 +405,16 @@ This topic is complete when:
 
 ## Review Focus
 
-Reviewers should pay closest attention to the source-reference closure rules and
-the uncertainty checks. Those two areas protect Janus from its highest-risk
-failure modes: unverifiable summaries and confident false causality.
+Reviewers should pay closest attention to:
+
+- whether source-reference closure is strict enough without forcing unnecessary
+  fixture churn;
+- whether `signal`/ref mismatches should start as warnings or immediate errors;
+- whether capability witness checks should be hard validation failures;
+- whether the false-causality and missing-data checks are structural enough to
+  avoid pretending to solve causality;
+- whether implementation should proceed only after whole-design approval or be
+  approved phase by phase.
+
+The first and fourth points protect Janus from its highest-risk failure modes:
+unverifiable summaries and confident false causality.
