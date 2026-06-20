@@ -98,7 +98,8 @@ Deliverables:
   objects such as time windows, source refs, missing data, token budget,
   direction, freshness, and privacy scope;
 - a thin read-only fixture loader for `expected.json` evidence bundles, scoped
-  only to what this milestone needs;
+  only to what this milestone needs, including single-fixture resolution by
+  scenario id or path such as `fixtures/scenarios/<id>/expected.json`;
 - JSON Schema for the evidence contracts;
 - at least one serialized example evidence item and bundle;
 - tests that validate the Evidence IR shape against existing fixture
@@ -111,8 +112,9 @@ Acceptance criteria:
   supporting evidence and counter-evidence;
 - evidence strength is not conflated with causal confidence;
 - fixture evidence bundles can be deserialized without ad hoc parsing;
-- the fixture loader is intentionally narrow and does not yet validate source
-  refs, registry coverage, or all fixture metadata;
+- the fixture loader is intentionally narrow: single-fixture addressing is in
+  scope, but source-ref validation, registry coverage, and full fixture metadata
+  validation are not;
 - schema generation and tests run with `cargo test`.
 
 Suggested review topic:
@@ -134,6 +136,11 @@ Deliverables:
 - a fixture-backed stub implementation that returns gold bundles by scenario,
   using the narrow loader introduced in Milestone 1;
 - a CLI or test helper that emits Evidence IR JSON for a selected fixture.
+
+Boundary:
+
+- this milestone returns hand-authored gold bundles. The real compiled and
+  ranked `get_evidence_bundle` path lands in Milestone 6.
 
 Acceptance criteria:
 
@@ -235,7 +242,7 @@ Deliverables:
 - anomaly window importer or simple detector over fixture metrics;
 - log and error pattern clustering for representative fixture logs;
 - timeline builder for symptoms, changes, propagation effects, recovery markers,
-  and non-causal nearby changes;
+  and candidate nearby-change markers;
 - derived support for `find_related_anomalies`;
 - derived support for `compare_windows`.
 
@@ -243,7 +250,8 @@ Acceptance criteria:
 
 - anomaly windows include bounded time intervals and source refs;
 - log clusters preserve exemplars;
-- timeline output can distinguish causal changes from non-causal nearby changes;
+- timeline output preserves event ordering and candidate nearby changes, without
+  final causal or non-causal classification;
 - `related_anomalies` and `window_comparison` fixture artifacts have a concrete
   derived-context home instead of drifting as unused gold output.
 
@@ -264,6 +272,10 @@ Deliverables:
 - scoring that separates evidence strength from causal confidence;
 - token-cost accounting and dropped-item reporting;
 - support for counter-evidence requirements;
+- `rank_suspected_causes` output that links candidate causes to supporting
+  evidence, counter-evidence, and trap notes where relevant;
+- causal and non-causal classification for nearby changes using time alignment,
+  dependency direction, blast radius, and counter-evidence;
 - initial `suggest_next_checks` logic based on gaps and weak hypotheses.
 
 Boundary:
@@ -279,6 +291,9 @@ Acceptance criteria:
 
 - false-causality trap fixtures rank the obvious innocent suspect low with
   explicit counter-evidence;
+- `suspected_causes` fixture artifacts have a concrete generation path;
+- nearby changes are classified only after Evidence Compiler reasoning, not by
+  the Milestone 5B timeline builder alone;
 - evidence bundles include hypothesis-discriminating evidence rather than only
   the largest or noisiest signals;
 - missing input data is returned as evidence about uncertainty, not hidden;
@@ -299,8 +314,15 @@ Deliverables:
 - first MCP tool for `get_evidence_bundle`;
 - strict input and output schemas suitable for tool-use validators;
 - initial surfaces for `build_timeline`, `expand_entity_context`,
-  `find_related_anomalies`, `compare_windows`, or `suggest_next_checks`,
-  depending on which fixture-backed capability is most mature.
+  `find_related_anomalies`, `compare_windows`, `rank_suspected_causes`, or
+  `suggest_next_checks`, depending on which fixture-backed capability is most
+  mature.
+
+Boundary:
+
+- `explain_symptom` is treated as a question-driven `get_evidence_bundle`
+  workflow plus timeline context in this version. It should become a separate
+  primitive only if the evidence contract needs a distinct surface.
 
 Acceptance criteria:
 
@@ -320,17 +342,24 @@ Goal: test the central Janus bet against the fixture corpus.
 
 Deliverables:
 
-- raw-access baseline that gives an agent or evaluator direct fixture telemetry
-  under the same token budget;
+- raw-access baseline that gives an agent or evaluator realistic raw query
+  access under the same token budget, using recency, label, and entity slices
+  rather than a naive full dump or arbitrary `LIMIT N`;
 - Janus-access path that gives the same agent or evaluator Evidence IR bundles;
 - scoring for suspicious-entity accuracy, useful timeline quality,
   false-causality rate, token cost, missing-data awareness, and auditability;
+- scoring against `scenario.json` `ground_truth`, including
+  `primary_cause_entity`, `blast_radius`, and `not_the_cause`;
 - repeatable eval report over the fixture corpus.
 
 Acceptance criteria:
 
 - the eval can be run from a single command;
 - results are tied to fixture versions;
+- the raw-access baseline is reviewed as an adversarial baseline, not a strawman
+  designed to make Janus win;
+- token cost is measured from serialized raw-access and Janus-access material,
+  not copied from hand-authored Evidence IR `token_cost` fields;
 - Janus improves at least one target metric without hiding regressions in others;
 - false-causality trap scenarios are reported separately from baseline scenarios.
 
