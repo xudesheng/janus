@@ -1,8 +1,9 @@
 use janus::{
-    evidence::{EvidenceBundle, SourceRef, SourceSignal},
+    evidence::{EvidenceBundle, SourceRef, SourceSignal, TimeWindow},
     fixture_validation::{FixtureCase, FixtureCorpus, FixtureSelector},
     hot_context_store::{
-        HotContextStore, HotStoreError, SourceKey, SourceResolution, StoredRecord, StoredRecordKind,
+        HotContextStore, HotStoreError, SourceKey, SourceQuery, SourceResolution, StoredRecord,
+        StoredRecordKind,
     },
 };
 use serde_json::{Value, json};
@@ -172,6 +173,60 @@ fn same_raw_key_across_kinds_disambiguates_by_signal_and_ambiguous_scalar() {
         }
         other => panic!("expected scalar ambiguity, got {other:?}"),
     }
+}
+
+#[test]
+fn time_window_selector_returns_overlapping_records_in_stable_order() {
+    let case = fixture_case("deploy-bad-rollout");
+    let store = HotContextStore::load_fixture_case(case).unwrap();
+
+    let selected = store.select(SourceQuery {
+        time_window: Some(TimeWindow {
+            start: "2026-06-01T14:03:00Z".to_string(),
+            end: "2026-06-01T14:04:00Z".to_string(),
+        }),
+        ..SourceQuery::default()
+    });
+    let keys = selected
+        .iter()
+        .map(|record| record.key.as_str())
+        .collect::<Vec<_>>();
+
+    assert!(keys.contains(&"http.server.error_rate@service:checkout"));
+    assert!(keys.contains(&"log-1"));
+    assert!(keys.contains(&"change:deploy-checkout-v2"));
+}
+
+#[test]
+fn entity_and_kind_selectors_filter_without_reordering_fixture_records() {
+    let case = fixture_case("deploy-bad-rollout");
+    let store = HotContextStore::load_fixture_case(case).unwrap();
+
+    let resources = store.select(SourceQuery {
+        kinds: vec![StoredRecordKind::Resource],
+        ..SourceQuery::default()
+    });
+    let resource_keys = resources
+        .iter()
+        .map(|record| record.key.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        resource_keys,
+        vec!["res:api-gateway", "res:checkout-v2", "res:orders-pg"]
+    );
+
+    let checkout_logs = store.select(SourceQuery {
+        entities: vec!["service:checkout".to_string()],
+        kinds: vec![StoredRecordKind::Log],
+        ..SourceQuery::default()
+    });
+    let log_keys = checkout_logs
+        .iter()
+        .map(|record| record.key.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(log_keys, vec!["log-1", "log-2", "log-3", "log-4"]);
 }
 
 fn repo_root() -> &'static Path {

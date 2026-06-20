@@ -47,6 +47,13 @@ pub struct StoredRecord {
     pub payload: Value,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SourceQuery {
+    pub time_window: Option<TimeWindow>,
+    pub entities: Vec<String>,
+    pub kinds: Vec<StoredRecordKind>,
+}
+
 #[derive(Debug, Default)]
 pub struct HotContextStore {
     records: Vec<StoredRecord>,
@@ -232,6 +239,13 @@ impl HotContextStore {
                 candidates,
             },
         }
+    }
+
+    pub fn select(&self, query: SourceQuery) -> Vec<&StoredRecord> {
+        self.records
+            .iter()
+            .filter(|record| record_matches_query(record, &query))
+            .collect()
     }
 
     pub fn records(&self) -> &[StoredRecord] {
@@ -1067,4 +1081,28 @@ fn dedupe_stable(values: Vec<String>) -> Vec<String> {
     }
 
     deduped
+}
+
+fn record_matches_query(record: &StoredRecord, query: &SourceQuery) -> bool {
+    query
+        .time_window
+        .as_ref()
+        .is_none_or(|query_window| record_overlaps_window(record, query_window))
+        && (query.entities.is_empty()
+            || record
+                .entities
+                .iter()
+                .any(|entity| query.entities.contains(entity)))
+        && (query.kinds.is_empty() || query.kinds.contains(&record.kind))
+}
+
+fn record_overlaps_window(record: &StoredRecord, query_window: &TimeWindow) -> bool {
+    record
+        .time_window
+        .as_ref()
+        .is_some_and(|record_window| windows_overlap(record_window, query_window))
+}
+
+fn windows_overlap(left: &TimeWindow, right: &TimeWindow) -> bool {
+    left.start.as_str() <= right.end.as_str() && right.start.as_str() <= left.end.as_str()
 }
