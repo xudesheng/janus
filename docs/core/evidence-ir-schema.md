@@ -93,6 +93,11 @@ fixture checks belong to `fixture-validation-harness`.
 7. **Prefer simple types until behavior needs more.** Timestamps can start as
    validated ISO-8601 strings in the contract. Temporal arithmetic belongs to
    later derivation and compiler work.
+8. **Keep fixture annotations outside Evidence IR.** `expected.json` may contain
+   `_`-prefixed helper keys outside `evidence_bundle`, but `EvidenceBundle`,
+   `EvidenceItem`, `SourceRef`, and budget objects should reject unknown fields,
+   including `_`-prefixed annotation keys. If a future fixture needs annotation
+   inside Evidence IR, the formal contract must add an explicit field first.
 
 ## Rust Module Shape
 
@@ -332,6 +337,12 @@ Known dimensions from current fixtures include:
 The schema should require each confidence value to be a number between `0` and
 `1`, but it should not freeze the set of confidence dimension names.
 
+This open-ended map is acceptable for Milestone 1 because confidence is
+response-side data and MCP tool schemas are out of scope. Some strict tool-use
+validators may reject open `additionalProperties` objects; Milestone 7
+(`mcp-agent-surface`) should revisit whether agent-facing tool schemas need a
+closed confidence representation.
+
 ## Fixture Loader
 
 Milestone 1 needs only a narrow loader. It should not become the full fixture
@@ -382,6 +393,9 @@ Schema requirements:
 
 Schema compatibility with strict tool validators matters, even though MCP tool
 schemas are not part of this milestone.
+
+Tests should fail if any generated schema object with `type: array` lacks an
+`items` declaration.
 
 ## Validation Helpers
 
