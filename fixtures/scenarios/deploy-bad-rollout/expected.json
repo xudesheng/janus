@@ -19,6 +19,16 @@
   "log_patterns": [
     { "id": "lp-1", "template": "Unhandled NullPointerException in CheckoutHandler.applyDiscount: coupon is null", "entity": "service:checkout", "severity": "ERROR", "first_seen": "2026-06-01T14:03:21Z", "last_seen": "2026-06-01T14:06:44Z", "count": 3, "exemplars": ["log-1", "log-3"], "stability": "new-since-incident" }
   ],
+  "window_comparison": {
+    "_for_capability": "compare_windows",
+    "healthy": { "start": "2026-06-01T14:00:00Z", "end": "2026-06-01T14:02:00Z" },
+    "anomalous": { "start": "2026-06-01T14:04:00Z", "end": "2026-06-01T14:10:00Z" },
+    "deltas": [
+      { "entity": "service:checkout", "signal": "http.server.error_rate", "from": 0.003, "to": 0.41, "factor": 136.7 },
+      { "entity": "service:checkout", "signal": "http.server.duration_p95_ms", "from": 140, "to": 610, "factor": 4.4 },
+      { "entity": "db:orders-pg", "signal": "db.query.duration_p95_ms", "from": 28, "to": 29, "factor": 1.04, "note": "database latency is flat; the DB is counter-evidence, not the cause" }
+    ]
+  },
   "evidence_bundle": {
     "question": "Why did checkout start returning 5xx around 14:05 on 2026-06-01?",
     "time_window": { "start": "2026-06-01T14:00:00Z", "end": "2026-06-01T14:15:00Z" },

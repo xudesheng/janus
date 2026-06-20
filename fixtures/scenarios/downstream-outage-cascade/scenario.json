@@ -32,5 +32,5 @@
     "false-causality-guard"
   ],
   "inputs": ["resources", "traces", "metrics", "logs", "changes"],
-  "expected": ["entities", "relationships", "anomaly_windows", "log_patterns", "evidence_bundle", "timeline", "suspected_causes", "next_checks"]
+  "expected": ["entities", "relationships", "anomaly_windows", "related_anomalies", "log_patterns", "evidence_bundle", "timeline", "suspected_causes", "next_checks"]
 }

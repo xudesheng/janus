@@ -37,6 +37,7 @@
     "relationships",
     "anomaly_windows",
     "log_patterns",
+    "window_comparison",
     "evidence_bundle",
     "timeline",
     "suspected_causes",
