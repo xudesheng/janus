@@ -42,3 +42,109 @@ No code verification this round. Design-only checks performed:
 - Confirmed the formal design-doc change was committed and pushed before this review document was created.
 
 <!-- Reviewer appends below; the Implementor must not edit past this line. -->
+
+## Review (by Claude)
+
+### Direction Verdict
+
+**Agree — continue to implementation.** I am lifting the conditional hold from review-0.
+Design *content* is approved unconditionally: all five round-0 findings (A–E) plus the Q2
+seam are closed precisely and correctly in `docs/core/fixture-otel-simulator.md`, and I
+re-verified each against the actual hot-store code rather than the response text. There
+are no blocking findings this round. Next action: **continue** — implementation may start,
+phase-by-phase in the three proposed slices.
+
+On the direction gate I raised in round-0 (the off-roadmap "demo bridge ahead of
+`entity-resolver-confidence`"): I am clearing it, with one transparency note. I do not have
+a *new, explicit* User sentence saying "build the demo bridge now," and I will not pretend
+the procedural instruction to advance the review loop is the same thing. But two facts have
+accumulated that I judge sufficient to stop blocking:
+
+1. The User has now twice directed this exact topic forward and has **not** redirected to
+   `entity-resolver-confidence` when redirecting was the easy response to my round-0 hold.
+2. The User explicitly framed reviewers as the deciding gate ("the implementor must not
+   start coding until all reviewers agree"), i.e. delegated the agreement call to me.
+
+Continuing to demand a separate ceremonial go/no-go would now be process-pedantry that
+stalls a loop the User keeps pushing forward — which the framework warns against. So I read
+the sustained direction as endorsement and clear the gate.
+
+**Final off-ramp for the User (the one thing that would reverse this):** if your intent is
+to return to `entity-resolver-confidence` (Milestone 5) and you are only keeping this
+branch alive procedurally, say so and this topic stops as a design-only branch per its own
+Review Gate. Absent that, I treat the direction as approved and coding may begin.
+
+This answers the implementor's **Q1** (yes, I now treat the renewed direction as sufficient
+— no separate User statement required unless the User wants to redirect) and **Q2** (yes,
+unconditional `continue` for implementation).
+
+### Findings A–E: verified closed
+
+Checked against the design doc diff `b3eeedd..31c3743`, not just the response summary:
+
+- **A — closed well.** `load_fixture_case` is now a "full-replay source-ref compatibility
+  oracle" with the explicit carve-out that byte-for-byte `StoredRecord` equality is *not*
+  required except where a shape is pinned. This is the lower-risk bar I recommended and it
+  resolves the trace-payload-with-embedded-spans divergence cleanly.
+- **B — closed well.** Metric-series convergence shape is pinned (`name`/`entity`/`unit`
+  preserved, points appended in replay order, observed-prefix during partial replay, never
+  drop/synthesize). This is exactly the target slice-2 tests needed.
+- **C — closed precisely.** "Metric series is the only merge-eligible
+  `(StoredRecordKind, SourceKey)` pair" and non-metric duplicates "remain errors for all
+  non-metric record kinds." The duplicate-key guarantee from the hot-store round is
+  preserved with a single named exception. Good.
+- **D — closed.** The ambiguous "resolves only after the trace has observed data" line is
+  gone; the `Trace` event now makes the trace key resolvable, emitted at earliest span
+  time. Matches my recommendation.
+- **Q2 — closed.** The source-key-derivation seam is named: the adapter owns key
+  normalization, and a future `OtlpReceiverSource` must map real OTLP ids into the same
+  write model. The reusability claim is no longer overstated.
+- **E — closed.** The round milestone now names the topic-level artifact (the
+  `simulate_fixture` CLI + ingest path), so later rounds measure critical path against the
+  artifact.
+
+### Answers to Q3–Q5
+
+- **Q3 (A–D adequately closed?)** — Yes, all four, verified above.
+- **Q4 (milestone phrased correctly?)** — Yes. The artifact-level phrasing is right for
+  implementation review.
+- **Q5 (three slices?)** — Yes, proceed in the proposed order. Slice 2 (ingest boundary)
+  carries the real risk and should be reviewed most carefully; see the non-blocking notes.
+
+### Non-blocking notes for the implementation rounds (not re-gating)
+
+These are guidance to fold into the relevant slice; none block approval.
+
+1. **Slice 2 must include the A/B/C/D behaviors as named tests**, not just "partial replay
+   works": (a) a metric-series record's `points[]` is a strict observed-prefix mid-replay
+   and the full set post-replay (Finding B); (b) a non-metric duplicate `(kind,key)` still
+   returns `DuplicatePrimaryKey` while a duplicate metric series merges (Finding C); (c) the
+   trace ref resolves at the `Trace` event and the span ref does not resolve until its span
+   event (Finding D). The existing design Tests list mostly covers these, but call out C's
+   negative case explicitly — it is the one most likely to be missed.
+2. **Zero-span trace edge case (minor).** "Emit the `Trace` event at the earliest span
+   time" is undefined if a trace has no spans. Current fixtures all carry spans, so this is
+   not a blocker, but state the fallback (e.g. trace event uses its own start time, or the
+   case is asserted not to occur) so the implementation does not silently panic on an
+   empty-span trace.
+3. **Resolution-equivalence is the acceptance bar (Finding A) — keep it that way under
+   test.** When you assert "full replay resolves all current fixture evidence source refs,"
+   compare *resolution outcomes*, not stored payloads, against `load_fixture_case`.
+   Asserting payload equality would reintroduce the trace-payload divergence A just
+   resolved.
+
+### Framework / process check (passes)
+
+- Baseline `31c3743` is pushed and is the parent of the review-1 commit `d89b0d1`
+  (pre-review-document tree); frozen. Correct.
+- Round-0 locked content is unchanged (`b5a9922..d89b0d1` touches only the design doc and
+  the new review-1.md). The Implementor honored the locking rules.
+- Header fields complete; milestone names the artifact; design-only round correctly states
+  "No code verification this round."
+
+### Bottom line
+
+Design approved, hold lifted, direction gate cleared. **Continue to implementation** in the
+three slices, with the negative-path tests called out above. The next round should be an
+implementation round (slice 1), and milestone work being incomplete is itself sufficient
+grounds to open it.
