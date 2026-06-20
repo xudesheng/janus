@@ -122,3 +122,104 @@ avoid the default Windows `target/debug` executable-lock issue observed earlier
 in this worktree.
 
 <!-- Reviewer appends below; the Implementor must not edit past this line. -->
+
+## Review (by Claude)
+
+### Direction Verdict
+
+On critical path: yes. Milestone progress: slice 2 accepted — and with it the
+**Milestone 4 Definition Of Done is met**. Next action: stop the mandatory round
+loop and report completion; the remaining CLI work is optional, at the User's
+discretion, not a milestone requirement.
+
+This is an implementation round, so I judged progress before defects. Slice 2
+delivers exactly the approved scope — `SourceQuery`/`select` selectors and a
+store-aware `get_evidence_bundle` — and it closes the milestone. I verified the
+reviewed tree independently: baseline `4ed66fa` is the parent of the review-3
+commit (so the pushed slice-2 code is what I reviewed), the slice-2 commit touched
+only `src/query.rs`, `src/hot_context_store.rs`, and the two test files (no locked
+review body was edited), `cargo test` is fully green (get_evidence_bundle suite now
+12, hot_context_store 9), `cargo clippy --all-targets --all-features -D warnings`
+exits 0, and the corpus still validates 0/0.
+
+### Milestone 4 DoD check (the reason this is a completion verdict)
+
+Walking the design's Definition Of Done against the merged slices 1+2:
+
+- all registered fixture inputs load into the store — done (slice 1, tested).
+- all current evidence source refs resolve to concrete records — done, and now
+  *enforced* on the query path (`ensure_source_refs_resolve`, `query.rs:380`).
+- stable time-window and entity selectors — done (`select` /
+  `record_matches_query`, `hot_context_store.rs:244,1086`), deterministic via
+  insertion order, tested for overlap + entity/kind filtering + stable order.
+- `get_evidence_bundle` (or helper) uses the store for source lookup without
+  generating evidence — done; the function returns the gold bundle byte-for-byte
+  (tests assert `bundle == expected` for every fixture) while adding lookup +
+  context checks.
+- source lookup failures are structured and test-covered — done
+  (`SourceLookup`, `UnsatisfiedRequirement` with stable `requirement` tags;
+  negative tests for missing entity and disjoint time+entity).
+- design keeps OTLP/simulator as follow-up adapters — unchanged, still true.
+- `cargo fmt`/`test`/`clippy`/`validate_fixtures` pass — verified.
+
+The only thing not done is the **CLI**, which the design lists as "Optional
+inspection CLI" and "not the main contract," and which is absent from the DoD. So
+the milestone artifact exists. Per Round Termination, since I leave no required
+changes and the milestone work is complete, the implementor should **not** emit a
+mandatory `review-4`; report completion and let the User decide on the optional
+polish slice.
+
+### What I verified in the code
+
+- **Selector semantics** match the design and the round's description: AND across
+  populated dimensions, OR within entity/kind lists, `time_window: None` records
+  excluded from time-filtered queries (`record_overlaps_window` uses
+  `is_some_and`), inclusive interval overlap (`windows_overlap`,
+  `hot_context_store.rs:1105`), insertion-order output.
+- **No bundle rewriting:** the gold bundle is loaded from
+  `case.expected["evidence_bundle"]` and returned unchanged; the new checks are
+  side-effect-free reads. Tests assert equality with the fixture gold for all
+  fixtures and for the entity-filtered case.
+- **Check ordering is correct:** query/budget/raw-ref/counter checks run before the
+  store is even built, so the new substrate checks don't perturb the existing
+  error contract — which is exactly why the prior get_evidence_bundle tests still
+  pass unchanged.
+
+### Answers to the requested reviewer questions
+
+1. **Selector semantics correct?** Yes — AND across dimensions, OR within
+   entity/kind, no-time records excluded from time queries, stable order. Correct
+   and tested.
+2. **Integration strict enough without rewriting?** Yes — every returned source ref
+   must resolve to `Found` or the call hard-fails with a structured `SourceLookup`
+   error, and the bundle is returned unchanged.
+3. **Combined time+entity check the right threshold?** Acceptable for M4. Treat it
+   as a *substrate-connectivity* check ("the store actually holds records the query
+   can reach"), not evidence validation. One caveat to record: requiring the query
+   time window to always select ≥1 record couples `get_evidence_bundle` success to
+   window overlap, so a legitimate but tight real-world query window (vs. the
+   fixture's own window) could false-negative. Fine now — every fixture passes —
+   but revisit when M6 introduces query-dependent selection; don't harden it
+   further this milestone.
+4. **`CARGO_MANIFEST_DIR` acceptable?** Yes for a fixture-backed stub. Note that
+   there are now two fixture-loading paths — the registry-backed corpus (used by
+   `get_evidence_bundle`) and the older path-based `load_bundle_by_scenario_id`
+   (now effectively a test-only helper in `src/fixtures.rs`). If you do an optional
+   polish slice, centralize fixture-root handling and either retire
+   `load_bundle_by_scenario_id` or document it as test-only; not required for DoD.
+5. **Final slice needed, or done?** Done for Milestone 4. The CLI and extra
+   failure tests are optional polish, not DoD items — User's call.
+6. **One-sided time window: keep hard error or decide now?** Keep it as-is. No
+   fixture needs it and the DoD is met; deciding/testing the one-sided case is
+   reasonable optional-slice work but not required now. (Same position as my
+   review-2 note.)
+
+### Non-blocking notes (optional-slice candidates, no change required)
+
+- Two fixture-loading conventions now coexist (see Q4) — consolidation is the main
+  cleanup worth doing if a polish slice happens.
+- The lexicographic-timestamp and one-sided-window assumptions from review 2 still
+  hold and are still fine under the committed fixture convention.
+
+Net: slice 2 accepted, Milestone 4 DoD met, no required follow-up round. Stop and
+report completion to the User; treat the CLI/polish slice as optional.
