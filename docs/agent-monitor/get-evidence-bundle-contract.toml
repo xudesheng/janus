@@ -31,8 +31,8 @@ USE_WORKTREE = true
 # have it AUTO-GENERATED on first run (the agent is initialised with the prompt
 # "please read docs/review-framework.md" and the new id is written back here).
 [sessions]
-claude = ""
-codex = ""
+claude = "d91d7af0-c40f-4f86-b1fa-3c1a38b3797d"
+codex = "019ee388-e489-7ce0-b7c7-7c0aab899c4b"
 cursor = ""
 
 # All optional; defaults shown.
