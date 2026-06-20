@@ -1,5 +1,8 @@
 use janus::{
-    fixture_simulator::{format_dry_run_plan, format_jsonl_plan, plan_fixture_replay},
+    fixture_simulator::{
+        format_dry_run_plan, format_jsonl_plan, format_replay_summary, plan_fixture_replay,
+        replay_fixture_case,
+    },
     fixture_validation::{FixtureCorpus, FixtureSelector},
 };
 use std::{env, path::Path, process};
@@ -42,12 +45,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    if !dry_run && !jsonl {
-        return Err(
-            "simulate_fixture currently supports dry-run planning only; pass --dry-run or --jsonl"
-                .into(),
-        );
-    }
     if dry_run && jsonl {
         return Err("pass either --dry-run or --jsonl, not both".into());
     }
@@ -63,12 +60,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .into_iter()
         .next()
         .ok_or_else(|| format!("fixture `{fixture_id}` not found"))?;
-    let plan = plan_fixture_replay(case)?;
-
-    if jsonl {
-        println!("{}", format_jsonl_plan(&plan)?);
+    if dry_run || jsonl {
+        let plan = plan_fixture_replay(case)?;
+        if jsonl {
+            println!("{}", format_jsonl_plan(&plan)?);
+        } else {
+            print!("{}", format_dry_run_plan(&plan));
+        }
     } else {
-        print!("{}", format_dry_run_plan(&plan));
+        let summary = replay_fixture_case(case)?;
+        print!("{}", format_replay_summary(&summary));
     }
 
     Ok(())

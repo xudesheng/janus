@@ -61,7 +61,7 @@ In scope:
   events, prior incidents, and telemetry gaps;
 - a hot-store ingest sink or equivalent API that accepts replay events without
   bypassing `HotContextStore`;
-- final-store source-ref resolution checks against current fixture gold
+- final-store raw source-ref resolution checks against current fixture gold
   evidence bundles;
 - step or dry-run mode that shows event order without needing wall-clock sleeps;
 - a small CLI for local demos;
@@ -307,12 +307,19 @@ The simulator CLI can then:
 1. load a fixture;
 2. replay the input into a fresh hot store;
 3. load the fixture gold evidence bundle;
-4. validate that every returned source ref resolves against the simulated store;
+4. validate that every returned raw source ref resolves against the simulated
+   store;
 5. run the existing query-context checks;
 6. print a compact demo report.
 
 The returned bundle should remain unchanged. The simulator proves source-backed
 ingest plumbing, not evidence compilation.
+
+Gold bundles may also contain derived refs such as anomaly windows, log patterns,
+evidence items, entities, and relationships. This simulator replays fixture
+`input.json` only, so it should report those derived refs as skipped during demo
+validation rather than loading `expected.json` derived records or deriving them
+itself. Full derived-ref validation belongs to derived-context topics.
 
 ## CLI
 
@@ -372,7 +379,7 @@ the old fixture loader:
 - resources are emitted before timed records;
 - metric points accumulate into metric-series records with the existing source
   keys;
-- after full replay, every current fixture Evidence IR source ref resolves
+- after full replay, every current fixture Evidence IR raw source ref resolves
   against the simulated store;
 - a partial replay before a known event leaves that event's source ref missing;
 - replaying through that event makes the same source ref resolvable;
@@ -382,9 +389,9 @@ the old fixture loader:
 The partial replay tests are important. They prove this is a stream simulator,
 not just another all-at-once fixture loader.
 
-Implementation slices may prove raw source refs before the final demo validation
-slice. Derived evidence refs, such as anomaly windows and log patterns, still
-need the final validation path to prove the full Definition Of Done.
+Derived evidence refs, such as anomaly windows and log patterns, are outside the
+simulator's ingest-only validation scope. The demo should count and report them
+as skipped rather than silently treating them as replayed input evidence.
 
 ## Definition Of Done
 
@@ -394,8 +401,8 @@ This topic is complete when:
   ingest-like adapter;
 - metric points are represented as replay events and end up under the expected
   metric-series source refs;
-- full replay resolves all current fixture evidence source refs through the hot
-  store;
+- full replay resolves all current fixture evidence raw source refs through the
+  hot store and reports derived refs as skipped;
 - partial replay can show a source ref becoming available over simulated time;
 - a local CLI can run a fixture simulation and print a deterministic summary;
 - no OTLP protobuf, network receiver, persistence, derivation, ranking, or MCP

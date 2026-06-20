@@ -1,6 +1,10 @@
 use crate::{
+    evidence::{EvidenceBundle, SourceRef, SourceSignal, TimeWindow, ValidationErrors},
     fixture_validation::FixtureCase,
-    hot_context_store::{HotIngestEvent, MetricSeriesKey, StoredRecordKind},
+    hot_context_store::{
+        HotContextStore, HotIngestEvent, HotStoreError, MetricSeriesKey, SourceQuery,
+        SourceResolution, StoredRecordKind,
+    },
     references::{metric_series_ref, span_ref},
 };
 use serde_json::{Map, Value, json};
@@ -36,6 +40,17 @@ pub struct FixtureReplayPlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixtureReplaySummary {
+    pub scenario_id: String,
+    pub events_emitted: usize,
+    pub records_stored: usize,
+    pub raw_source_refs_resolved: usize,
+    pub non_replayed_source_refs_skipped: usize,
+    pub query_time_window_records: usize,
+    pub validation_errors: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FixtureSimulationError {
     MissingField {
         fixture_id: String,
@@ -45,6 +60,23 @@ pub enum FixtureSimulationError {
     InvalidShape {
         fixture_id: String,
         json_path: String,
+        message: String,
+    },
+}
+
+#[derive(Debug)]
+pub enum FixtureReplayError {
+    Simulation(FixtureSimulationError),
+    Store(HotStoreError),
+    FixtureBundle(serde_json::Error),
+    InvalidBundle(ValidationErrors),
+    SourceLookup {
+        item_id: String,
+        source_ref: SourceRef,
+        message: String,
+    },
+    QueryWindow(serde_json::Error),
+    QueryContext {
         message: String,
     },
 }
@@ -90,6 +122,40 @@ pub fn plan_fixture_replay(
     FixtureReplayPlan::build(case)
 }
 
+pub fn replay_fixture_case(case: &FixtureCase) -> Result<FixtureReplaySummary, FixtureReplayError> {
+    let plan = plan_fixture_replay(case)?;
+    let store = replay_plan_into_store(&plan)?;
+    let bundle = evidence_bundle_from_case(case)?;
+    bundle
+        .validate()
+        .map_err(FixtureReplayError::InvalidBundle)?;
+    let source_refs = validate_raw_source_refs(&store, &bundle)?;
+    let query_time_window_records = query_time_window_records(&store, case)?;
+
+    Ok(FixtureReplaySummary {
+        scenario_id: case.registry_entry.id.clone(),
+        events_emitted: plan.events().len(),
+        records_stored: store.record_count(),
+        raw_source_refs_resolved: source_refs.resolved,
+        non_replayed_source_refs_skipped: source_refs.skipped,
+        query_time_window_records,
+        validation_errors: 0,
+    })
+}
+
+pub fn replay_plan_into_store(
+    plan: &FixtureReplayPlan,
+) -> Result<HotContextStore, FixtureReplayError> {
+    let mut store = HotContextStore::new();
+
+    for event in plan.events() {
+        let ingest_event = HotIngestEvent::try_from(event)?;
+        store.ingest(ingest_event)?;
+    }
+
+    Ok(store)
+}
+
 pub fn format_dry_run_plan(plan: &FixtureReplayPlan) -> String {
     let mut output = format!(
         "fixture {} replay plan: {} event(s)\n",
@@ -116,6 +182,25 @@ pub fn format_jsonl_plan(plan: &FixtureReplayPlan) -> Result<String, serde_json:
     }
 
     Ok(lines.join("\n"))
+}
+
+pub fn format_replay_summary(summary: &FixtureReplaySummary) -> String {
+    format!(
+        "fixture {} replay summary\n\
+events emitted: {}\n\
+records stored: {}\n\
+raw source refs resolved: {}\n\
+non-replayed source refs skipped: {}\n\
+query time-window records: {}\n\
+validation errors: {}\n",
+        summary.scenario_id,
+        summary.events_emitted,
+        summary.records_stored,
+        summary.raw_source_refs_resolved,
+        summary.non_replayed_source_refs_skipped,
+        summary.query_time_window_records,
+        summary.validation_errors
+    )
 }
 
 impl FixtureReplayPlan {
@@ -248,6 +333,7 @@ impl TryFrom<&SimulationEvent> for HotIngestEvent {
             SimulatedSignal::Resource => Ok(HotIngestEvent::Resource(event.payload.clone())),
             SimulatedSignal::Trace => Ok(HotIngestEvent::Trace(event.payload.clone())),
             SimulatedSignal::Span => {
+                // Fixture span keys are `trace_id/span_id`; real OTLP ingest should carry trace_id directly.
                 let Some((trace_id, _span_id)) = event.source_key.split_once('/') else {
                     return Err(FixtureSimulationError::InvalidShape {
                         fixture_id: event.scenario_id.clone(),
@@ -307,6 +393,168 @@ impl fmt::Display for FixtureSimulationError {
 }
 
 impl std::error::Error for FixtureSimulationError {}
+
+impl From<FixtureSimulationError> for FixtureReplayError {
+    fn from(error: FixtureSimulationError) -> Self {
+        Self::Simulation(error)
+    }
+}
+
+impl From<HotStoreError> for FixtureReplayError {
+    fn from(error: HotStoreError) -> Self {
+        Self::Store(error)
+    }
+}
+
+impl fmt::Display for FixtureReplayError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FixtureReplayError::Simulation(error) => write!(formatter, "{error}"),
+            FixtureReplayError::Store(error) => write!(formatter, "{error}"),
+            FixtureReplayError::FixtureBundle(error) => {
+                write!(
+                    formatter,
+                    "failed to parse fixture evidence bundle: {error}"
+                )
+            }
+            FixtureReplayError::InvalidBundle(error) => {
+                write!(formatter, "fixture evidence bundle is invalid: {error}")
+            }
+            FixtureReplayError::SourceLookup {
+                item_id,
+                source_ref,
+                message,
+            } => write!(
+                formatter,
+                "evidence item `{item_id}` source ref {:?} did not resolve: {message}",
+                source_ref
+            ),
+            FixtureReplayError::QueryWindow(error) => {
+                write!(
+                    formatter,
+                    "failed to parse fixture query time window: {error}"
+                )
+            }
+            FixtureReplayError::QueryContext { message } => write!(formatter, "{message}"),
+        }
+    }
+}
+
+impl std::error::Error for FixtureReplayError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            FixtureReplayError::Simulation(error) => Some(error),
+            FixtureReplayError::Store(error) => Some(error),
+            FixtureReplayError::FixtureBundle(error) | FixtureReplayError::QueryWindow(error) => {
+                Some(error)
+            }
+            FixtureReplayError::InvalidBundle(error) => Some(error),
+            FixtureReplayError::SourceLookup { .. } | FixtureReplayError::QueryContext { .. } => {
+                None
+            }
+        }
+    }
+}
+
+struct RawSourceRefValidation {
+    resolved: usize,
+    skipped: usize,
+}
+
+fn evidence_bundle_from_case(case: &FixtureCase) -> Result<EvidenceBundle, FixtureReplayError> {
+    serde_json::from_value(case.expected["evidence_bundle"].clone())
+        .map_err(FixtureReplayError::FixtureBundle)
+}
+
+fn validate_raw_source_refs(
+    store: &HotContextStore,
+    bundle: &EvidenceBundle,
+) -> Result<RawSourceRefValidation, FixtureReplayError> {
+    let mut resolved = 0;
+    let mut skipped = 0;
+
+    for item in &bundle.items {
+        for source_ref in item.source_refs.iter() {
+            if !is_raw_replay_source_signal(source_ref.signal) {
+                skipped += 1;
+                continue;
+            }
+
+            match store.resolve_source_ref(source_ref) {
+                SourceResolution::Found(_) => resolved += 1,
+                resolution => {
+                    return Err(FixtureReplayError::SourceLookup {
+                        item_id: item.id.clone(),
+                        source_ref: source_ref.clone(),
+                        message: describe_resolution(resolution),
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(RawSourceRefValidation { resolved, skipped })
+}
+
+fn query_time_window_records(
+    store: &HotContextStore,
+    case: &FixtureCase,
+) -> Result<usize, FixtureReplayError> {
+    let time_window: TimeWindow = serde_json::from_value(case.manifest.time_window.clone())
+        .map_err(FixtureReplayError::QueryWindow)?;
+    let matches = store.select(SourceQuery {
+        time_window: Some(time_window),
+        ..SourceQuery::default()
+    });
+
+    if matches.is_empty() {
+        return Err(FixtureReplayError::QueryContext {
+            message: "fixture manifest time window matched no replayed hot-store records"
+                .to_string(),
+        });
+    }
+
+    Ok(matches.len())
+}
+
+fn is_raw_replay_source_signal(signal: SourceSignal) -> bool {
+    matches!(
+        signal,
+        SourceSignal::Trace
+            | SourceSignal::Metric
+            | SourceSignal::Log
+            | SourceSignal::Change
+            | SourceSignal::PriorIncident
+            | SourceSignal::TelemetryGap
+    )
+}
+
+fn describe_resolution(resolution: SourceResolution<'_>) -> String {
+    match resolution {
+        SourceResolution::Found(_) => "found".to_string(),
+        SourceResolution::Missing { raw_ref } => {
+            format!("source ref `{raw_ref}` was missing")
+        }
+        SourceResolution::Unsupported { raw_ref, signal } => {
+            format!("source ref `{raw_ref}` has unsupported signal {signal:?}")
+        }
+        SourceResolution::SignalMismatch {
+            raw_ref,
+            signal,
+            candidates,
+        } => format!(
+            "source ref `{raw_ref}` had {} candidate(s), but none matched signal {signal:?}",
+            candidates.len()
+        ),
+        SourceResolution::Ambiguous {
+            raw_ref,
+            candidates,
+        } => format!(
+            "source ref `{raw_ref}` matched {} candidate(s)",
+            candidates.len()
+        ),
+    }
+}
 
 fn append_resources(
     fixture_id: &str,

@@ -1,6 +1,7 @@
 use janus::{
     fixture_simulator::{
-        SimulatedSignal, format_dry_run_plan, format_jsonl_plan, plan_fixture_replay,
+        SimulatedSignal, format_dry_run_plan, format_jsonl_plan, format_replay_summary,
+        plan_fixture_replay, replay_fixture_case,
     },
     fixture_validation::{FixtureCase, FixtureCorpus, FixtureSelector},
     hot_context_store::StoredRecordKind,
@@ -215,6 +216,59 @@ fn jsonl_output_renders_one_event_per_line() {
     assert_eq!(first["signal"], "resource");
     assert_eq!(first["record_kind"], "resource");
     assert_eq!(first["source_key"], "res:api-gateway");
+}
+
+#[test]
+fn replay_summary_validates_raw_source_refs_for_all_current_fixtures() {
+    let corpus = FixtureCorpus::load(repo_root()).unwrap();
+
+    for case in &corpus.cases {
+        let summary = replay_fixture_case(case).unwrap_or_else(|error| {
+            panic!(
+                "fixture replay failed for {}: {error}",
+                case.registry_entry.id
+            )
+        });
+
+        assert!(summary.events_emitted > 0);
+        assert!(summary.records_stored > 0);
+        assert!(summary.raw_source_refs_resolved > 0);
+        assert!(summary.query_time_window_records > 0);
+        assert_eq!(summary.validation_errors, 0);
+    }
+}
+
+#[test]
+fn replay_summary_reports_non_replayed_source_refs_as_skipped() {
+    let case = fixture_case("deploy-bad-rollout");
+    let summary = replay_fixture_case(&case).unwrap();
+    let output = format_replay_summary(&summary);
+
+    assert!(summary.non_replayed_source_refs_skipped > 0);
+    assert!(output.contains("fixture deploy-bad-rollout replay summary"));
+    assert!(output.contains("raw source refs resolved: "));
+    assert!(output.contains("non-replayed source refs skipped: "));
+    assert!(output.contains("validation errors: 0"));
+}
+
+#[test]
+fn simulate_fixture_cli_default_replay_succeeds_for_one_fixture() {
+    let output = Command::new(env!("CARGO_BIN_EXE_simulate_fixture"))
+        .args(["--fixture", "deploy-bad-rollout"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "simulate_fixture failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("fixture deploy-bad-rollout replay summary"));
+    assert!(stdout.contains("events emitted: "));
+    assert!(stdout.contains("raw source refs resolved: "));
+    assert!(stdout.contains("validation errors: 0"));
 }
 
 #[test]
