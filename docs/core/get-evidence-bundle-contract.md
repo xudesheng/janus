@@ -93,9 +93,11 @@ generation lands in Milestone 6.
    tests should show the response preserves it.
 5. **Raw refs are explicit.** A request can require source-backed evidence; the
    stub should reject or fail validation if a returned item lacks source refs.
-6. **Fixture selection is a temporary adapter.** Milestone 2 may use a
-   `scenario_id` selector so the stub can choose a gold bundle. That selector is
-   not the long-term production query mechanism.
+6. **Fixture selection is a temporary adapter.** Milestone 2 may use an optional
+   `scenario_id` selector so the stub can choose a gold bundle. The stable query
+   core is the intent, time window, entities, budget, evidence requirements,
+   freshness preference, and privacy scope; `scenario_id` is not the long-term
+   production query mechanism.
 7. **No causal claims from this layer.** The function returns structured
    evidence bundles. It does not generate root-cause prose.
 
@@ -135,12 +137,12 @@ Required fields:
 | `intent` | object | The question or hypothesis being investigated. |
 | `time_window` | `TimeWindow` | Investigation window. |
 | `budget` | object | Query-side max item and token budget. |
-| `scenario_id` | string | Temporary fixture selector for Milestone 2 only. |
 
 Optional fields:
 
 | Field | Type | Notes |
 |---|---|---|
+| `scenario_id` | string | Temporary fixture selector for Milestone 2 only. The fixture-backed stub requires it during validation. |
 | `entities` | string array | Candidate or known relevant entity ids. |
 | `require_counter_evidence` | bool | Default should be `false` if omitted. |
 | `require_raw_refs` | bool | Default should be `true` if omitted. |
@@ -149,7 +151,9 @@ Optional fields:
 
 The `scenario_id` field is deliberately temporary. It lets the stub return
 fixture gold output without introducing a registry loader or real retrieval.
-Later milestones should remove or isolate it from production query surfaces.
+It is optional in the request schema so later production query surfaces can omit
+it without breaking the stable query core. For Milestone 2, the fixture-backed
+stub validates that `scenario_id` is present and safe before loading a fixture.
 
 ## Query Intent
 
@@ -193,10 +197,24 @@ The optional fields are useful contract pressure for later retrieval but do not
 need real behavior in the stub. The stub should still validate that numeric
 budget values are non-zero where appropriate.
 
+For the fixture-backed stub, budget compatibility is checked against the actual
+returned content, not the fixture bundle's declared ceilings:
+
+- request `budget.max_tokens` must be greater than or equal to response
+  `budget.tokens_used`;
+- request `budget.max_items` must be greater than or equal to
+  `items.len()`.
+
+The response bundle's `budget.max_tokens` and `budget.max_items` remain fixture
+metadata and are returned unchanged. They are not used to decide whether a
+request can fit the already-authored gold bundle. If the request cannot fit the
+actual returned content, the stub returns the unsupported-budget error.
+
 ## Freshness Requirement
 
 The request can express freshness preference without forcing all returned items
-to match it.
+to match it. This should be a request-side enum such as
+`FreshnessPreference`, distinct from response-side `EvidenceFreshness`.
 
 Suggested enum values:
 
@@ -205,7 +223,8 @@ Suggested enum values:
 - `changing`
 
 `any` should be the default. This keeps the request contract explicit while
-avoiding false precision in the fixture-backed stub.
+avoiding false precision in the fixture-backed stub. The value `any` must not be
+added to response-side Evidence IR freshness.
 
 ## Privacy Scope
 
@@ -228,8 +247,19 @@ The fixture-backed implementation should do this:
 2. load `fixtures/scenarios/<scenario_id>/expected.json` using the existing
    narrow fixture loader;
 3. validate the loaded `EvidenceBundle`;
-4. return the loaded bundle unchanged, except for optional metadata that is
-   explicitly part of the response contract.
+4. return the loaded bundle unchanged.
+
+Milestone 2 does not add query echo fields, selected-budget metadata, or other
+new fields to `EvidenceBundle`. The response contract remains the Milestone 1
+Evidence IR bundle. The stub may deserialize and reserialize the bundle, but it
+must not add, remove, reorder, rewrite, or synthesize evidence content.
+
+The public `get_evidence_bundle` path should validate `scenario_id` before
+calling the loader. Missing, empty, traversal, or path-separator-containing
+scenario ids are invalid query errors. The existing loader guard remains
+defense-in-depth; if that same invalid-id guard trips through the public path,
+map it to invalid query rather than fixture load error. I/O, parse, and missing
+bundle failures are fixture load errors.
 
 The stub must not:
 
@@ -240,9 +270,10 @@ The stub must not:
 - synthesize missing counter-evidence;
 - rewrite source refs.
 
-If the query budget is lower than the fixture bundle budget, the stub should
-return a clear error rather than pretending it optimized selection. Budget-aware
-selection belongs to Milestone 6.
+If the query budget cannot fit the returned fixture content by the compatibility
+rules in "Query Budget", the stub should return a clear unsupported-budget error
+rather than pretending it optimized selection. Budget-aware selection belongs to
+Milestone 6.
 
 ## Error Model
 
@@ -251,8 +282,9 @@ problems from fixture loading problems.
 
 Suggested variants:
 
-- invalid query;
-- fixture load error;
+- invalid query, including missing intent, invalid budget values, missing
+  `scenario_id` for the fixture-backed stub, or unsafe `scenario_id`;
+- fixture load error for I/O, parse, or missing `evidence_bundle` failures;
 - invalid fixture bundle;
 - unsupported budget for fixture stub.
 
@@ -273,7 +305,9 @@ Schema requirements:
 - enum values are explicit;
 - arrays define `items`;
 - request budget fields expose integer minimums where practical;
-- `scenario_id`, `intent`, `time_window`, and `budget` are required;
+- `intent`, `time_window`, and `budget` are required;
+- `scenario_id` is optional in schema but required by the fixture-backed stub's
+  validation path;
 - unknown fields are rejected for request-side structs;
 - the schema is generated from Rust types, not handwritten as the source of
   truth.
@@ -290,8 +324,9 @@ Milestone 2 should include tests that:
 2. construct an `EvidenceQuery` for `coincidental-deploy-trap` and verify
    counter-evidence survives unchanged;
 3. reject a query with neither question nor hypothesis;
-4. reject path traversal in `scenario_id`;
-5. reject or clearly fail a budget smaller than the fixture bundle budget;
+4. reject a missing or unsafe `scenario_id` in the fixture-backed stub;
+5. reject a budget whose `max_tokens` is lower than response
+   `budget.tokens_used` or whose `max_items` is lower than `items.len()`;
 6. serialize a returned `EvidenceBundle` to JSON;
 7. generate and compare the committed `evidence-query.schema.json`;
 8. verify generated array schemas declare `items`.
@@ -332,7 +367,8 @@ The `get-evidence-bundle-contract` topic is complete when:
 2. `get_evidence_bundle(EvidenceQuery) -> Result<EvidenceBundle, _>` exists.
 3. The implementation returns fixture-backed gold bundles by scenario id.
 4. Baseline and false-causality trap fixtures are covered by tests.
-5. Query validation rejects missing intent and unsafe scenario ids.
+5. Query validation rejects missing intent and missing or unsafe scenario ids for
+   the fixture-backed stub.
 6. Stub budget limitations are explicit and tested.
 7. `evidence-query.schema.json` is generated and committed.
 8. A CLI or equivalent helper can emit response JSON.
