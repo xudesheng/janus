@@ -1,0 +1,173 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "EvidenceItem",
+  "type": "object",
+  "required": [
+    "claim",
+    "direction",
+    "entities",
+    "freshness",
+    "id",
+    "kind",
+    "missing_data",
+    "privacy_scope",
+    "source_refs",
+    "strength",
+    "time_window",
+    "token_cost"
+  ],
+  "properties": {
+    "claim": {
+      "type": "string"
+    },
+    "confidence": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/UnitInterval"
+      }
+    },
+    "direction": {
+      "$ref": "#/definitions/EvidenceDirection"
+    },
+    "entities": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "freshness": {
+      "$ref": "#/definitions/EvidenceFreshness"
+    },
+    "id": {
+      "type": "string"
+    },
+    "kind": {
+      "$ref": "#/definitions/EvidenceKind"
+    },
+    "missing_data": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "note": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "privacy_scope": {
+      "type": "string"
+    },
+    "source_refs": {
+      "$ref": "#/definitions/SourceRefs"
+    },
+    "strength": {
+      "$ref": "#/definitions/UnitInterval"
+    },
+    "time_window": {
+      "$ref": "#/definitions/TimeWindow"
+    },
+    "token_cost": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "EvidenceDirection": {
+      "type": "string",
+      "enum": [
+        "supports",
+        "weakens",
+        "contradicts",
+        "neutral"
+      ]
+    },
+    "EvidenceFreshness": {
+      "type": "string",
+      "enum": [
+        "settled",
+        "changing"
+      ]
+    },
+    "EvidenceKind": {
+      "type": "string",
+      "enum": [
+        "metric_anomaly",
+        "trace_exemplar",
+        "log_cluster",
+        "change_event",
+        "dependency_edge",
+        "profile_hotspot",
+        "previous_incident",
+        "counter_evidence",
+        "missing_data"
+      ]
+    },
+    "SourceRef": {
+      "type": "object",
+      "required": [
+        "ref",
+        "signal"
+      ],
+      "properties": {
+        "ref": {
+          "type": "string"
+        },
+        "signal": {
+          "$ref": "#/definitions/SourceSignal"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SourceRefs": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/SourceRef"
+      },
+      "minItems": 1
+    },
+    "SourceSignal": {
+      "type": "string",
+      "enum": [
+        "trace",
+        "metric",
+        "log",
+        "change",
+        "profile",
+        "anomaly_window",
+        "log_pattern",
+        "prior_incident",
+        "telemetry_gap",
+        "entity",
+        "relationship",
+        "external"
+      ]
+    },
+    "TimeWindow": {
+      "type": "object",
+      "required": [
+        "end",
+        "start"
+      ],
+      "properties": {
+        "end": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "start": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "additionalProperties": false
+    },
+    "UnitInterval": {
+      "type": "number",
+      "maximum": 1.0,
+      "minimum": 0.0
+    }
+  }
+}

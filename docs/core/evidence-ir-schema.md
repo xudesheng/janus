@@ -26,6 +26,23 @@ The implementation topic should deliver:
 - tests that deserialize current fixture evidence bundles;
 - at least one serialized example bundle or evidence item.
 
+## Design Review Gate
+
+No Rust implementation should start for this topic until every active reviewer
+has agreed on the design direction in their `Direction Verdict`. Until then,
+review rounds for `evidence-ir-schema` are design-only or diagnosis-only rounds.
+
+After reviewer agreement, the implementation can land as one small milestone or
+as phase-by-phase review rounds:
+
+1. Rust Evidence IR types, enum vocabulary, and validation helpers.
+2. Narrow fixture loader plus tests against current `expected.json` bundles.
+3. Generated JSON Schema artifacts and repeatability tests.
+
+The phases are sequencing guidance, not separate product milestones. All three
+remain part of Milestone 1, and none should pull `EvidenceQuery`,
+`get_evidence_bundle`, MCP tools, or full fixture validation into this topic.
+
 ## Scope
 
 In scope for this topic:
@@ -76,6 +93,11 @@ fixture checks belong to `fixture-validation-harness`.
 7. **Prefer simple types until behavior needs more.** Timestamps can start as
    validated ISO-8601 strings in the contract. Temporal arithmetic belongs to
    later derivation and compiler work.
+8. **Keep fixture annotations outside Evidence IR.** `expected.json` may contain
+   `_`-prefixed helper keys outside `evidence_bundle`, but `EvidenceBundle`,
+   `EvidenceItem`, `SourceRef`, and budget objects should reject unknown fields,
+   including `_`-prefixed annotation keys. If a future fixture needs annotation
+   inside Evidence IR, the formal contract must add an explicit field first.
 
 ## Rust Module Shape
 
@@ -213,6 +235,12 @@ Current fixtures use `trace`, `metric`, `log`, `change`, `anomaly_window`,
 External backend pointers can use `external` later, but source resolution is not
 part of this milestone.
 
+Fixture compatibility note: current fixtures sometimes use `signal: "log"` with
+refs to log-pattern ids such as `lp-1`. Milestone 1 should accept that current
+shape unless reviewers explicitly choose a fixture migration. The `log_pattern`
+signal value is reserved for a more precise future split, not a reason to churn
+fixtures during the first executable contract.
+
 ### `EvidenceBudget`
 
 Shape:
@@ -309,6 +337,12 @@ Known dimensions from current fixtures include:
 The schema should require each confidence value to be a number between `0` and
 `1`, but it should not freeze the set of confidence dimension names.
 
+This open-ended map is acceptable for Milestone 1 because confidence is
+response-side data and MCP tool schemas are out of scope. Some strict tool-use
+validators may reject open `additionalProperties` objects; Milestone 7
+(`mcp-agent-surface`) should revisit whether agent-facing tool schemas need a
+closed confidence representation.
+
 ## Fixture Loader
 
 Milestone 1 needs only a narrow loader. It should not become the full fixture
@@ -359,6 +393,9 @@ Schema requirements:
 
 Schema compatibility with strict tool validators matters, even though MCP tool
 schemas are not part of this milestone.
+
+Tests should fail if any generated schema object with `type: array` lacks an
+`items` declaration.
 
 ## Validation Helpers
 
@@ -434,4 +471,3 @@ The review for this topic should focus on:
   that current fixtures need unnecessary churn;
 - whether the fixture loader stays narrow and does not pull Milestone 3 forward;
 - whether schema generation is repeatable and testable.
-
