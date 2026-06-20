@@ -1,6 +1,7 @@
 use janus::{
     evidence::{evidence_bundle_schema, evidence_item_schema},
     fixtures::{FixtureLoadError, load_bundle_by_scenario_id, load_bundle_from_expected_path},
+    query::evidence_query_schema,
 };
 use serde_json::Value;
 use std::{fs, path::PathBuf};
@@ -57,15 +58,21 @@ fn generated_schemas_match_committed_artifacts() {
         "schemas/evidence-ir/evidence-bundle.schema.json",
         serde_json::to_value(evidence_bundle_schema()).unwrap(),
     );
+    assert_schema_matches(
+        "schemas/evidence-ir/evidence-query.schema.json",
+        serde_json::to_value(evidence_query_schema()).unwrap(),
+    );
 }
 
 #[test]
 fn generated_array_schemas_declare_items() {
     let item_schema = serde_json::to_value(evidence_item_schema()).unwrap();
     let bundle_schema = serde_json::to_value(evidence_bundle_schema()).unwrap();
+    let query_schema = serde_json::to_value(evidence_query_schema()).unwrap();
 
     assert_arrays_have_items("$EvidenceItem", &item_schema);
     assert_arrays_have_items("$EvidenceBundle", &bundle_schema);
+    assert_arrays_have_items("$EvidenceQuery", &query_schema);
 }
 
 #[test]

@@ -247,7 +247,10 @@ The fixture-backed implementation should do this:
 2. load `fixtures/scenarios/<scenario_id>/expected.json` using the existing
    narrow fixture loader;
 3. validate the loaded `EvidenceBundle`;
-4. return the loaded bundle unchanged.
+4. check that the requested budget fits the loaded bundle's actual
+   `tokens_used` and `items.len()`;
+5. check any Milestone 2 fixture-stub evidence requirements;
+6. return the loaded bundle unchanged.
 
 Milestone 2 does not add query echo fields, selected-budget metadata, or other
 new fields to `EvidenceBundle`. The response contract remains the Milestone 1
@@ -260,6 +263,17 @@ scenario ids are invalid query errors. The existing loader guard remains
 defense-in-depth; if that same invalid-id guard trips through the public path,
 map it to invalid query rather than fixture load error. I/O, parse, and missing
 bundle failures are fixture load errors.
+
+In Milestone 2, `require_raw_refs: true` is satisfied by any bundle that passes
+Milestone 1 `EvidenceBundle` validation, because every item already requires
+non-empty `source_refs`. Setting `require_raw_refs: false` does not weaken
+Evidence IR validation for fixture-backed bundles.
+
+In Milestone 2, `require_counter_evidence: true` requires at least one returned
+item with `kind: counter_evidence` or `direction: weakens | contradicts`.
+If `budget.min_counter_evidence_items` is present, the stub requires at least
+that many counter-evidence items whether or not `require_counter_evidence` is
+set.
 
 The stub must not:
 
