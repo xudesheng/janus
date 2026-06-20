@@ -1,6 +1,9 @@
 use crate::evidence::{
     EvidenceBundle, EvidenceDirection, EvidenceKind, SourceSignal, ValidationErrors,
 };
+use crate::references::{
+    RefCategory, ReferenceIndex, categories_for_signal, display_categories, source_signal_name,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -1282,121 +1285,6 @@ fn validate_scalar_ref_value(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum RefCategory {
-    Resource,
-    Trace,
-    Span,
-    Metric,
-    Log,
-    Change,
-    PriorIncident,
-    TelemetryGap,
-    Entity,
-    Relationship,
-    AnomalyWindow,
-    LogPattern,
-    EvidenceItem,
-}
-
-#[derive(Debug, Clone, Default)]
-struct ReferenceIndex {
-    refs: BTreeMap<String, BTreeSet<RefCategory>>,
-}
-
-impl ReferenceIndex {
-    fn build(input: &Value, expected: &Value) -> Self {
-        let mut index = Self::default();
-        index.add_input_refs(input);
-        index.add_expected_refs(expected);
-        index
-    }
-
-    fn resolve(&self, raw_ref: &str) -> Option<&BTreeSet<RefCategory>> {
-        if let Some(categories) = self.refs.get(raw_ref) {
-            return Some(categories);
-        }
-
-        raw_ref
-            .strip_prefix("trace:")
-            .and_then(|stripped| self.refs.get(stripped))
-    }
-
-    fn add(&mut self, raw_ref: impl Into<String>, category: RefCategory) {
-        let raw_ref = raw_ref.into();
-        if raw_ref.trim().is_empty() {
-            return;
-        }
-
-        self.refs.entry(raw_ref).or_default().insert(category);
-    }
-
-    fn add_input_refs(&mut self, input: &Value) {
-        add_ids_from_array(self, input, "resources", RefCategory::Resource);
-        add_ids_from_array(self, input, "logs", RefCategory::Log);
-        add_ids_from_array(self, input, "changes", RefCategory::Change);
-        add_ids_from_array(self, input, "prior_incidents", RefCategory::PriorIncident);
-        add_ids_from_array(self, input, "telemetry_gaps", RefCategory::TelemetryGap);
-
-        if let Some(traces) = array_at(input, "traces") {
-            for trace in traces {
-                if let Some(trace_id) = trace.get("trace_id").and_then(Value::as_str) {
-                    self.add(trace_id, RefCategory::Trace);
-
-                    if let Some(spans) = trace.get("spans").and_then(Value::as_array) {
-                        for span in spans {
-                            if let Some(span_id) = span.get("span_id").and_then(Value::as_str) {
-                                self.add(format!("{trace_id}/{span_id}"), RefCategory::Span);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if let Some(metrics) = array_at(input, "metrics") {
-            for metric in metrics {
-                if let (Some(name), Some(entity)) = (
-                    metric.get("name").and_then(Value::as_str),
-                    metric.get("entity").and_then(Value::as_str),
-                ) {
-                    self.add(format!("{name}@{entity}"), RefCategory::Metric);
-                }
-
-                if let Some(gap_ref) = metric
-                    .get("_gap")
-                    .and_then(|gap| gap.get("ref"))
-                    .and_then(Value::as_str)
-                {
-                    self.add(gap_ref, RefCategory::TelemetryGap);
-                }
-            }
-        }
-    }
-
-    fn add_expected_refs(&mut self, expected: &Value) {
-        add_ids_from_array(self, expected, "entities", RefCategory::Entity);
-        add_ids_from_array(
-            self,
-            expected,
-            "anomaly_windows",
-            RefCategory::AnomalyWindow,
-        );
-        add_ids_from_array(self, expected, "log_patterns", RefCategory::LogPattern);
-
-        if let Some(items) = expected
-            .pointer("/evidence_bundle/items")
-            .and_then(Value::as_array)
-        {
-            for item in items {
-                if let Some(id) = item.get("id").and_then(Value::as_str) {
-                    self.add(id, RefCategory::EvidenceItem);
-                }
-            }
-        }
-    }
-}
-
 struct RawCorpus {
     root: PathBuf,
     fixtures_root: PathBuf,
@@ -1639,16 +1527,6 @@ fn array_at<'a>(value: &'a Value, key: &str) -> Option<&'a Vec<Value>> {
     value.get(key).and_then(Value::as_array)
 }
 
-fn add_ids_from_array(index: &mut ReferenceIndex, value: &Value, key: &str, category: RefCategory) {
-    if let Some(values) = array_at(value, key) {
-        for value in values {
-            if let Some(id) = value.get("id").and_then(Value::as_str) {
-                index.add(id, category);
-            }
-        }
-    }
-}
-
 fn metric_names_by_entity(input: &Value) -> BTreeMap<String, BTreeSet<String>> {
     let mut names = BTreeMap::<String, BTreeSet<String>>::new();
 
@@ -1706,62 +1584,6 @@ fn first_ranked_suspected_cause(expected: &Value) -> Option<&str> {
         })
         .min_by_key(|(rank, _)| *rank)
         .map(|(_, entity)| entity)
-}
-
-fn categories_for_signal(signal: SourceSignal) -> &'static [RefCategory] {
-    match signal {
-        SourceSignal::Trace => &[RefCategory::Trace, RefCategory::Span],
-        SourceSignal::Metric => &[RefCategory::Metric],
-        SourceSignal::Log => &[RefCategory::Log],
-        SourceSignal::Change => &[RefCategory::Change],
-        SourceSignal::Profile => &[],
-        SourceSignal::AnomalyWindow => &[RefCategory::AnomalyWindow],
-        SourceSignal::LogPattern => &[RefCategory::LogPattern],
-        SourceSignal::PriorIncident => &[RefCategory::PriorIncident],
-        SourceSignal::TelemetryGap => &[RefCategory::TelemetryGap],
-        SourceSignal::Entity => &[RefCategory::Entity],
-        SourceSignal::Relationship => &[RefCategory::Relationship],
-        SourceSignal::External => &[],
-    }
-}
-
-fn source_signal_name(signal: SourceSignal) -> &'static str {
-    match signal {
-        SourceSignal::Trace => "trace",
-        SourceSignal::Metric => "metric",
-        SourceSignal::Log => "log",
-        SourceSignal::Change => "change",
-        SourceSignal::Profile => "profile",
-        SourceSignal::AnomalyWindow => "anomaly_window",
-        SourceSignal::LogPattern => "log_pattern",
-        SourceSignal::PriorIncident => "prior_incident",
-        SourceSignal::TelemetryGap => "telemetry_gap",
-        SourceSignal::Entity => "entity",
-        SourceSignal::Relationship => "relationship",
-        SourceSignal::External => "external",
-    }
-}
-
-fn display_categories<'a>(categories: impl IntoIterator<Item = &'a RefCategory>) -> String {
-    categories
-        .into_iter()
-        .map(|category| match category {
-            RefCategory::Resource => "resource",
-            RefCategory::Trace => "trace",
-            RefCategory::Span => "span",
-            RefCategory::Metric => "metric",
-            RefCategory::Log => "log",
-            RefCategory::Change => "change",
-            RefCategory::PriorIncident => "prior_incident",
-            RefCategory::TelemetryGap => "telemetry_gap",
-            RefCategory::Entity => "entity",
-            RefCategory::Relationship => "relationship",
-            RefCategory::AnomalyWindow => "anomaly_window",
-            RefCategory::LogPattern => "log_pattern",
-            RefCategory::EvidenceItem => "evidence_item",
-        })
-        .collect::<Vec<_>>()
-        .join("|")
 }
 
 fn sorted_strings(values: &[String]) -> Vec<String> {
