@@ -12,7 +12,7 @@ fn current_corpus_validates_successfully() {
     let report = validate_fixture_corpus(repo_root());
 
     assert_eq!(report.error_count(), 0, "{report}");
-    assert_eq!(report.warning_count(), 4, "{report}");
+    assert_eq!(report.warning_count(), 0, "{report}");
     assert_eq!(report.coverage.fixture_count, 12);
     assert_eq!(report.coverage.false_causality_trap_count, 2);
 }
@@ -170,6 +170,55 @@ fn dangling_timeline_source_ref_fails() {
     let report = validate_fixture_corpus(corpus.path());
 
     assert_has_error(&report, "$.timeline[0].source_ref");
+}
+
+#[test]
+fn signal_ref_mismatch_warns_when_ref_is_in_fixture() {
+    let corpus = TempCorpus::new("signal_ref_mismatch");
+    write_minimal_corpus(corpus.path(), &["evidence-ir", "get_evidence_bundle"]);
+    write_scenario(
+        corpus.path(),
+        r#"{
+          "id": "minimal",
+          "title": "Minimal fixture",
+          "version": 1,
+          "schema_version": "fixtures/v1",
+          "failure_class": "deploy",
+          "difficulty": "baseline",
+          "false_causality_trap": false,
+          "summary": "Minimal scenario.",
+          "question": "What happened?",
+          "time_window": { "start": "2026-06-01T00:00:00Z", "end": "2026-06-01T00:05:00Z" },
+          "ground_truth": { "primary_cause_entity": "service:minimal", "not_the_cause": [] },
+          "capabilities": ["evidence-ir", "get_evidence_bundle"],
+          "inputs": ["logs"],
+          "expected": ["log_patterns", "evidence_bundle"]
+        }"#,
+    );
+    write_expected(
+        corpus.path(),
+        format!(
+            r#"{{
+              "log_patterns": [
+                {{ "id": "lp-1", "template": "failed", "entity": "service:minimal", "severity": "ERROR", "first_seen": "2026-06-01T00:01:00Z", "last_seen": "2026-06-01T00:01:00Z", "count": 1, "exemplars": ["log-1"], "stability": "new-since-incident" }}
+              ],
+              "evidence_bundle": {}
+            }}"#,
+            minimal_bundle_with_ref("lp-1")
+        )
+        .as_str(),
+    );
+
+    let report = validate_fixture_corpus(corpus.path());
+
+    assert_eq!(report.error_count(), 0, "{report}");
+    assert_eq!(report.warning_count(), 1, "{report}");
+    assert!(report.issues.iter().any(|issue| {
+        issue.severity == IssueSeverity::Warning
+            && issue
+                .message
+                .contains("source signal `log` points at log_pattern")
+    }));
 }
 
 #[test]
