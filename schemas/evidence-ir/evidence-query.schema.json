@@ -1,0 +1,138 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "EvidenceQuery",
+  "type": "object",
+  "required": [
+    "budget",
+    "intent",
+    "time_window"
+  ],
+  "properties": {
+    "budget": {
+      "$ref": "#/definitions/EvidenceQueryBudget"
+    },
+    "entities": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "freshness": {
+      "default": "any",
+      "allOf": [
+        {
+          "$ref": "#/definitions/FreshnessPreference"
+        }
+      ]
+    },
+    "intent": {
+      "$ref": "#/definitions/EvidenceQueryIntent"
+    },
+    "privacy_scope": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "require_counter_evidence": {
+      "default": false,
+      "type": "boolean"
+    },
+    "require_raw_refs": {
+      "default": true,
+      "type": "boolean"
+    },
+    "scenario_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "time_window": {
+      "$ref": "#/definitions/TimeWindow"
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "EvidenceQueryBudget": {
+      "type": "object",
+      "required": [
+        "max_items",
+        "max_tokens"
+      ],
+      "properties": {
+        "max_items": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1.0
+        },
+        "max_tokens": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1.0
+        },
+        "min_counter_evidence_items": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 1.0
+        },
+        "reserve_tokens_for_raw_refs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 1.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "EvidenceQueryIntent": {
+      "type": "object",
+      "properties": {
+        "hypothesis": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "question": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "FreshnessPreference": {
+      "type": "string",
+      "enum": [
+        "any",
+        "settled",
+        "changing"
+      ]
+    },
+    "TimeWindow": {
+      "type": "object",
+      "required": [
+        "end",
+        "start"
+      ],
+      "properties": {
+        "end": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "start": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
