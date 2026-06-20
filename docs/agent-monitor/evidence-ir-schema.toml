@@ -17,7 +17,7 @@ TOPIC = "evidence-ir-schema"
 
 # Repo the loop drives. If omitted, the current working directory is used.
 # TOML literal strings (single quotes) need no backslash escaping on Windows.
-WORK_ROOT = 'C:\Users\xudes\Documents\github\rust\janus'
+WORK_ROOT = 'C:\Users\xudes\Documents\github\janus'
 DESIGN_DOC_FOLDER = "./docs/core"
 # Optional: work in a git worktree instead of WORK_ROOT itself. When true, the
 # loop requires WORK_ROOT to be on 'main', runs `git pull`, ensures a branch named
@@ -31,8 +31,8 @@ USE_WORKTREE = true
 # have it AUTO-GENERATED on first run (the agent is initialised with the prompt
 # "please read docs/review-framework.md" and the new id is written back here).
 [sessions]
-claude = ""
-codex = ""
+claude = "112bf3be-bf7c-46ac-aa6b-8cf468e40464"
+codex = "019ee360-014a-71d0-81b6-db1ca19d099e"
 cursor = ""
 
 # All optional; defaults shown.
