@@ -92,3 +92,124 @@ Milestone 4 Definition Of Done.
 - No code verification this round; this is a design-only review submission.
 
 <!-- Reviewer appends below; the Implementor must not edit past this line. -->
+
+## Review (by Claude)
+
+### Direction Verdict
+
+On critical path: yes. Moves the milestone: yes. Next action: continue.
+
+I AGREE with the design direction. `hot-context-store` is the correct next topic:
+sequencing it before any OTLP/simulator work is right, because it turns ingest
+into "just another adapter into one store" instead of a one-off demo path, and it
+advances Janus from Milestone 3 *closure* ("the ref string exists") to Milestone 4
+*retrieval* ("the ref dereferences to a concrete stored record"). Scope control is
+good — derivation, ranking, live ingest, durable persistence, and MCP surfaces are
+correctly excluded. The `StoredRecord` + `serde_json::Value` payload envelope is
+the right altitude for a fixture-shaped store and does not over-commit the later
+OTLP path.
+
+Per the design's own Review Gate, this is an agree-with-refinements verdict, not a
+blank check: three items below shape the store *contract* and should be settled in
+`docs/core/hot-context-store.md` before (or as the first act of) coding, because
+they affect testable behavior and the validator/store boundary. None of them is a
+redirect. I also explicitly approve the proposed phase-by-phase slicing (see Q5).
+
+### Must-resolve in the design before coding
+
+**1. Reuse the existing `ReferenceIndex`, don't re-derive keys in parallel.**
+The canonical source-key and alias conventions the design re-specifies in "Source
+Keys" already exist and run today in `ReferenceIndex`
+(`src/fixture_validation.rs:1302-1398`): trace ids, `{trace_id}/{span_id}` spans,
+`{name}@{entity}` metrics, log/change/prior-incident/telemetry-gap ids, derived
+anomaly-window / log-pattern / evidence-item ids, and the `trace:` prefix alias
+strip (`resolve`, lines 1315-1323). The design's key table is essentially a second
+copy of that logic. Two independent derivations *will* drift, and the failure mode
+is exactly the invariant this milestone exists to protect: the store could resolve
+a ref the validator rejects, or vice versa. The design currently commits to "don't
+duplicate parsing logic" for *loading* (line ~296) but says nothing about the
+*key derivation*. Please state explicitly that the store reuses/extends the
+`ReferenceIndex` key+alias scheme as the single source of truth — most naturally by
+promoting it (or its key-construction helpers) into a shared module that maps a ref
+to a concrete record handle, with the M3 `ref -> {RefCategory}` view kept as a thin
+projection. The M3↔M4 distinction ("closure vs. retrieval") then becomes "same keys,
+richer value," which is exactly the framing the design wants.
+
+**2. Make signal/category mismatch a hard outcome now; the warning path has no
+witness (Review Focus #4).** The current corpus validates at **0 errors, 0
+warnings** (`cargo run --bin validate_fixtures` on the baseline tree), and
+`7dbad28 "Clean fixture source signal mismatches"` already removed the cases that
+produced warnings. So the "narrow compatibility warning path while current fixtures
+are cleaned up" the design hedges on (lines ~204-208, ~287-292) currently guards
+*nothing*. Carrying a warning branch with no fixture exercising it is untested code
+and a silent-acceptance risk. Recommendation: in the store, `SourceResolution`
+treats signal/category mismatch as a distinct first-class outcome (the design
+already lists this — good), and the store-aware `get_evidence_bundle` integration
+treats it as a **failure**, not a warning, for the committed corpus. If you want to
+keep a warning escape hatch, gate it behind an explicit, test-covered fixture flag
+so it cannot regress into silent acceptance — but given the clean corpus I'd drop it
+until a fixture actually needs it, and add it back with its witness.
+
+**3. Define the primary-key namespace precisely: global vs. per-kind, and how that
+splits "duplicate-key loader error" from "ambiguous-resolution outcome" (Review
+Focus #6).** The design says duplicate primary keys are a *loader error*
+(lines ~272-278) but also that `SourceResolution` must report *"found multiple
+possible targets"* (lines ~255-261). These collide for a cross-category same-string
+case — e.g. a log id equal to a change id pointing at two different records. Today
+`ReferenceIndex` keys a string to a *set* of categories (line 1304), i.e. it is a
+single global namespace that tolerates one string carrying multiple categories.
+Decide and write down: is the store's primary-key namespace **global** (so any
+same-string collision across kinds is a load-time duplicate error) or **per-kind**
+(so the same string can be a log record and a change record, and `resolve_source_ref`
+disambiguates by `SourceRef.signal`, only returning "multiple possible targets" when
+the signal cannot disambiguate)? Because `SourceRef` already carries `signal`
+(`src/evidence.rs:54-59`), per-kind keying with signal disambiguation is the more
+faithful and more testable model, and it makes the "ambiguous" outcome reachable
+only when it genuinely cannot be resolved. Either choice is fine, but the test plan
+("duplicate source keys fail with a useful error" vs. "missing refs fail distinctly
+from mismatches") is unspecified until this is nailed down.
+
+### Minor (can be handled in implementation)
+
+- **Total resolution over `SourceSignal`.** The design defines the outcome for
+  `external` refs (always fail — good) but is silent on `profile`. `SourceSignal`
+  has 12 variants (`src/evidence.rs:106-121`) and `categories_for_signal` maps both
+  `Profile` and `External` to `&[]` (`fixture_validation.rs:1717,1724`); there is no
+  `profile` record kind in the store's kind list. Please state that `profile`
+  resolves to a deterministic "unsupported / no target" outcome too, so resolution
+  is total over the enum and can't silently fall through.
+- **Doc accuracy nit.** `FixtureCase`/`FixtureCorpus` live in the
+  `fixture_validation` module, not `fixtures` (the design says "from the Milestone 3
+  harness," which is fine, but the `load_fixture_case(case: &FixtureCase)` signature
+  should name the right import path). They are already `pub`, so no API change is
+  needed — the store can consume them directly.
+
+### Answers to the requested reviewer questions
+
+1. **Store boundary:** Yes — envelope + JSON payload is strong enough for later
+   simulator/OTLP adapters while staying small, provided finding #1 keeps key
+   derivation unified with the validator.
+2. **Beyond M3 closure:** Yes — requiring a concrete `StoredRecord` (not
+   `Option<&_>`, per "Store API Shape") is a real advance over closure checks.
+3. **Mismatch policy:** Hard failure now (finding #2). The corpus is clean; don't
+   ship an unexercised warning branch.
+4. **Scope control:** Correct exclusions. Keep them.
+5. **Slicing:** I approve phase-by-phase implementation as proposed (slices 1-3),
+   on the condition that **slice 1 settles the key namespace / `ReferenceIndex`
+   reuse contract** (findings #1 and #3), since slices 2-3 depend on it. Each slice
+   must preserve the full Definition Of Done as the design already requires.
+6. **Selector/error semantics:** Precise enough *except* finding #3; deterministic
+   ordering preferring fixture order, optional window/entity/kind filters, and the
+   four-way `SourceResolution` split are testable as written.
+7. **Query integration:** Yes — returning the gold bundle unchanged while
+   exercising store-backed source lookup and window/entity selection is the right
+   M4 behavior; bundle rewriting/pruning correctly stays Milestone 6. One
+   implementation note: today `get_evidence_bundle` loads only `expected.json` via
+   `load_bundle_by_scenario_id` (`src/query.rs:107`, `src/fixtures.rs:29`), so the
+   store-aware path will additionally need the fixture **input** (the `FixtureCase`),
+   which means going through the registry-backed `FixtureCorpus`. Add the store-aware
+   helper alongside and keep the current function as a thin wrapper, as the design
+   suggests.
+
+Net: direction approved, proceed to implementation under the proposed slicing once
+findings #1-#3 are folded into `docs/core/hot-context-store.md`.
