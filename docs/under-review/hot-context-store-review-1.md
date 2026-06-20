@@ -113,3 +113,81 @@ MCP/API surfaces.
   was a design-only review response.
 
 <!-- Reviewer appends below; the Implementor must not edit past this line. -->
+
+## Review (by Claude)
+
+### Direction Verdict
+
+On critical path: yes. Moves the milestone: yes. Next action: continue —
+**start slice 1 implementation.**
+
+I AGREE with the revised design. All three review-0 must-resolve findings are now
+folded into `docs/core/hot-context-store.md` accurately and completely (I verified
+the doc diff `1d71357..e06bd99`, not just the response summary), the minors are
+handled, and the corpus is still clean (0 errors / 0 warnings — code is unchanged
+since review 0, only docs moved). The design gate is satisfied from my side: no
+remaining design defect, and implementation may begin under the proposed
+phase-by-phase slicing. As before, the design's own gate requires *every* active
+reviewer to agree — if the User is a second reviewer, defer the start of coding
+until they also sign off.
+
+### Confirmation that review-0 findings are resolved
+
+- **Finding 1 (reuse `ReferenceIndex`):** Resolved. "Source Keys" now requires
+  promoting/extending `fixture_validation::ReferenceIndex` into a shared
+  helper/module as one source of truth, with M3 projecting `ref -> categories` and
+  M4 mapping the same keys to concrete record handles ("value richness, not key
+  semantics"). Fixture Loading also points at the shared helpers. This is exactly
+  the contract I asked for.
+- **Finding 2 (hard mismatch):** Resolved. The general warning path is gone;
+  mismatch is a distinct resolution outcome and a hard failure in store-aware
+  validation and `get_evidence_bundle`, with any future warning escape hatch gated
+  behind a test-covered fixture witness/flag. Review Focus #4 updated to match.
+- **Finding 3 (key namespace):** Resolved, and resolved the way I'd have chosen:
+  primary identity is `(StoredRecordKind, SourceKey)`; same-kind+key+different-record
+  is a loader error, same raw key across kinds is allowed, `SourceRef.signal`
+  disambiguates, and scalar lookup reports ambiguity only when no signal can choose.
+  The loader-error list, Fixture Loading rules, and Tests list were all updated
+  consistently — no dangling "duplicate source keys" language left over.
+- **Minors:** `profile` now mirrors `external` as a deterministic unsupported
+  outcome (resolution is total over the signal enum); `fixture_validation` is named
+  as the module for `FixtureCorpus`/`FixtureCase`; the query path correctly notes it
+  needs the registry-backed corpus, not just the `expected.json` bundle loader.
+
+### Answers to the requested reviewer questions
+
+1. **Shared `ReferenceIndex` precise enough?** Yes — naming the module/API shape is
+   an implementation decision for slice 1, not a design-doc prerequisite. See the
+   acceptance suggestion below for how to *prove* the single-source-of-truth claim.
+2. **Hard-failure policy acceptable for the clean corpus?** Yes.
+3. **`(StoredRecordKind, SourceKey)` the right identity, scalar ambiguity only when
+   signal-free lookup can't choose?** Yes — correct and testable.
+4. **`external` and `profile` sufficiently specified?** Yes; both are deterministic
+   unsupported outcomes and resolution is now total over `SourceSignal`.
+5. **Next round = slice 1 only?** Approved. Slice 1 (shared reference helpers, store
+   envelope, fixture loading, aliases, source-reference resolution) is the right
+   first cut; keep simulator, OTLP, derivation, ranking, persistence, and MCP/API
+   out, and preserve the full Definition Of Done.
+
+### Non-blocking notes for slice 1 (implementation-time, not design blockers)
+
+- **Make the refactor *prove* finding #1, don't just assert it.** When you promote
+  `ReferenceIndex` into the shared helper, refactor the existing validator to consume
+  that helper and treat "validator output unchanged" as an acceptance check — i.e.
+  `cargo run --bin validate_fixtures` still reports 0 errors / 0 warnings and the
+  `fixture_validation` tests stay green after the extraction. That demonstrates one
+  source of truth rather than a second key derivation that merely happens to agree
+  today.
+- **Relationship-signal refs are not in the current index.** `ReferenceIndex`
+  indexes resources, traces, spans, metrics, logs, changes, prior incidents,
+  telemetry gaps, entities, anomaly windows, log patterns, and evidence items, but
+  `add_expected_refs` never adds a `RefCategory::Relationship` entry
+  (`src/fixture_validation.rs:1377-1397`). The design's resolver list says "entity
+  ids and relationship refs **when present**," and the clean corpus implies no
+  evidence bundle currently carries a relationship `source_ref` (an unresolved one
+  would already be a hard error). That's fine for slice 1, but if/when a fixture
+  introduces a relationship source ref, the shared index will need relationship
+  indexing added — flagging so it isn't a surprise mid-slice.
+
+Net: design approved, no further design round needed from me. Proceed to slice 1
+under the stated scope and DoD (pending any other active reviewer's agreement).
