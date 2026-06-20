@@ -83,3 +83,74 @@ Checked locally:
 - confirmed the baseline SHA is pushed before creating this review document.
 
 <!-- Reviewer appends below; the Implementor must not edit past this line. -->
+
+## Review (by Claude)
+
+### Direction Verdict
+
+On the critical path: yes. Milestone progress this round is the decision it
+secures: the formal design now closes both round-0 coding blockers. **I agree
+with the design, and I am clearing implementation to begin.** Coding may proceed
+as one post-approval walking skeleton (Reviewer Focus #5). Next action:
+**continue** — to the implementation round.
+
+I verified the revisions in `docs/core/get-evidence-bundle-contract.md` against my
+round-0 findings, not just the round-1 summary:
+
+- **M1 (budget comparison) — resolved.** "Query Budget" now specifies the exact
+  rule: request `budget.max_tokens` ≥ response `budget.tokens_used` and request
+  `budget.max_items` ≥ `items.len()`, with the fixture bundle's declared
+  `max_tokens`/`max_items` kept as returned-unchanged metadata. This is the
+  honest "does the gold bundle fit" semantic, and Test #5 now matches it exactly.
+  It is also concrete against the targets (`deploy-bad-rollout` `tokens_used: 250`
+  over 5 items; `coincidental-deploy-trap` `tokens_used: 380` over 5 items).
+- **M2 (response metadata) — resolved.** The "except optional metadata" clause is
+  gone; Stub Behavior step 4 returns the bundle unchanged and the doc states M2
+  adds no query-echo, selected-budget, or other fields. The Milestone 1
+  `EvidenceBundle` + `evidence-bundle.schema.json` stay frozen. Correct.
+- **S1 (`scenario_id` required-vs-temporary) — resolved.** Now optional in schema,
+  required by the fixture stub's validation, with the stable query core named
+  explicitly. Its later removal will not break the stable surface.
+- **S2 (freshness vocabularies) — resolved.** Distinct `FreshnessPreference`
+  (`any | settled | changing`) for the request vs response `EvidenceFreshness`
+  (`settled | changing`), with `any` barred from the response IR.
+- **S3 (scenario-id error mapping) — resolved.** Public-path validation maps
+  missing/empty/traversal/separator ids to invalid-query; the existing
+  `validate_scenario_id` loader guard (`src/fixtures.rs`) stays as
+  defense-in-depth; I/O, parse, and missing-bundle stay fixture-load errors.
+
+No remaining design-only blocker. The contract is sound, honestly stub-scoped,
+and aligned with `roadmap.md` Milestone 2, `evidence-ir-schema.md` (the frozen M1
+types), and `fixtures.md`.
+
+### Non-blocking clarifications (fold into the implementation round; not a gate)
+
+These are small under-specifications, not coding blockers. The implementor can
+resolve them while implementing and report the choices in the next round's
+`## Verification` / response, without another design-only round.
+
+1. **The two requirement flags are specified asymmetrically.** `require_raw_refs`
+   has a guard ("reject or fail validation if a returned item lacks source refs",
+   Principle 5), but `require_counter_evidence` has none — Principle 4 only says
+   tests should show counter-evidence is *preserved*. Decide and state whether,
+   when `require_counter_evidence: true`, the stub errors on a gold bundle that
+   carries no counter-evidence item, or whether it is pure contract pressure with
+   no stub behavior in M2. Note also that, because M1 already makes `source_refs`
+   required and non-empty, the `require_raw_refs` guard is effectively always
+   satisfied by any bundle that passes Stub Behavior step 3; that is acceptable as
+   contract pressure, but worth saying so the flag's M2 behavior is unambiguous.
+   (Both target fixtures already carry counter-evidence — `deploy-bad-rollout`
+   ev-5 `weakens`, `coincidental-deploy-trap` ev-3 `weakens` / ev-4 `contradicts`
+   — so neither test trips this today.)
+
+2. **The budget-fit check is not enumerated in the Stub Behavior 1–4 list.** The
+   numbered procedure is validate-query → load → validate-bundle → return, but the
+   budget compatibility check needs post-load content (`tokens_used`,
+   `items.len()`), so it logically sits between steps 3 and 4. The prose below the
+   list covers it; adding it as an explicit step would make the procedure
+   self-contained. Editorial only.
+
+### Phasing
+
+Reaffirming round 0: one post-approval walking skeleton is fine; no phase-by-phase
+approval needed for the three Design Review Gate phases. Land them together.
