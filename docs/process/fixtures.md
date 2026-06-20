@@ -175,7 +175,7 @@ ones the scenario meaningfully exercises:
 - `evidence_bundle`: the gold output of `get_evidence_bundle` — see next section.
 - `timeline`: `[{ t, marker, entity, text, source_ref }]` (`build_timeline`).
   `marker` ∈ change, symptom, propagation, recovery, trigger, amplification,
-  non-causal-change.
+  non-causal-change, data-gap.
 - `suspected_causes`: `[{ rank, entity, hypothesis, score, reasons, supporting:
   [ev-ids], counter: [ev-ids], trap_note? }]` (`rank_suspected_causes`).
 - `next_checks`: `[{ action, rationale, expected_signal }]` (`suggest_next_checks`).

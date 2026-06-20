@@ -26,6 +26,22 @@ This should happen before the hot store and derivation pipeline, so later
 implementation work has a concrete target and cannot silently drift away from
 the evidence contract.
 
+## Design Review Gate
+
+No Rust implementation should start for this topic until every active reviewer
+has agreed on the design direction in their `Direction Verdict`.
+
+This topic should finalize the Milestone 3 harness design before coding by
+default. Registry validation, source-reference closure, capability witnesses,
+coverage reporting, and uncertainty guards share one corpus model and one issue
+model, so agreeing on the full contract first reduces churn in the implementation
+rounds.
+
+Reviewers may explicitly approve phase-by-phase implementation instead. If they
+do, each phase still remains part of the same Milestone 3 contract and should
+not weaken the Definition Of Done below. Until reviewer agreement exists, review
+rounds for this topic are design-only or diagnosis-only rounds.
+
 ## Scope
 
 In scope:
@@ -169,7 +185,28 @@ When `scenario.expected` includes `evidence_bundle`, `expected.json` must includ
 This reuses Milestone 1 instead of duplicating Evidence IR validation. Any
 Evidence IR error should be reported with fixture id and JSON path context.
 
-### 4. Reference Index Construction
+### 4. Derived Artifact Shape And Vocabulary Validation
+
+The harness should validate lightweight shape and vocabulary rules for expected
+derived artifacts before source-reference closure. This catches drift between
+`fixtures.md` and the corpus without attempting to prove semantic correctness.
+
+Required checks for each registered fixture:
+
+- `relationships[*].type` is one of the relationship types listed in
+  `fixtures.md`;
+- `timeline[*].marker` is one of the marker values listed in `fixtures.md`,
+  including `data-gap`;
+- `anomaly_windows[*].signal` is a non-empty signal name, not a closed enum;
+- when `input.metrics` contains a series for the same `entity`, an
+  `anomaly_windows[*].signal` value should match that metric series `name`.
+
+The anomaly-window signal check is intentionally not a global vocabulary check:
+metric names are fixture data and will vary by scenario. A mismatch with present
+input metrics should be reported because it usually means the gold anomaly
+cannot be traced back to the fixture's telemetry.
+
+### 5. Reference Index Construction
 
 For each fixture, build a reference index from input and expected artifacts.
 Reference validation should use actual ids from JSON, not naming guesses.
@@ -199,7 +236,7 @@ The index should record both the raw ref string and its source category. This
 lets the validator produce useful messages such as "found ref `lp-1` as a log
 pattern, but the source signal says `log`."
 
-### 5. Source Reference Validation
+### 6. Source Reference Validation
 
 The harness should validate known reference-bearing fields first:
 
@@ -236,10 +273,23 @@ Evidence IR enum has `log_pattern`, so the long-term clean form should be
 `signal: "log_pattern"` for derived pattern refs and `signal: "log"` for raw
 log records.
 
-### 6. Capability Exercise Checks
+The warning is a temporary compatibility state, not a permanent acceptance
+state. The issue report should count signal/ref mismatch warnings by category.
+Once the committed corpus has zero signal/ref mismatch warnings, any future
+mismatch should become a hard validation error in the same implementation round
+or the next review round. Milestone 3 should either clean current corpus
+mismatches or keep the warning path covered only by negative test fixtures.
+
+### 7. Capability Exercise Checks
 
 Each declared capability should have a minimal structural witness. The goal is
 not deep semantic proof; it is preventing empty capability declarations.
+
+A witness means the required key exists and is non-empty. Arrays must contain at
+least one item. Objects must contain the fields that make the artifact usable for
+that capability. For `token-budget-retrieval`, the witness is
+`expected.evidence_bundle.budget` with the required budget fields, not merely an
+empty `evidence_bundle` object.
 
 Suggested witness mapping:
 
@@ -263,7 +313,7 @@ Suggested witness mapping:
 If a capability lacks its witness, validation should fail because downstream
 tests will otherwise believe a scenario exercises behavior that is not present.
 
-### 7. Uncertainty And False-Causality Checks
+### 8. Uncertainty And False-Causality Checks
 
 Janus treats false causality and missing data as core failure modes. The harness
 should enforce this structurally:
@@ -282,7 +332,7 @@ should enforce this structurally:
 These checks should stay structural. They should not try to calculate true
 causality from telemetry.
 
-### 8. Coverage Report
+### 9. Coverage Report
 
 The harness should print a coverage report after validation:
 
@@ -309,6 +359,22 @@ The corpus loader should expose selectors for later tests and eval code:
 
 The command-line tool can use the same selectors for focused runs, but the Rust
 API is the important contract.
+
+## Implementation Phases
+
+After design approval, implementation can land in focused reviewable phases:
+
+1. Corpus model, registry loading, manifest loading, deterministic issue
+   collection, and fixture selectors.
+2. Evidence IR reuse, reference-index construction, and source-reference closure
+   validation.
+3. Capability witness checks, false-causality checks, missing-data checks,
+   coverage reporting, and the validation CLI.
+4. Focused negative tests and cleanup if the earlier phases need to stay small.
+
+These phases are sequencing guidance, not separate product milestones. Phase 1
+is not a complete Milestone 3 outcome if source-reference closure and
+uncertainty checks are still missing.
 
 ## CLI
 
@@ -373,6 +439,16 @@ This topic is complete when:
 
 ## Review Focus
 
-Reviewers should pay closest attention to the source-reference closure rules and
-the uncertainty checks. Those two areas protect Janus from its highest-risk
-failure modes: unverifiable summaries and confident false causality.
+Reviewers should pay closest attention to:
+
+- whether source-reference closure is strict enough without forcing unnecessary
+  fixture churn;
+- whether `signal`/ref mismatches should start as warnings or immediate errors;
+- whether capability witness checks should be hard validation failures;
+- whether the false-causality and missing-data checks are structural enough to
+  avoid pretending to solve causality;
+- whether implementation should proceed only after whole-design approval or be
+  approved phase by phase.
+
+The first and fourth points protect Janus from its highest-risk failure modes:
+unverifiable summaries and confident false causality.

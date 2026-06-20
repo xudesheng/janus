@@ -37,6 +37,7 @@
     "entities",
     "relationships",
     "anomaly_windows",
+    "window_comparison",
     "evidence_bundle",
     "timeline",
     "suspected_causes",
