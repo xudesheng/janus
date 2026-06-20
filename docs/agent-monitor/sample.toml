@@ -18,7 +18,7 @@ TOPIC = "sample"
 # Repo the loop drives. If omitted, the current working directory is used.
 # TOML literal strings (single quotes) need no backslash escaping on Windows.
 WORK_ROOT = 'C:\Users\xudes\Documents\github\rust\janus'
-
+DESIGN_DOC_FOLDER = "./docs/core"
 # Optional: work in a git worktree instead of WORK_ROOT itself. When true, the
 # loop requires WORK_ROOT to be on 'main', runs `git pull`, ensures a branch named
 # {TOPIC}, and a sibling worktree dir (default {repo}-{TOPIC}) checked out on it;
