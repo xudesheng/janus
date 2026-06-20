@@ -144,6 +144,13 @@ The exact Rust names are flexible, but the responsibilities are not:
 - `entities` enables entity filters;
 - `payload` keeps the original fixture-shaped record available for inspection.
 
+The primary store identity is the pair `(StoredRecordKind, SourceKey)`, not the
+raw source-key string alone. This lets the store represent same-string refs in
+different categories without corrupting either record. Signal-aware resolution
+uses the requested `SourceRef.signal` to choose the matching category; scalar
+resolution can report ambiguity when a raw ref string maps to more than one
+category.
+
 The store should not discard original JSON fields. Keeping `payload` as
 `serde_json::Value` is acceptable for this milestone because fixture inputs are
 logical OTel-shaped records, not byte-exact OTLP.
@@ -176,7 +183,19 @@ evidence can be dereferenced before real derivation exists.
 
 ## Source Keys
 
-Source keys should be deterministic and close to fixture conventions:
+Source keys should reuse the existing Milestone 3 reference-index conventions
+rather than re-deriving keys in a parallel implementation. The current validator
+already has the key and alias scheme in `fixture_validation::ReferenceIndex`;
+Milestone 4 should promote or extend that logic into a shared helper/module so
+the validator and hot store use one source of truth.
+
+The distinction is value richness, not key semantics:
+
+- Milestone 3 maps refs to reference categories to prove closure.
+- Milestone 4 should map the same refs to concrete stored-record handles while
+  still allowing the validator to project the category-only view it needs.
+
+The descriptive key scheme is:
 
 | Input | Key |
 |---|---|
@@ -201,16 +220,25 @@ The store should also support resolver aliases used by fixtures:
 - Evidence IR `SourceRef { signal, ref }` resolves through signal-aware category
   matching.
 
-If a ref exists but its signal category does not match, the resolver should make
-that visible. For committed corpus behavior this should usually be an error, but
-a warning path can remain for compatibility tests if the fixture validation
-harness already treats a shape as warning-only.
+If a ref exists but its signal category does not match, the resolver must make
+that visible as a mismatch outcome. For the committed corpus, this is a hard
+failure in store-aware validation and `get_evidence_bundle` source lookup. Do
+not keep a warning-only compatibility path unless a future fixture explicitly
+needs it and provides a test-covered witness or fixture flag.
 
 Primary keys and aliases should remain distinct in the implementation model.
 Primary keys identify stored records. Aliases such as `trace:t-0001` or
 `trace:t-0001/s-3` are additional lookup routes to the same record, not extra
 records. Alias conflicts should be reported unless both aliases resolve to the
-same concrete target.
+same concrete target and category.
+
+Duplicate-key behavior is defined per kind:
+
+- same kind + same primary key + different record is a loader error;
+- same raw key across different kinds is allowed in the store index;
+- signal-aware resolution should use `SourceRef.signal` to disambiguate;
+- scalar resolution should report ambiguity when the raw key has multiple
+  category matches and no signal can choose one.
 
 Signal-aware resolution should report both the requested signal and the matched
 record kind when they differ. This is especially important for the known
@@ -270,7 +298,7 @@ successfully constructed store.
 
 Loader errors should cover at least:
 
-- duplicate primary source keys;
+- duplicate primary source keys within the same record kind;
 - alias conflicts;
 - missing required fixture fields for a recognized record kind;
 - malformed time windows where the fixture field is present but unusable;
@@ -280,22 +308,23 @@ Loader errors should cover at least:
 Resolution outcomes should cover at least:
 
 - unsupported `external` refs;
+- unsupported `profile` refs until a profile source record kind exists;
 - missing refs;
 - ambiguous refs;
 - signal/category mismatches;
 - found refs with the concrete stored record payload.
 
 The store-aware `get_evidence_bundle` integration should fail on missing,
-ambiguous, unsupported, or mismatched source refs unless the existing fixture
-validation compatibility policy explicitly classifies that mismatch as a
-warning-only case for the current corpus. Do not let the integration silently
-drop unverifiable refs.
+ambiguous, unsupported, or mismatched source refs for the committed corpus. Do
+not let the integration silently drop unverifiable refs.
 
 ## Fixture Loading
 
 The first loader should build from the already validated fixture corpus rather
 than duplicate parsing logic. It can use `FixtureCorpus` and `FixtureCase` from
-the Milestone 3 harness.
+the `fixture_validation` module, and it should share the promoted
+reference-index helpers described in "Source Keys" for source-key and alias
+construction.
 
 Required behavior:
 
@@ -308,8 +337,8 @@ Required behavior:
   point timestamps, and telemetry gap start/end;
 - load same-fixture expected artifacts as derived reference targets when an
   expected file is provided;
-- detect duplicate source keys within a fixture unless the duplicate is an
-  intentional alias to the same record.
+- detect duplicate primary keys within a record kind unless the duplicate is an
+  intentional alias to the same concrete record.
 
 The loader should report structured errors with fixture id, file path, JSON
 path, and message. Reusing the validation issue style from
@@ -340,7 +369,9 @@ The resolver should cover at least:
 - entity ids and relationship refs when present.
 
 `external` refs should still fail unless a future design adds a self-contained
-external-record target. Janus must not produce unverifiable source pointers.
+external-record target. `profile` refs should return the same deterministic
+unsupported outcome until Janus has a profile source record kind. Janus must not
+produce unverifiable source pointers.
 
 ## Query Integration
 
@@ -349,7 +380,9 @@ milestone. It should, however, be able to use the hot store for source lookup:
 
 1. validate `EvidenceQuery`;
 2. load the fixture-backed gold bundle as today;
-3. load that fixture's input and expected artifacts into `HotContextStore`;
+3. load that fixture's input and expected artifacts into `HotContextStore`,
+   which means using the registry-backed `FixtureCorpus`/`FixtureCase` path
+   rather than only the narrow `expected.json` bundle loader;
 4. validate or resolve every returned evidence source ref through the store;
 5. apply basic store selection tests for the query time window and query
    entities;
@@ -392,7 +425,9 @@ This should not become the simulator. It is only a local inspection aid.
 Add focused tests that prove behavior, not only compile-time shape:
 
 - every current fixture input loads into `HotContextStore`;
-- duplicate source keys fail with a useful error;
+- duplicate primary keys within the same record kind fail with a useful error;
+- same-string refs across different record kinds are disambiguated by
+  `SourceRef.signal` or reported as ambiguous for scalar resolution;
 - span refs such as `t-0001/s-3` resolve to a concrete span payload;
 - metric series refs resolve to concrete metric payloads;
 - log, change, prior-incident, and telemetry-gap refs resolve where present;
@@ -400,7 +435,8 @@ Add focused tests that prove behavior, not only compile-time shape:
   are loaded;
 - every Evidence IR source ref in every current fixture evidence bundle
   resolves through the store;
-- missing refs fail distinctly from signal/category mismatches;
+- missing refs, unsupported refs, ambiguous refs, and signal/category mismatches
+  fail distinctly;
 - time-window selectors return records overlapping the requested window;
 - entity selectors return records tied to the requested entity;
 - selector output order is deterministic;
@@ -434,8 +470,8 @@ Reviewers should focus on these points:
    repeating Milestone 3 closure checks.
 3. Whether this topic stays small enough by excluding derivation, ranking, live
    ingest, and durable persistence.
-4. Whether signal/category mismatches should be hard failures immediately or
-   retain a narrow compatibility warning path until current fixtures are clean.
+4. Whether the hard-failure policy for signal/category mismatches is correct
+   for the now-clean committed corpus.
 5. Whether the recommended implementation slices are acceptable after design
    approval, or whether reviewers want the whole Milestone 4 implementation
    reviewed as one coding round.
