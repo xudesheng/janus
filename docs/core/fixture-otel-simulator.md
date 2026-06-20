@@ -92,6 +92,12 @@ The future `otel-ingest-prototype` topic should be able to replace
 `FixtureReplaySource` with an OTLP receiver while keeping the same normalized
 hot-store write model and source-ref semantics.
 
+The source-specific adapter owns source-key derivation. `FixtureReplaySource`
+uses fixture conventions such as `t-0001`, `t-0001/s-3`, and `name@entity`; a
+future `OtlpReceiverSource` must normalize real OTLP trace ids, span ids, metric
+identity, resource attributes, and entity hints into the same hot-store write
+model without assuming fixture ids.
+
 This topic should not add `opentelemetry-proto`, a network listener, or Collector
 configuration. Those belong to real ingest. The simulator is allowed to be
 "OTel-shaped" rather than byte-exact OTLP, matching the fixture contract.
@@ -104,10 +110,13 @@ must build a replay plan and apply events to a fresh `HotContextStore` through a
 incremental ingest boundary.
 
 It is acceptable to use `HotContextStore::load_fixture_case` as a test oracle for
-full-replay compatibility, but not as the main replay implementation. Partial
-replay is a required behavior: before an event is ingested, source refs owned by
-that event should be missing; after the event is ingested, the same refs should
-be resolvable.
+full-replay source-ref compatibility, but not as the main replay implementation.
+Full replay must preserve source-key and source-ref resolution semantics; it does
+not require byte-for-byte `StoredRecord` payload equality with batch fixture
+loading except where this document explicitly pins a stored shape. Partial replay
+is a required behavior: before an event is ingested, source refs owned by that
+event should be missing; after the event is ingested, the same refs should be
+resolvable.
 
 This distinction is what makes the topic useful for later real ingest. A future
 OTLP receiver should be able to feed the same normalized ingest boundary without
@@ -192,6 +201,16 @@ The stored metric-series record should contain only observed points up to the
 current replay step. After replay completes, it should preserve the same source
 key that Evidence IR uses today.
 
+The accumulated metric-series payload should converge to the fixture metric
+shape after full replay:
+
+- preserve `name`, `entity`, `unit`, and other non-point fields from the fixture
+  metric record;
+- append point payloads in replay order, which should match fixture point order
+  for the current fixtures;
+- keep only observed points before full replay and all points after full replay;
+- never drop or synthesize metric points.
+
 This is the main reason the topic needs an ingest sink instead of only calling
 `HotContextStore::load_fixture_case`.
 
@@ -213,8 +232,9 @@ span record:
 
 The design should preserve these rules:
 
+- the `Trace` event makes the trace source key resolvable and should be emitted
+  when the trace first has observable data, normally the earliest span time;
 - a span source ref does not resolve before that span's event is ingested;
-- a trace source ref resolves only after the trace has observed data;
 - full replay preserves the same trace and span lookup semantics as current
   fixture loading;
 - trace aggregation can be simple and fixture-shaped for this topic, as long as
@@ -249,8 +269,10 @@ Required behavior:
   as direct fixture loading;
 - metric points update their metric-series record instead of conflicting on
   duplicate primary keys;
+- metric series is the only merge-eligible `(StoredRecordKind, SourceKey)` pair;
 - trace and span events preserve trace and span aliases;
-- duplicate primary keys with different payloads remain errors;
+- duplicate primary keys with different payloads remain errors for all non-metric
+  record kinds;
 - source-ref resolution outcomes stay unchanged.
 
 It is acceptable for `HotIngestEvent` to be internal to this topic at first, as
