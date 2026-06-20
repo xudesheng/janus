@@ -1,0 +1,37 @@
+{
+  "id": "recurring-incident-memory",
+  "title": "Recurring DB lock contention matches a prior incident",
+  "version": 1,
+  "schema_version": "fixtures/v1",
+  "failure_class": "recurring-incident",
+  "difficulty": "baseline",
+  "false_causality_trap": false,
+  "summary": "orders-pg lock contention from a reporting batch recurs and degrades checkout, with the same signature as a prior incident stored in warm-layer memory (prior:inc-0603). The value here is recognizing the recurrence: the gold evidence links the current anomaly to the stored prior incident and surfaces its known mitigation, shortening time-to-resolution.",
+  "question": "Why is checkout slow again at 03:05 on 2026-06-18, and have we seen this before?",
+  "time_window": { "start": "2026-06-18T02:55:00Z", "end": "2026-06-18T03:25:00Z" },
+  "ground_truth": {
+    "primary_cause_entity": "db:orders-pg",
+    "cause_kind": "resource_contention",
+    "contributing_entity": "service:reporting-job",
+    "cause_ref": "change:reporting-job-batch-start-2",
+    "recurring_of": "prior:inc-0603",
+    "blast_radius": ["db:orders-pg", "service:checkout"],
+    "not_the_cause": ["service:checkout"],
+    "notes": "Same lock-contention signature as a stored prior incident. A correct bundle includes a previous_incident evidence item linking to prior:inc-0603 and recommends its recorded mitigation (reschedule the batch off-peak)."
+  },
+  "capabilities": [
+    "entity-resolution",
+    "relationship-building",
+    "anomaly-windows",
+    "change-ingestion",
+    "evidence-ir",
+    "get_evidence_bundle",
+    "build_timeline",
+    "find_related_anomalies",
+    "rank_suspected_causes",
+    "suggest_next_checks",
+    "false-causality-guard"
+  ],
+  "inputs": ["resources", "traces", "metrics", "logs", "changes", "prior_incidents"],
+  "expected": ["entities", "relationships", "anomaly_windows", "evidence_bundle", "timeline", "suspected_causes", "next_checks"]
+}

@@ -1,0 +1,45 @@
+{
+  "_note": "Self-contained, OTel-shaped synthetic telemetry. Some records intentionally lack service.version/service.instance.id to create resolution ambiguity. Aggregate metric over service.name blends the two identities on purpose.",
+  "resources": [
+    { "id": "res:payments-canary", "attributes": { "service.name": "payments", "service.version": "5.0.0-rc1", "service.instance.id": "payments-canary-001", "deployment.environment": "prod", "k8s.namespace.name": "payments", "rollout": "canary" } },
+    { "id": "res:payments-stable-a", "attributes": { "service.name": "payments", "service.version": "4.3.2", "service.instance.id": "payments-7a", "deployment.environment": "prod", "k8s.namespace.name": "payments" } },
+    { "id": "res:payments-stable-b", "attributes": { "service.name": "payments", "service.version": "4.3.2", "service.instance.id": "payments-7b", "deployment.environment": "prod", "k8s.namespace.name": "payments" } },
+    { "id": "res:payments-unlabeled", "attributes": { "service.name": "payments", "deployment.environment": "prod" } }
+  ],
+  "traces": [
+    {
+      "trace_id": "t-4001",
+      "exemplar_of": "canary-error",
+      "spans": [
+        { "span_id": "s-1", "parent_id": null, "resource": "res:payments-canary", "name": "POST /charge", "kind": "SERVER", "start": "2026-06-10T09:12:00.000Z", "end": "2026-06-10T09:12:00.230Z", "status": "ERROR", "attributes": { "http.route": "/charge", "http.status_code": 500, "exception.type": "SerializationError", "service.instance.id": "payments-canary-001" } }
+      ]
+    },
+    {
+      "trace_id": "t-4002",
+      "exemplar_of": "stable-ok",
+      "spans": [
+        { "span_id": "s-2", "parent_id": null, "resource": "res:payments-stable-a", "name": "POST /charge", "kind": "SERVER", "start": "2026-06-10T09:12:05.000Z", "end": "2026-06-10T09:12:05.080Z", "status": "OK", "attributes": { "http.route": "/charge", "http.status_code": 200, "service.instance.id": "payments-7a" } }
+      ]
+    },
+    {
+      "trace_id": "t-4003",
+      "exemplar_of": "unresolved",
+      "spans": [
+        { "span_id": "s-3", "parent_id": null, "resource": "res:payments-unlabeled", "name": "POST /charge", "kind": "SERVER", "start": "2026-06-10T09:13:00.000Z", "end": "2026-06-10T09:13:00.110Z", "status": "ERROR", "attributes": { "http.route": "/charge", "http.status_code": 500 } }
+      ]
+    }
+  ],
+  "metrics": [
+    { "name": "http.server.error_rate", "entity": "instance:payments-canary-001", "unit": "ratio", "points": [ { "t": "2026-06-10T09:02:00Z", "v": 0.01 }, { "t": "2026-06-10T09:08:00Z", "v": 0.39 }, { "t": "2026-06-10T09:20:00Z", "v": 0.42 } ] },
+    { "name": "http.server.error_rate", "entity": "instance:payments-7a", "unit": "ratio", "points": [ { "t": "2026-06-10T09:02:00Z", "v": 0.003 }, { "t": "2026-06-10T09:08:00Z", "v": 0.004 }, { "t": "2026-06-10T09:20:00Z", "v": 0.003 } ] },
+    { "name": "http.server.error_rate", "entity": "instance:payments-7b", "unit": "ratio", "points": [ { "t": "2026-06-10T09:02:00Z", "v": 0.002 }, { "t": "2026-06-10T09:08:00Z", "v": 0.005 }, { "t": "2026-06-10T09:20:00Z", "v": 0.004 } ] },
+    { "name": "http.server.error_rate", "entity": "service:payments(aggregate-by-name)", "unit": "ratio", "_note": "Blended over all instances incl. unresolved; hides the canary.", "points": [ { "t": "2026-06-10T09:02:00Z", "v": 0.004 }, { "t": "2026-06-10T09:08:00Z", "v": 0.086 }, { "t": "2026-06-10T09:20:00Z", "v": 0.091 } ] }
+  ],
+  "logs": [
+    { "id": "log-1", "t": "2026-06-10T09:08:30Z", "entity": "instance:payments-canary-001", "severity": "ERROR", "body": "SerializationError encoding charge response v5 schema", "attributes": { "service.version": "5.0.0-rc1", "service.instance.id": "payments-canary-001" } },
+    { "id": "log-2", "t": "2026-06-10T09:13:00Z", "entity": "payments(unresolved)", "severity": "ERROR", "body": "SerializationError encoding charge response", "attributes": {} }
+  ],
+  "changes": [
+    { "id": "change:payments-canary-rollout", "t": "2026-06-10T09:05:00Z", "kind": "deploy", "entity": "service:payments", "summary": "Start canary rollout payments 5.0.0-rc1 (10% of fleet)", "attributes": { "to_version": "5.0.0-rc1", "rollout": "canary", "traffic_share": "0.1" } }
+  ]
+}

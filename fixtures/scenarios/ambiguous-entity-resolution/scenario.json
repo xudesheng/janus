@@ -1,0 +1,42 @@
+{
+  "id": "ambiguous-entity-resolution",
+  "title": "Same service.name hides a failing canary",
+  "version": 1,
+  "schema_version": "fixtures/v1",
+  "failure_class": "entity-ambiguity",
+  "difficulty": "hard",
+  "false_causality_trap": false,
+  "summary": "Two distinct runtime identities both emit service.name=payments: a failing canary (v5.0.0-rc1) and a healthy stable fleet (v4.3.2). A naive aggregate over service.name shows only a mild error bump and hides the canary. Some telemetry lacks service.instance.id/service.version, so a fraction cannot be attributed to either identity. The resolver must produce candidate entities with confidence and alternatives, surface the unresolved fraction as missing data, and not silently merge the two.",
+  "question": "Is the payments service unhealthy on 2026-06-10, and which part?",
+  "time_window": { "start": "2026-06-10T09:00:00Z", "end": "2026-06-10T09:30:00Z" },
+  "ground_truth": {
+    "primary_cause_entity": "service:payments@canary",
+    "cause_kind": "change_event",
+    "cause_ref": "change:payments-canary-rollout",
+    "healthy_entity": "service:payments@stable",
+    "blast_radius": ["service:payments@canary"],
+    "resolution_note": "payments is not one entity. The canary (v5.0.0-rc1) is failing; the stable fleet (v4.3.2) is healthy. ~18% of payments telemetry has no service.instance.id and is unresolved. Correct output keeps the two identities separate with confidence, reports the unresolved fraction, and recommends adding service.instance.id.",
+    "notes": "Aggregating by service.name is the failure mode: it dilutes the canary's 40% error rate into a ~9% blended rate that looks tolerable."
+  },
+  "capabilities": [
+    "entity-resolution",
+    "relationship-building",
+    "anomaly-windows",
+    "change-ingestion",
+    "evidence-ir",
+    "get_evidence_bundle",
+    "expand_entity_context",
+    "suggest_next_checks",
+    "false-causality-guard"
+  ],
+  "inputs": ["resources", "traces", "metrics", "logs", "changes"],
+  "expected": [
+    "entities",
+    "relationships",
+    "anomaly_windows",
+    "evidence_bundle",
+    "entity_context",
+    "suspected_causes",
+    "next_checks"
+  ]
+}

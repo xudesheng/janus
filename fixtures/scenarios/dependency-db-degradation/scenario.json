@@ -1,0 +1,46 @@
+{
+  "id": "dependency-db-degradation",
+  "title": "Database lock contention degrades upstream checkout",
+  "version": 1,
+  "schema_version": "fixtures/v1",
+  "failure_class": "dependency-degradation",
+  "difficulty": "baseline",
+  "false_causality_trap": false,
+  "summary": "A heavy reporting batch job takes a long lock on orders-pg. Query latency on orders-pg jumps ~40x, so checkout requests slow and time out, and api-gateway surfaces 5xx to users. There is no checkout deploy. The fault propagates upward from the database, so blast-radius direction is the key disambiguator.",
+  "question": "Why did checkout latency and 5xx spike around 14:22 on 2026-06-03 with no deploy?",
+  "time_window": { "start": "2026-06-03T14:10:00Z", "end": "2026-06-03T14:35:00Z" },
+  "ground_truth": {
+    "primary_cause_entity": "db:orders-pg",
+    "cause_kind": "resource_contention",
+    "contributing_entity": "service:reporting-job",
+    "cause_ref": "change:reporting-job-batch-start",
+    "blast_radius": ["db:orders-pg", "service:checkout", "service:api-gateway"],
+    "not_the_cause": ["service:checkout"],
+    "notes": "Checkout is a victim, not the cause: its code is unchanged and its own spans wait on the DB span. Dependency direction (errors originate downstream at the DB and propagate upstream) is what separates cause from symptom."
+  },
+  "capabilities": [
+    "entity-resolution",
+    "relationship-building",
+    "anomaly-windows",
+    "log-pattern-clustering",
+    "evidence-ir",
+    "get_evidence_bundle",
+    "build_timeline",
+    "find_related_anomalies",
+    "compare_windows",
+    "rank_suspected_causes",
+    "suggest_next_checks",
+    "false-causality-guard"
+  ],
+  "inputs": ["resources", "traces", "metrics", "logs", "changes"],
+  "expected": [
+    "entities",
+    "relationships",
+    "anomaly_windows",
+    "log_patterns",
+    "evidence_bundle",
+    "timeline",
+    "suspected_causes",
+    "next_checks"
+  ]
+}

@@ -1,0 +1,146 @@
+{
+  "schema_version": "fixtures/v1",
+  "description": "Machine-readable index of Janus incident fixtures. Each fixture is a self-contained, synthetic, OTel-shaped scenario with gold derived artifacts. See docs/process/fixtures.md for the full scheme. Fixtures are original synthetic data and do not reproduce any external dataset.",
+  "capabilities": [
+    "entity-resolution",
+    "relationship-building",
+    "change-ingestion",
+    "anomaly-windows",
+    "log-pattern-clustering",
+    "evidence-ir",
+    "get_evidence_bundle",
+    "build_timeline",
+    "find_related_anomalies",
+    "compare_windows",
+    "rank_suspected_causes",
+    "expand_entity_context",
+    "suggest_next_checks",
+    "false-causality-guard",
+    "token-budget-retrieval"
+  ],
+  "failure_classes": [
+    "deploy",
+    "dependency-degradation",
+    "retry-storm",
+    "config-change",
+    "traffic-shift",
+    "resource-exhaustion",
+    "schema-change",
+    "downstream-outage",
+    "coincidental-correlation",
+    "entity-ambiguity",
+    "missing-data",
+    "recurring-incident"
+  ],
+  "fixtures": [
+    {
+      "id": "deploy-bad-rollout",
+      "path": "scenarios/deploy-bad-rollout",
+      "failure_class": "deploy",
+      "difficulty": "baseline",
+      "false_causality_trap": false,
+      "capabilities": ["entity-resolution", "relationship-building", "change-ingestion", "anomaly-windows", "log-pattern-clustering", "evidence-ir", "get_evidence_bundle", "build_timeline", "compare_windows", "rank_suspected_causes", "suggest_next_checks", "false-causality-guard"],
+      "title": "Bad checkout deploy causes 5xx and latency"
+    },
+    {
+      "id": "dependency-db-degradation",
+      "path": "scenarios/dependency-db-degradation",
+      "failure_class": "dependency-degradation",
+      "difficulty": "baseline",
+      "false_causality_trap": false,
+      "capabilities": ["entity-resolution", "relationship-building", "anomaly-windows", "log-pattern-clustering", "evidence-ir", "get_evidence_bundle", "build_timeline", "find_related_anomalies", "compare_windows", "rank_suspected_causes", "suggest_next_checks", "false-causality-guard"],
+      "title": "Database lock contention degrades upstream checkout"
+    },
+    {
+      "id": "retry-storm-amplification",
+      "path": "scenarios/retry-storm-amplification",
+      "failure_class": "retry-storm",
+      "difficulty": "hard",
+      "false_causality_trap": true,
+      "capabilities": ["entity-resolution", "relationship-building", "anomaly-windows", "log-pattern-clustering", "evidence-ir", "get_evidence_bundle", "build_timeline", "find_related_anomalies", "rank_suspected_causes", "suggest_next_checks", "false-causality-guard"],
+      "title": "Retry storm amplifies a transient blip into an outage"
+    },
+    {
+      "id": "coincidental-deploy-trap",
+      "path": "scenarios/coincidental-deploy-trap",
+      "failure_class": "coincidental-correlation",
+      "difficulty": "hard",
+      "false_causality_trap": true,
+      "capabilities": ["entity-resolution", "relationship-building", "change-ingestion", "anomaly-windows", "evidence-ir", "get_evidence_bundle", "build_timeline", "compare_windows", "rank_suspected_causes", "suggest_next_checks", "false-causality-guard"],
+      "title": "Coincidental deploy near a cache-loss incident"
+    },
+    {
+      "id": "ambiguous-entity-resolution",
+      "path": "scenarios/ambiguous-entity-resolution",
+      "failure_class": "entity-ambiguity",
+      "difficulty": "hard",
+      "false_causality_trap": false,
+      "capabilities": ["entity-resolution", "relationship-building", "anomaly-windows", "change-ingestion", "evidence-ir", "get_evidence_bundle", "expand_entity_context", "suggest_next_checks", "false-causality-guard"],
+      "title": "Same service.name hides a failing canary"
+    },
+    {
+      "id": "config-change-timeout",
+      "path": "scenarios/config-change-timeout",
+      "failure_class": "config-change",
+      "difficulty": "baseline",
+      "false_causality_trap": false,
+      "capabilities": ["entity-resolution", "relationship-building", "change-ingestion", "anomaly-windows", "log-pattern-clustering", "evidence-ir", "get_evidence_bundle", "build_timeline", "compare_windows", "rank_suspected_causes", "suggest_next_checks", "false-causality-guard"],
+      "title": "Lowered upstream timeout config turns slow-but-OK into 504s"
+    },
+    {
+      "id": "traffic-shift-hotspot",
+      "path": "scenarios/traffic-shift-hotspot",
+      "failure_class": "traffic-shift",
+      "difficulty": "hard",
+      "false_causality_trap": false,
+      "capabilities": ["entity-resolution", "relationship-building", "anomaly-windows", "evidence-ir", "get_evidence_bundle", "build_timeline", "compare_windows", "rank_suspected_causes", "suggest_next_checks", "false-causality-guard"],
+      "title": "Tenant traffic ramp saturates one orders shard"
+    },
+    {
+      "id": "resource-exhaustion-memory",
+      "path": "scenarios/resource-exhaustion-memory",
+      "failure_class": "resource-exhaustion",
+      "difficulty": "hard",
+      "false_causality_trap": false,
+      "capabilities": ["entity-resolution", "relationship-building", "anomaly-windows", "change-ingestion", "log-pattern-clustering", "evidence-ir", "get_evidence_bundle", "build_timeline", "rank_suspected_causes", "suggest_next_checks", "false-causality-guard"],
+      "title": "Memory leak drives an OOM-kill / restart cycle"
+    },
+    {
+      "id": "schema-migration-errors",
+      "path": "scenarios/schema-migration-errors",
+      "failure_class": "schema-change",
+      "difficulty": "baseline",
+      "false_causality_trap": false,
+      "capabilities": ["entity-resolution", "relationship-building", "change-ingestion", "anomaly-windows", "log-pattern-clustering", "evidence-ir", "get_evidence_bundle", "build_timeline", "rank_suspected_causes", "suggest_next_checks", "false-causality-guard"],
+      "title": "Column rename migration breaks the profile read path"
+    },
+    {
+      "id": "downstream-outage-cascade",
+      "path": "scenarios/downstream-outage-cascade",
+      "failure_class": "downstream-outage",
+      "difficulty": "baseline",
+      "false_causality_trap": false,
+      "capabilities": ["entity-resolution", "relationship-building", "change-ingestion", "anomaly-windows", "log-pattern-clustering", "evidence-ir", "get_evidence_bundle", "build_timeline", "find_related_anomalies", "rank_suspected_causes", "suggest_next_checks", "false-causality-guard"],
+      "title": "External payment provider outage cascades to checkout"
+    },
+    {
+      "id": "recurring-incident-memory",
+      "path": "scenarios/recurring-incident-memory",
+      "failure_class": "recurring-incident",
+      "difficulty": "baseline",
+      "false_causality_trap": false,
+      "capabilities": ["entity-resolution", "relationship-building", "anomaly-windows", "change-ingestion", "evidence-ir", "get_evidence_bundle", "build_timeline", "find_related_anomalies", "rank_suspected_causes", "suggest_next_checks", "false-causality-guard"],
+      "title": "Recurring DB lock contention matches a prior incident"
+    },
+    {
+      "id": "missing-data-gap",
+      "path": "scenarios/missing-data-gap",
+      "failure_class": "missing-data",
+      "difficulty": "hard",
+      "false_causality_trap": false,
+      "capabilities": ["entity-resolution", "relationship-building", "anomaly-windows", "change-ingestion", "evidence-ir", "get_evidence_bundle", "build_timeline", "rank_suspected_causes", "suggest_next_checks", "false-causality-guard"],
+      "title": "Telemetry gap during the incident forces honest uncertainty"
+    }
+  ],
+  "proposed": []
+}

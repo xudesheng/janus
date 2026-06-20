@@ -1,0 +1,45 @@
+{
+  "id": "coincidental-deploy-trap",
+  "title": "Coincidental deploy near a cache-loss incident",
+  "version": 1,
+  "schema_version": "fixtures/v1",
+  "failure_class": "coincidental-correlation",
+  "difficulty": "hard",
+  "false_causality_trap": true,
+  "summary": "A redis-cache node is lost at 15:01, collapsing the cache hit ratio and pushing search-api onto catalog-pg, which slows search and produces timeouts. One minute after the errors begin, an unrelated search-ui frontend deploy lands at 15:03. The deploy is the obvious suspect by change-proximity, but the incident started BEFORE it and on a different component, so the deploy must be ranked low with explicit counter-evidence.",
+  "question": "Why did search start failing around 15:03 on 2026-06-08, right after the search-ui deploy?",
+  "time_window": { "start": "2026-06-08T14:55:00Z", "end": "2026-06-08T15:20:00Z" },
+  "ground_truth": {
+    "primary_cause_entity": "infra:redis-cache",
+    "cause_kind": "resource_contention",
+    "cause_ref": "change:redis-node-loss",
+    "innocent_suspect": "service:search-ui",
+    "innocent_suspect_ref": "change:deploy-search-ui",
+    "blast_radius": ["infra:redis-cache", "service:search-api", "db:catalog-pg"],
+    "not_the_cause": ["service:search-ui"],
+    "notes": "The trap is change-proximity: a deploy at 15:03 looks causal but the symptoms began at 15:02 (and the cache loss at 15:01). The deployed service (search-ui) is not on the error path; its own error rate stays flat. Correct ranking puts redis-cache first and the deploy near zero, with counter-evidence that onset precedes the deploy."
+  },
+  "capabilities": [
+    "entity-resolution",
+    "relationship-building",
+    "change-ingestion",
+    "anomaly-windows",
+    "evidence-ir",
+    "get_evidence_bundle",
+    "build_timeline",
+    "compare_windows",
+    "rank_suspected_causes",
+    "suggest_next_checks",
+    "false-causality-guard"
+  ],
+  "inputs": ["resources", "traces", "metrics", "logs", "changes"],
+  "expected": [
+    "entities",
+    "relationships",
+    "anomaly_windows",
+    "evidence_bundle",
+    "timeline",
+    "suspected_causes",
+    "next_checks"
+  ]
+}

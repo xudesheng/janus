@@ -1,0 +1,39 @@
+{
+  "_note": "Self-contained, OTel-shaped synthetic telemetry. ISO-8601 UTC timestamps. The exemplar shows catalog completing server-side after the gateway has already aborted the call.",
+  "resources": [
+    { "id": "res:api-gateway", "attributes": { "service.name": "api-gateway", "service.version": "3.4.1", "deployment.environment": "prod" } },
+    { "id": "res:catalog", "attributes": { "service.name": "catalog", "service.version": "6.1.0", "deployment.environment": "prod", "k8s.namespace.name": "catalog" } }
+  ],
+  "traces": [
+    {
+      "trace_id": "t-5001",
+      "exemplar_of": "gateway-timeout",
+      "spans": [
+        { "span_id": "s-1", "parent_id": null, "resource": "res:api-gateway", "name": "GET /products", "kind": "SERVER", "start": "2026-06-12T11:24:00.000Z", "end": "2026-06-12T11:24:00.505Z", "status": "ERROR", "attributes": { "http.route": "/products", "http.status_code": 504 } },
+        { "span_id": "s-2", "parent_id": "s-1", "resource": "res:api-gateway", "name": "catalog.list", "kind": "CLIENT", "start": "2026-06-12T11:24:00.010Z", "end": "2026-06-12T11:24:00.502Z", "status": "ERROR", "attributes": { "peer.service": "catalog", "error.type": "deadline_exceeded", "rpc.timeout_ms": 500 } },
+        { "span_id": "s-3", "parent_id": "s-2", "resource": "res:catalog", "name": "GET /products", "kind": "SERVER", "start": "2026-06-12T11:24:00.020Z", "end": "2026-06-12T11:24:00.640Z", "status": "OK", "attributes": { "http.route": "/products", "http.status_code": 200 } }
+      ]
+    },
+    {
+      "trace_id": "t-5002",
+      "exemplar_of": "baseline",
+      "spans": [
+        { "span_id": "b-1", "parent_id": null, "resource": "res:api-gateway", "name": "GET /products", "kind": "SERVER", "start": "2026-06-12T11:12:00.000Z", "end": "2026-06-12T11:12:00.430Z", "status": "OK", "attributes": { "http.route": "/products", "http.status_code": 200 } },
+        { "span_id": "b-3", "parent_id": "b-1", "resource": "res:catalog", "name": "GET /products", "kind": "SERVER", "start": "2026-06-12T11:12:00.020Z", "end": "2026-06-12T11:12:00.410Z", "status": "OK", "attributes": { "http.route": "/products", "http.status_code": 200 } }
+      ]
+    }
+  ],
+  "metrics": [
+    { "name": "http.server.error_rate", "entity": "service:api-gateway", "unit": "ratio", "points": [ { "t": "2026-06-12T11:14:00Z", "v": 0.003 }, { "t": "2026-06-12T11:20:00Z", "v": 0.04 }, { "t": "2026-06-12T11:22:00Z", "v": 0.33 }, { "t": "2026-06-12T11:28:00Z", "v": 0.36 } ] },
+    { "name": "upstream.timeout.count", "entity": "service:api-gateway", "unit": "count", "points": [ { "t": "2026-06-12T11:14:00Z", "v": 1 }, { "t": "2026-06-12T11:22:00Z", "v": 210 }, { "t": "2026-06-12T11:28:00Z", "v": 240 } ] },
+    { "name": "http.server.duration_p95_ms", "entity": "service:catalog", "unit": "ms", "points": [ { "t": "2026-06-12T11:14:00Z", "v": 610 }, { "t": "2026-06-12T11:22:00Z", "v": 625 }, { "t": "2026-06-12T11:28:00Z", "v": 618 } ] },
+    { "name": "http.server.error_rate", "entity": "service:catalog", "unit": "ratio", "points": [ { "t": "2026-06-12T11:14:00Z", "v": 0.002 }, { "t": "2026-06-12T11:22:00Z", "v": 0.002 }, { "t": "2026-06-12T11:28:00Z", "v": 0.003 } ] }
+  ],
+  "logs": [
+    { "id": "log-1", "t": "2026-06-12T11:20:30Z", "entity": "service:api-gateway", "severity": "ERROR", "body": "upstream catalog exceeded 500ms deadline, returning 504", "attributes": { "error.type": "deadline_exceeded", "rpc.timeout_ms": 500 } },
+    { "id": "log-2", "t": "2026-06-12T11:23:10Z", "entity": "service:api-gateway", "severity": "ERROR", "body": "upstream catalog exceeded 500ms deadline, returning 504", "attributes": { "error.type": "deadline_exceeded", "rpc.timeout_ms": 500 } }
+  ],
+  "changes": [
+    { "id": "change:api-gateway-timeout-lowered", "t": "2026-06-12T11:20:00Z", "kind": "config_change", "entity": "service:api-gateway", "summary": "Lower upstream request timeout 5000ms -> 500ms", "attributes": { "key": "upstream.request_timeout_ms", "from": "5000", "to": "500", "source": "config-repo" } }
+  ]
+}

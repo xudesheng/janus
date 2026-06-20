@@ -1,0 +1,51 @@
+{
+  "_note": "Gold artifacts. The resolver must keep canary and stable as separate entities with confidence and alternatives, expose an unresolved bucket as missing data, and answer the health question per-identity rather than over the blended service.name aggregate.",
+  "entities": [
+    { "id": "service:payments@canary", "kind": "service", "from": ["res:payments-canary"], "confidence": 0.96, "discriminators": { "service.version": "5.0.0-rc1", "service.instance.id": "payments-canary-001", "rollout": "canary" }, "alternatives": [{ "id": "service:payments@stable", "reason": "same service.name", "confidence": 0.04 }] },
+    { "id": "service:payments@stable", "kind": "service", "from": ["res:payments-stable-a", "res:payments-stable-b"], "confidence": 0.95, "discriminators": { "service.version": "4.3.2", "service.instance.id": ["payments-7a", "payments-7b"] }, "alternatives": [{ "id": "service:payments@canary", "reason": "same service.name", "confidence": 0.05 }] },
+    { "id": "service:payments@unresolved", "kind": "service", "from": ["res:payments-unlabeled"], "confidence": 0.4, "unresolved": true, "missing_attributes": ["service.version", "service.instance.id"], "estimated_share": 0.18, "alternatives": [{ "id": "service:payments@canary", "confidence": 0.5 }, { "id": "service:payments@stable", "confidence": 0.5 }] }
+  ],
+  "relationships": [
+    { "src": "service:payments@canary", "type": "deployed-as", "dst": "instance:payments-canary-001", "confidence": 0.98 },
+    { "src": "service:payments@stable", "type": "deployed-as", "dst": "instance:payments-7a", "confidence": 0.98 },
+    { "src": "service:payments@stable", "type": "deployed-as", "dst": "instance:payments-7b", "confidence": 0.98 }
+  ],
+  "anomaly_windows": [
+    { "id": "aw-1", "entity": "service:payments@canary", "signal": "http.server.error_rate", "start": "2026-06-10T09:06:00Z", "end": "2026-06-10T09:30:00Z", "baseline": 0.01, "peak": 0.42, "detector_confidence": 0.92 },
+    { "id": "aw-2", "entity": "service:payments@stable", "signal": "http.server.error_rate", "start": null, "end": null, "baseline": 0.003, "peak": 0.005, "detector_confidence": 0.1, "note": "no anomaly: stable fleet is healthy" }
+  ],
+  "entity_context": {
+    "_for_capability": "expand_entity_context",
+    "entity": "service:payments@canary",
+    "kind": "service",
+    "current_health": "unhealthy",
+    "discriminators": { "service.version": "5.0.0-rc1", "rollout": "canary", "traffic_share": 0.1 },
+    "recent_changes": ["change:payments-canary-rollout"],
+    "dependencies": [],
+    "siblings_same_name": ["service:payments@stable", "service:payments@unresolved"],
+    "owners": [],
+    "related_incidents": [],
+    "resolution_confidence": 0.96
+  },
+  "evidence_bundle": {
+    "question": "Is the payments service unhealthy on 2026-06-10, and which part?",
+    "time_window": { "start": "2026-06-10T09:00:00Z", "end": "2026-06-10T09:30:00Z" },
+    "budget": { "max_items": 6, "max_tokens": 700, "tokens_used": 300, "items_dropped": 0 },
+    "items": [
+      { "id": "ev-1", "claim": "The payments canary (v5.0.0-rc1) error rate rose to ~42% after its 09:05 rollout.", "kind": "metric_anomaly", "direction": "supports", "strength": 0.9, "time_window": { "start": "2026-06-10T09:06:00Z", "end": "2026-06-10T09:30:00Z" }, "entities": ["service:payments@canary"], "source_refs": [{ "signal": "metric", "ref": "http.server.error_rate@instance:payments-canary-001" }, { "signal": "change", "ref": "change:payments-canary-rollout" }, { "signal": "anomaly_window", "ref": "aw-1" }], "freshness": "changing", "missing_data": [], "token_cost": 55, "privacy_scope": "none", "confidence": { "entity_mapping": 0.96, "time_alignment": 0.93 } },
+      { "id": "ev-2", "claim": "The stable payments fleet (v4.3.2) stayed healthy (~0.3-0.5% errors).", "kind": "metric_anomaly", "direction": "supports", "strength": 0.85, "time_window": { "start": "2026-06-10T09:00:00Z", "end": "2026-06-10T09:30:00Z" }, "entities": ["service:payments@stable"], "source_refs": [{ "signal": "metric", "ref": "http.server.error_rate@instance:payments-7a" }, { "signal": "metric", "ref": "http.server.error_rate@instance:payments-7b" }], "freshness": "settled", "missing_data": [], "token_cost": 45, "privacy_scope": "none", "confidence": { "entity_mapping": 0.95 } },
+      { "id": "ev-3", "claim": "The canary failure signature is a v5-schema SerializationError, matching the new version.", "kind": "log_cluster", "direction": "supports", "strength": 0.8, "time_window": { "start": "2026-06-10T09:08:30Z", "end": "2026-06-10T09:13:00Z" }, "entities": ["service:payments@canary"], "source_refs": [{ "signal": "log", "ref": "log-1" }, { "signal": "trace", "ref": "t-4001/s-1" }], "freshness": "changing", "missing_data": [], "token_cost": 50, "privacy_scope": "none" },
+      { "id": "ev-4", "claim": "About 18% of payments telemetry has no service.instance.id and cannot be attributed to canary or stable.", "kind": "missing_data", "direction": "neutral", "strength": 0.6, "time_window": { "start": "2026-06-10T09:00:00Z", "end": "2026-06-10T09:30:00Z" }, "entities": ["service:payments@unresolved"], "source_refs": [{ "signal": "trace", "ref": "t-4003/s-3" }, { "signal": "log", "ref": "log-2" }], "freshness": "changing", "missing_data": ["service.instance.id", "service.version on res:payments-unlabeled"], "token_cost": 50, "privacy_scope": "none", "confidence": { "entity_mapping": 0.4 } },
+      { "id": "ev-5", "claim": "payments is unhealthy as a single service (blended error rate ~9% looks tolerable).", "kind": "counter_evidence", "direction": "contradicts", "strength": 0.7, "time_window": { "start": "2026-06-10T09:00:00Z", "end": "2026-06-10T09:30:00Z" }, "entities": ["service:payments@stable", "service:payments@canary"], "source_refs": [{ "signal": "metric", "ref": "http.server.error_rate@service:payments(aggregate-by-name)" }], "freshness": "changing", "missing_data": [], "token_cost": 50, "privacy_scope": "none", "note": "Aggregating by service.name dilutes the canary; the right unit of analysis is the per-version identity." }
+    ]
+  },
+  "suspected_causes": [
+    { "rank": 1, "entity": "service:payments@canary", "hypothesis": "payments 5.0.0-rc1 canary introduced a v5-schema SerializationError", "score": 0.88, "reasons": ["error_isolated_to_canary", "change_proximity", "error_signature_matches_version", "stable_fleet_healthy"], "supporting": ["ev-1", "ev-2", "ev-3"], "counter": [] },
+    { "rank": 2, "entity": "service:payments@unresolved", "hypothesis": "unattributed telemetry may include additional failing instances", "score": 0.3, "reasons": ["missing_instance_id"], "supporting": ["ev-4"], "counter": [], "note": "cannot confirm or rule out until disambiguated" }
+  ],
+  "next_checks": [
+    { "action": "Require service.instance.id (and service.version) on payments telemetry to resolve the ~18% unattributed share.", "rationale": "Removes the resolution ambiguity that hides per-identity health.", "expected_signal": "entity-resolution" },
+    { "action": "Halt or roll back the payments 5.0.0-rc1 canary and confirm the canary error rate clears.", "rationale": "If the canary is the cause, stopping it should restore health without touching the stable fleet.", "expected_signal": "metric_anomaly" },
+    { "action": "Evaluate health per service.version, not over the blended service.name aggregate.", "rationale": "The blended rate (~9%) masks the canary's 42%; per-identity analysis is the correct unit.", "expected_signal": "compare_windows" }
+  ]
+}

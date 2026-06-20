@@ -1,0 +1,56 @@
+{
+  "_note": "Gold artifacts. False-causality trap: errors concentrate on payment-svc, but the cause is checkout's retry amplification. The bundle must rank the amplification hypothesis above the naive payment-svc-root hypothesis and report that no in-window change exists.",
+  "entities": [
+    { "id": "service:checkout", "kind": "service", "from": ["res:checkout"], "confidence": 0.99 },
+    { "id": "service:payment-svc", "kind": "service", "from": ["res:payment-svc"], "confidence": 0.99 }
+  ],
+  "relationships": [
+    { "src": "service:checkout", "type": "calls", "dst": "service:payment-svc", "confidence": 0.98, "evidence": ["trace:t-2001"] },
+    { "src": "service:checkout", "type": "retries", "dst": "service:payment-svc", "confidence": 0.95, "evidence": ["trace:t-2001"], "attributes": { "max_attempts": 5, "backoff": "none" } }
+  ],
+  "anomaly_windows": [
+    { "id": "aw-1", "entity": "service:payment-svc", "signal": "http.server.error_rate", "start": "2026-06-05T14:40:00Z", "end": "2026-06-05T15:00:00Z", "baseline": 0.004, "peak": 0.62, "detector_confidence": 0.93 },
+    { "id": "aw-2", "entity": "service:payment-svc", "signal": "request.rate_rps", "start": "2026-06-05T14:41:00Z", "end": "2026-06-05T15:00:00Z", "baseline": 490, "peak": 2350, "detector_confidence": 0.9 },
+    { "id": "aw-3", "entity": "service:checkout", "signal": "client.retry.rate_rps", "start": "2026-06-05T14:41:00Z", "end": "2026-06-05T15:00:00Z", "baseline": 5, "peak": 1850, "detector_confidence": 0.91 }
+  ],
+  "related_anomalies": {
+    "_for_capability": "find_related_anomalies",
+    "seed": "aw-1",
+    "related": [
+      { "window": "aw-3", "relation": "amplifier", "lag_seconds": 60, "note": "checkout retry rate surge tracks payment-svc request surge ~1:1" },
+      { "window": "aw-2", "relation": "load-amplification", "lag_seconds": 0, "note": "payment-svc request rate ~5x baseline matches retry fan-out" }
+    ]
+  },
+  "log_patterns": [
+    { "id": "lp-1", "template": "upstream provider transient error, returning 503", "entity": "service:payment-svc", "severity": "WARN", "first_seen": "2026-06-05T14:40:12Z", "last_seen": "2026-06-05T14:40:12Z", "count": 1, "exemplars": ["log-1"], "stability": "transient-trigger" },
+    { "id": "lp-2", "template": "charge failed, retrying attempt <n>/5 with no backoff", "entity": "service:checkout", "severity": "WARN", "first_seen": "2026-06-05T14:45:01Z", "last_seen": "2026-06-05T14:46:00Z", "count": 2, "exemplars": ["log-3", "log-4"], "stability": "new-since-incident" },
+    { "id": "lp-3", "template": "request queue full, shedding load", "entity": "service:payment-svc", "severity": "ERROR", "first_seen": "2026-06-05T14:42:30Z", "last_seen": "2026-06-05T14:42:30Z", "count": 1, "exemplars": ["log-2"], "stability": "overload-symptom" }
+  ],
+  "evidence_bundle": {
+    "question": "Why is payment-svc returning sustained 503s since 14:41 on 2026-06-05?",
+    "time_window": { "start": "2026-06-05T14:30:00Z", "end": "2026-06-05T15:00:00Z" },
+    "budget": { "max_items": 7, "max_tokens": 750, "tokens_used": 360, "items_dropped": 1 },
+    "items": [
+      { "id": "ev-1", "claim": "payment-svc request rate jumped ~5x (490 -> 2350 rps) at incident onset, matching checkout retry fan-out.", "kind": "metric_anomaly", "direction": "supports", "strength": 0.9, "time_window": { "start": "2026-06-05T14:41:00Z", "end": "2026-06-05T15:00:00Z" }, "entities": ["service:payment-svc", "service:checkout"], "source_refs": [{ "signal": "metric", "ref": "request.rate_rps@service:payment-svc" }, { "signal": "metric", "ref": "client.retry.rate_rps@service:checkout" }, { "signal": "anomaly_window", "ref": "aw-2" }], "freshness": "changing", "missing_data": [], "token_cost": 60, "privacy_scope": "none", "confidence": { "amplification": 0.9 } },
+      { "id": "ev-2", "claim": "A single checkout request fans out to 5 no-backoff charge attempts against payment-svc.", "kind": "trace_exemplar", "direction": "supports", "strength": 0.9, "time_window": { "start": "2026-06-05T14:45:00Z", "end": "2026-06-05T14:45:04Z" }, "entities": ["service:checkout", "service:payment-svc"], "source_refs": [{ "signal": "trace", "ref": "t-2001" }], "freshness": "settled", "missing_data": [], "token_cost": 65, "privacy_scope": "none" },
+      { "id": "ev-3", "claim": "The earliest payment-svc error was a brief transient upstream 503 before load climbed.", "kind": "log_cluster", "direction": "supports", "strength": 0.7, "time_window": { "start": "2026-06-05T14:40:12Z", "end": "2026-06-05T14:40:12Z" }, "entities": ["service:payment-svc"], "source_refs": [{ "signal": "log", "ref": "lp-1" }], "freshness": "settled", "missing_data": [], "token_cost": 45, "privacy_scope": "none" },
+      { "id": "ev-4", "claim": "payment-svc itself changed (deploy/config) inside the incident window.", "kind": "counter_evidence", "direction": "contradicts", "strength": 0.78, "time_window": { "start": "2026-06-05T14:30:00Z", "end": "2026-06-05T15:00:00Z" }, "entities": ["service:payment-svc"], "source_refs": [{ "signal": "change", "ref": "change:payment-svc-deploy-old" }], "freshness": "settled", "missing_data": ["no change record for payment-svc within the window; last deploy was 8 days prior"], "token_cost": 45, "privacy_scope": "none", "confidence": { "change_proximity": 0.85 } },
+      { "id": "ev-5", "claim": "payment-svc CPU saturated (0.45 -> 0.99) consistent with load overload, not an internal fault.", "kind": "metric_anomaly", "direction": "supports", "strength": 0.72, "time_window": { "start": "2026-06-05T14:42:00Z", "end": "2026-06-05T14:48:00Z" }, "entities": ["service:payment-svc"], "source_refs": [{ "signal": "metric", "ref": "cpu.utilization@service:payment-svc" }], "freshness": "changing", "missing_data": [], "token_cost": 45, "privacy_scope": "none" }
+    ]
+  },
+  "timeline": [
+    { "t": "2026-06-05T14:40:12Z", "marker": "trigger", "entity": "service:payment-svc", "text": "Brief transient upstream 503 (blip)", "source_ref": "log-1" },
+    { "t": "2026-06-05T14:41:00Z", "marker": "amplification", "entity": "service:checkout", "text": "Retry rate surges (no backoff)", "source_ref": "aw-3" },
+    { "t": "2026-06-05T14:42:00Z", "marker": "symptom", "entity": "service:payment-svc", "text": "Request rate ~4x, CPU saturates, queue full", "source_ref": "aw-2" },
+    { "t": "2026-06-05T14:42:30Z", "marker": "symptom", "entity": "service:payment-svc", "text": "Sustained 503s from load shedding", "source_ref": "log-2" }
+  ],
+  "suspected_causes": [
+    { "rank": 1, "entity": "service:checkout", "hypothesis": "no-backoff retry policy amplified a transient into a self-sustaining storm", "score": 0.82, "reasons": ["retry_fanout_trace", "retry_rate_tracks_load", "no_payment_change_in_window"], "supporting": ["ev-1", "ev-2", "ev-5"], "counter": [] },
+    { "rank": 2, "entity": "service:payment-svc", "hypothesis": "payment-svc internal fault is the root cause (errors concentrate here)", "score": 0.18, "reasons": ["errors_concentrate_here"], "supporting": ["ev-3"], "counter": ["ev-4", "ev-1"], "trap_note": "Naive suspect: errors are visible on payment-svc but it is the amplified victim." }
+  ],
+  "next_checks": [
+    { "action": "Enable exponential backoff + jitter and cap retries on checkout, then watch payment-svc request rate.", "rationale": "If load drops back to ~1x, the retry policy is confirmed as the lever.", "expected_signal": "metric_anomaly" },
+    { "action": "Check the upstream payment provider for the 14:40 transient.", "rationale": "Identifies the trigger that the retry storm amplified.", "expected_signal": "log_cluster" },
+    { "action": "Add a circuit breaker between checkout and payment-svc.", "rationale": "Prevents future transients from being amplified into outages.", "expected_signal": "relationship" }
+  ]
+}

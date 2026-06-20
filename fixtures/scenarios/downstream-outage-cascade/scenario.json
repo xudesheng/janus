@@ -1,0 +1,36 @@
+{
+  "id": "downstream-outage-cascade",
+  "title": "External payment provider outage cascades to checkout",
+  "version": 1,
+  "schema_version": "fixtures/v1",
+  "failure_class": "downstream-outage",
+  "difficulty": "baseline",
+  "false_causality_trap": false,
+  "summary": "The external payment provider (stripe) starts returning 503s and timeouts at 13:00 due to a provider-side outage. checkout's charge calls fail and api-gateway surfaces 5xx to users. Our own services are healthy apart from the failing external call. The cause is outside our control: an external dependency outage.",
+  "question": "Why did checkout payments start failing at 13:00 on 2026-06-17?",
+  "time_window": { "start": "2026-06-17T12:50:00Z", "end": "2026-06-17T13:20:00Z" },
+  "ground_truth": {
+    "primary_cause_entity": "external-api:stripe",
+    "cause_kind": "downstream_outage",
+    "cause_ref": "change:stripe-provider-incident",
+    "blast_radius": ["service:checkout", "service:api-gateway"],
+    "not_the_cause": ["service:checkout-internal"],
+    "notes": "All errors live on the external stripe call span; checkout's own internal work is healthy and there is no internal deploy or config change. Evidence must identify the external dependency and rule out internal causes."
+  },
+  "capabilities": [
+    "entity-resolution",
+    "relationship-building",
+    "change-ingestion",
+    "anomaly-windows",
+    "log-pattern-clustering",
+    "evidence-ir",
+    "get_evidence_bundle",
+    "build_timeline",
+    "find_related_anomalies",
+    "rank_suspected_causes",
+    "suggest_next_checks",
+    "false-causality-guard"
+  ],
+  "inputs": ["resources", "traces", "metrics", "logs", "changes"],
+  "expected": ["entities", "relationships", "anomaly_windows", "log_patterns", "evidence_bundle", "timeline", "suspected_causes", "next_checks"]
+}

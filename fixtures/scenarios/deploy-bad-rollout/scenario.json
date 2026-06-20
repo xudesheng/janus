@@ -1,0 +1,45 @@
+{
+  "id": "deploy-bad-rollout",
+  "title": "Bad checkout deploy causes 5xx and latency",
+  "version": 1,
+  "schema_version": "fixtures/v1",
+  "failure_class": "deploy",
+  "difficulty": "baseline",
+  "false_causality_trap": false,
+  "summary": "A v2 rollout of the checkout service introduces a null-pointer regression in discount handling. POST /checkout starts returning 5xx and latency rises; the user-facing api-gateway propagates the errors. The orders-pg database stays healthy, which is counter-evidence against a database cause.",
+  "question": "Why did checkout start returning 5xx around 14:05 on 2026-06-01?",
+  "time_window": { "start": "2026-06-01T14:00:00Z", "end": "2026-06-01T14:15:00Z" },
+  "ground_truth": {
+    "primary_cause_entity": "service:checkout",
+    "cause_kind": "change_event",
+    "cause_ref": "change:deploy-checkout-v2",
+    "blast_radius": ["service:checkout", "service:api-gateway"],
+    "not_the_cause": ["db:orders-pg"],
+    "notes": "Time alignment (deploy at 14:03, errors from 14:03), error signature (NPE in applyDiscount), and a healthy downstream DB together point to the deploy. The DB hypothesis must be returned as weakened counter-evidence, not silently dropped."
+  },
+  "capabilities": [
+    "entity-resolution",
+    "relationship-building",
+    "change-ingestion",
+    "anomaly-windows",
+    "log-pattern-clustering",
+    "evidence-ir",
+    "get_evidence_bundle",
+    "build_timeline",
+    "compare_windows",
+    "rank_suspected_causes",
+    "suggest_next_checks",
+    "false-causality-guard"
+  ],
+  "inputs": ["resources", "traces", "metrics", "logs", "changes"],
+  "expected": [
+    "entities",
+    "relationships",
+    "anomaly_windows",
+    "log_patterns",
+    "evidence_bundle",
+    "timeline",
+    "suspected_causes",
+    "next_checks"
+  ]
+}

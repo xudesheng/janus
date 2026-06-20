@@ -1,0 +1,41 @@
+{
+  "_note": "Self-contained, OTel-shaped synthetic telemetry. The optional prior_incidents key is a warm-layer memory store of past incidents the resolver can match against; prior:inc-0603 is described inline so the fixture stays self-contained (it does not reference any other fixture).",
+  "resources": [
+    { "id": "res:checkout", "attributes": { "service.name": "checkout", "service.version": "2.0.1", "deployment.environment": "prod" } },
+    { "id": "res:orders-pg", "attributes": { "service.name": "orders-pg", "db.system": "postgresql", "deployment.environment": "prod", "host.name": "node-db-1" } },
+    { "id": "res:reporting-job", "attributes": { "service.name": "reporting-job", "service.version": "1.2.0", "deployment.environment": "prod" } }
+  ],
+  "traces": [
+    {
+      "trace_id": "t-a001",
+      "exemplar_of": "slow",
+      "spans": [
+        { "span_id": "s-1", "parent_id": null, "resource": "res:checkout", "name": "POST /checkout", "kind": "SERVER", "start": "2026-06-18T03:08:00.000Z", "end": "2026-06-18T03:08:01.300Z", "status": "ERROR", "attributes": { "http.route": "/checkout", "error.type": "timeout" } },
+        { "span_id": "s-2", "parent_id": "s-1", "resource": "res:orders-pg", "name": "SELECT cart", "kind": "CLIENT", "start": "2026-06-18T03:08:00.020Z", "end": "2026-06-18T03:08:01.280Z", "status": "ERROR", "attributes": { "db.system": "postgresql", "error.type": "statement_timeout" } }
+      ]
+    }
+  ],
+  "metrics": [
+    { "name": "db.query.duration_p95_ms", "entity": "db:orders-pg", "unit": "ms", "points": [ { "t": "2026-06-18T02:58:00Z", "v": 31 }, { "t": "2026-06-18T03:05:00Z", "v": 1120 }, { "t": "2026-06-18T03:12:00Z", "v": 1250 }, { "t": "2026-06-18T03:20:00Z", "v": 55 } ] },
+    { "name": "db.locks.waiting", "entity": "db:orders-pg", "unit": "count", "points": [ { "t": "2026-06-18T02:58:00Z", "v": 0 }, { "t": "2026-06-18T03:05:00Z", "v": 16 }, { "t": "2026-06-18T03:12:00Z", "v": 21 }, { "t": "2026-06-18T03:20:00Z", "v": 1 } ] },
+    { "name": "http.server.error_rate", "entity": "service:checkout", "unit": "ratio", "points": [ { "t": "2026-06-18T02:58:00Z", "v": 0.003 }, { "t": "2026-06-18T03:06:00Z", "v": 0.28 }, { "t": "2026-06-18T03:20:00Z", "v": 0.01 } ] }
+  ],
+  "logs": [
+    { "id": "log-1", "t": "2026-06-18T03:05:10Z", "entity": "db:orders-pg", "severity": "WARN", "body": "16 transactions waiting on lock for relation orders", "attributes": {} },
+    { "id": "log-2", "t": "2026-06-18T03:06:30Z", "entity": "service:checkout", "severity": "ERROR", "body": "db query timed out after 1000ms: SELECT * FROM cart", "attributes": { "error.type": "statement_timeout" } }
+  ],
+  "changes": [
+    { "id": "change:reporting-job-batch-start-2", "t": "2026-06-18T03:04:30Z", "kind": "job_start", "entity": "service:reporting-job", "summary": "ad-hoc rollup batch started (VACUUM ANALYZE on orders)", "attributes": { "schedule": "manual", "job.name": "adhoc_rollup" } }
+  ],
+  "prior_incidents": [
+    {
+      "id": "prior:inc-0603",
+      "first_seen": "2026-06-03T14:20:00Z",
+      "title": "orders-pg lock contention from reporting batch degraded checkout",
+      "signature": { "primary_entity": "db:orders-pg", "symptom": "db.query.duration_p95_ms spike + db.locks.waiting spike", "trigger": "service:reporting-job VACUUM lock", "upstream_impact": "service:checkout statement_timeout" },
+      "mitigation": "Rescheduled reporting batch off-peak; added statement_timeout alerting on orders-pg.",
+      "resolution_minutes": 22,
+      "summary": "A reporting VACUUM took a long lock on orders, timing out checkout cart reads until the batch finished."
+    }
+  ]
+}

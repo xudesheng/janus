@@ -1,0 +1,44 @@
+{
+  "_note": "Self-contained, OTel-shaped synthetic telemetry. ISO-8601 UTC timestamps. Two change records: an innocent deploy and the real infra cause. Onset timing is the disambiguator.",
+  "resources": [
+    { "id": "res:search-ui", "attributes": { "service.name": "search-ui", "service.version": "5.2.0", "deployment.environment": "prod", "k8s.namespace.name": "edge" } },
+    { "id": "res:search-api", "attributes": { "service.name": "search-api", "service.version": "7.0.3", "deployment.environment": "prod", "k8s.namespace.name": "search" } },
+    { "id": "res:redis-cache", "attributes": { "service.name": "redis-cache", "db.system": "redis", "deployment.environment": "prod", "cluster.name": "search-cache" } },
+    { "id": "res:catalog-pg", "attributes": { "service.name": "catalog-pg", "db.system": "postgresql", "deployment.environment": "prod" } }
+  ],
+  "traces": [
+    {
+      "trace_id": "t-3001",
+      "exemplar_of": "slow-cache-miss",
+      "spans": [
+        { "span_id": "s-1", "parent_id": null, "resource": "res:search-api", "name": "GET /search", "kind": "SERVER", "start": "2026-06-08T15:06:00.000Z", "end": "2026-06-08T15:06:01.700Z", "status": "ERROR", "attributes": { "http.route": "/search", "http.status_code": 504 } },
+        { "span_id": "s-2", "parent_id": "s-1", "resource": "res:redis-cache", "name": "GET catalog:q", "kind": "CLIENT", "start": "2026-06-08T15:06:00.010Z", "end": "2026-06-08T15:06:00.030Z", "status": "OK", "attributes": { "db.system": "redis", "cache.hit": false } },
+        { "span_id": "s-3", "parent_id": "s-1", "resource": "res:catalog-pg", "name": "SELECT catalog", "kind": "CLIENT", "start": "2026-06-08T15:06:00.040Z", "end": "2026-06-08T15:06:01.690Z", "status": "ERROR", "attributes": { "db.system": "postgresql", "error.type": "statement_timeout" } }
+      ]
+    },
+    {
+      "trace_id": "t-3002",
+      "exemplar_of": "baseline-cache-hit",
+      "spans": [
+        { "span_id": "b-1", "parent_id": null, "resource": "res:search-api", "name": "GET /search", "kind": "SERVER", "start": "2026-06-08T14:57:00.000Z", "end": "2026-06-08T14:57:00.090Z", "status": "OK", "attributes": { "http.route": "/search", "http.status_code": 200 } },
+        { "span_id": "b-2", "parent_id": "b-1", "resource": "res:redis-cache", "name": "GET catalog:q", "kind": "CLIENT", "start": "2026-06-08T14:57:00.010Z", "end": "2026-06-08T14:57:00.025Z", "status": "OK", "attributes": { "cache.hit": true } }
+      ]
+    }
+  ],
+  "metrics": [
+    { "name": "cache.hit_ratio", "entity": "infra:redis-cache", "unit": "ratio", "points": [ { "t": "2026-06-08T14:58:00Z", "v": 0.95 }, { "t": "2026-06-08T15:01:00Z", "v": 0.55 }, { "t": "2026-06-08T15:03:00Z", "v": 0.41 }, { "t": "2026-06-08T15:10:00Z", "v": 0.4 } ] },
+    { "name": "http.server.error_rate", "entity": "service:search-api", "unit": "ratio", "points": [ { "t": "2026-06-08T14:58:00Z", "v": 0.002 }, { "t": "2026-06-08T15:02:00Z", "v": 0.12 }, { "t": "2026-06-08T15:04:00Z", "v": 0.33 }, { "t": "2026-06-08T15:10:00Z", "v": 0.36 } ] },
+    { "name": "http.server.duration_p95_ms", "entity": "service:search-api", "unit": "ms", "points": [ { "t": "2026-06-08T14:58:00Z", "v": 90 }, { "t": "2026-06-08T15:02:00Z", "v": 880 }, { "t": "2026-06-08T15:06:00Z", "v": 1700 } ] },
+    { "name": "http.server.error_rate", "entity": "service:search-ui", "unit": "ratio", "points": [ { "t": "2026-06-08T14:58:00Z", "v": 0.001 }, { "t": "2026-06-08T15:04:00Z", "v": 0.001 }, { "t": "2026-06-08T15:10:00Z", "v": 0.0015 } ] },
+    { "name": "db.query.duration_p95_ms", "entity": "db:catalog-pg", "unit": "ms", "points": [ { "t": "2026-06-08T14:58:00Z", "v": 35 }, { "t": "2026-06-08T15:03:00Z", "v": 950 }, { "t": "2026-06-08T15:08:00Z", "v": 1100 } ] }
+  ],
+  "logs": [
+    { "id": "log-1", "t": "2026-06-08T15:01:10Z", "entity": "infra:redis-cache", "severity": "ERROR", "body": "cluster node redis-2 unreachable; failing over, hit ratio degraded", "attributes": { "node": "redis-2" } },
+    { "id": "log-2", "t": "2026-06-08T15:02:20Z", "entity": "service:search-api", "severity": "ERROR", "body": "cache miss fallback to catalog-pg timed out after 1500ms", "attributes": { "error.type": "statement_timeout" } },
+    { "id": "log-3", "t": "2026-06-08T15:06:00Z", "entity": "service:search-api", "severity": "ERROR", "body": "cache miss fallback to catalog-pg timed out after 1500ms", "attributes": { "error.type": "statement_timeout" } }
+  ],
+  "changes": [
+    { "id": "change:redis-node-loss", "t": "2026-06-08T15:01:05Z", "kind": "infrastructure_event", "entity": "infra:redis-cache", "summary": "redis-cache lost node redis-2 (failover)", "attributes": { "node": "redis-2", "event": "node_unreachable" } },
+    { "id": "change:deploy-search-ui", "t": "2026-06-08T15:03:10Z", "kind": "deploy", "entity": "service:search-ui", "summary": "search-ui 5.1.7 -> 5.2.0 (frontend assets only)", "attributes": { "from_version": "5.1.7", "to_version": "5.2.0", "scope": "frontend" } }
+  ]
+}

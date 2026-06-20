@@ -1,0 +1,51 @@
+{
+  "_note": "Gold artifacts. The cause is a config change, not a deploy; catalog is healthy and must be returned as weakened counter-evidence.",
+  "entities": [
+    { "id": "service:api-gateway", "kind": "service", "from": ["res:api-gateway"], "confidence": 0.99 },
+    { "id": "service:catalog", "kind": "service", "from": ["res:catalog"], "confidence": 0.99 }
+  ],
+  "relationships": [
+    { "src": "service:api-gateway", "type": "calls", "dst": "service:catalog", "confidence": 0.98, "evidence": ["trace:t-5001"] }
+  ],
+  "anomaly_windows": [
+    { "id": "aw-1", "entity": "service:api-gateway", "signal": "http.server.error_rate", "start": "2026-06-12T11:20:00Z", "end": "2026-06-12T11:35:00Z", "baseline": 0.003, "peak": 0.36, "detector_confidence": 0.92 },
+    { "id": "aw-2", "entity": "service:api-gateway", "signal": "upstream.timeout.count", "start": "2026-06-12T11:20:00Z", "end": "2026-06-12T11:35:00Z", "baseline": 1, "peak": 240, "detector_confidence": 0.9 }
+  ],
+  "log_patterns": [
+    { "id": "lp-1", "template": "upstream catalog exceeded 500ms deadline, returning 504", "entity": "service:api-gateway", "severity": "ERROR", "first_seen": "2026-06-12T11:20:30Z", "last_seen": "2026-06-12T11:23:10Z", "count": 2, "exemplars": ["log-1"], "stability": "new-since-incident" }
+  ],
+  "window_comparison": {
+    "_for_capability": "compare_windows",
+    "healthy": { "start": "2026-06-12T11:10:00Z", "end": "2026-06-12T11:19:00Z" },
+    "anomalous": { "start": "2026-06-12T11:21:00Z", "end": "2026-06-12T11:30:00Z" },
+    "deltas": [
+      { "entity": "service:api-gateway", "signal": "http.server.error_rate", "from": 0.003, "to": 0.36, "factor": 120.0 },
+      { "entity": "service:catalog", "signal": "http.server.duration_p95_ms", "from": 610, "to": 618, "factor": 1.01, "note": "catalog latency essentially flat; it did not degrade" }
+    ]
+  },
+  "evidence_bundle": {
+    "question": "Why did api-gateway start returning 504s on catalog routes around 11:20 on 2026-06-12 with no deploy?",
+    "time_window": { "start": "2026-06-12T11:10:00Z", "end": "2026-06-12T11:35:00Z" },
+    "budget": { "max_items": 6, "max_tokens": 650, "tokens_used": 250, "items_dropped": 0 },
+    "items": [
+      { "id": "ev-1", "claim": "An api-gateway config change lowered the upstream timeout 5000ms -> 500ms at 11:20.", "kind": "change_event", "direction": "supports", "strength": 0.92, "time_window": { "start": "2026-06-12T11:20:00Z", "end": "2026-06-12T11:20:00Z" }, "entities": ["service:api-gateway"], "source_refs": [{ "signal": "change", "ref": "change:api-gateway-timeout-lowered" }], "freshness": "settled", "missing_data": [], "token_cost": 50, "privacy_scope": "none", "confidence": { "time_alignment": 0.95, "change_proximity": 0.95 } },
+      { "id": "ev-2", "claim": "An exemplar shows catalog completing in 620ms (OK) after the gateway aborted the call at 500ms (deadline_exceeded).", "kind": "trace_exemplar", "direction": "supports", "strength": 0.9, "time_window": { "start": "2026-06-12T11:24:00Z", "end": "2026-06-12T11:24:01Z" }, "entities": ["service:api-gateway", "service:catalog"], "source_refs": [{ "signal": "trace", "ref": "t-5001/s-2" }, { "signal": "trace", "ref": "t-5001/s-3" }], "freshness": "settled", "missing_data": [], "token_cost": 60, "privacy_scope": "none" },
+      { "id": "ev-3", "claim": "Gateway upstream-timeout count jumped from ~1 to ~240 starting at the config change.", "kind": "metric_anomaly", "direction": "supports", "strength": 0.85, "time_window": { "start": "2026-06-12T11:20:00Z", "end": "2026-06-12T11:35:00Z" }, "entities": ["service:api-gateway"], "source_refs": [{ "signal": "metric", "ref": "upstream.timeout.count@service:api-gateway" }, { "signal": "anomaly_window", "ref": "aw-2" }], "freshness": "changing", "missing_data": [], "token_cost": 45, "privacy_scope": "none" },
+      { "id": "ev-4", "claim": "The catalog service degraded and caused the 504s.", "kind": "counter_evidence", "direction": "weakens", "strength": 0.85, "time_window": { "start": "2026-06-12T11:10:00Z", "end": "2026-06-12T11:35:00Z" }, "entities": ["service:catalog"], "source_refs": [{ "signal": "metric", "ref": "http.server.duration_p95_ms@service:catalog" }, { "signal": "trace", "ref": "t-5001/s-3" }], "freshness": "settled", "missing_data": [], "token_cost": 45, "privacy_scope": "none", "note": "catalog p95 unchanged at ~620ms and its server span succeeded." }
+    ]
+  },
+  "timeline": [
+    { "t": "2026-06-12T11:20:00Z", "marker": "change", "entity": "service:api-gateway", "text": "Upstream timeout lowered 5000ms -> 500ms", "source_ref": "change:api-gateway-timeout-lowered" },
+    { "t": "2026-06-12T11:20:30Z", "marker": "symptom", "entity": "service:api-gateway", "text": "First 504 deadline_exceeded on catalog route", "source_ref": "log-1" },
+    { "t": "2026-06-12T11:22:00Z", "marker": "symptom", "entity": "service:api-gateway", "text": "Error rate climbs to 33%", "source_ref": "aw-1" }
+  ],
+  "suspected_causes": [
+    { "rank": 1, "entity": "service:api-gateway", "hypothesis": "lowered upstream timeout aborts legitimately-slow catalog responses", "score": 0.9, "reasons": ["config_change_proximity", "deadline_exceeded_signature", "catalog_latency_unchanged"], "supporting": ["ev-1", "ev-2", "ev-3"], "counter": [] },
+    { "rank": 2, "entity": "service:catalog", "hypothesis": "catalog degradation caused the 504s", "score": 0.08, "reasons": ["latency_flat", "server_spans_ok"], "supporting": [], "counter": ["ev-4"] }
+  ],
+  "next_checks": [
+    { "action": "Revert upstream.request_timeout_ms to 5000ms (or set a value above catalog p99) and confirm 504s clear.", "rationale": "Direct confirmation that the config change is the cause.", "expected_signal": "metric_anomaly" },
+    { "action": "Review the config-repo change that set 500ms and whether it was intended for a different route.", "rationale": "Identifies intent and prevents reintroduction.", "expected_signal": "change_event" },
+    { "action": "If the tight timeout is intended, optimize catalog /products p95 below 500ms before re-applying.", "rationale": "Aligns the SLO and the timeout instead of failing valid requests.", "expected_signal": "compare_windows" }
+  ]
+}

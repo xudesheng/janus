@@ -1,0 +1,35 @@
+{
+  "id": "traffic-shift-hotspot",
+  "title": "Tenant traffic ramp saturates one orders shard",
+  "version": 1,
+  "schema_version": "fixtures/v1",
+  "failure_class": "traffic-shift",
+  "difficulty": "hard",
+  "false_causality_trap": false,
+  "summary": "A large tenant (acme) starts a campaign that ramps its traffic ~5x. Its key range hashes onto orders-shard-3, which saturates (queue depth, latency) while shards 1 and 2 stay healthy. The service-wide aggregate looks only mildly degraded, hiding the hotspot. The cause is a traffic shift onto a partition, not a service regression.",
+  "question": "Why did some orders requests get slow around 16:10 on 2026-06-14 while the service average looks fine?",
+  "time_window": { "start": "2026-06-14T16:00:00Z", "end": "2026-06-14T16:30:00Z" },
+  "ground_truth": {
+    "primary_cause_entity": "shard:orders-shard-3",
+    "cause_kind": "traffic_shift",
+    "contributing_entity": "tenant:acme",
+    "cause_ref": "change:acme-traffic-ramp",
+    "blast_radius": ["shard:orders-shard-3"],
+    "not_the_cause": ["service:orders"],
+    "notes": "Analysis must be per-shard/per-tenant: shard-3 saturates while others are fine and the service aggregate is diluted. The disambiguator is the hot partition plus the tenant ramp, not a code change."
+  },
+  "capabilities": [
+    "entity-resolution",
+    "relationship-building",
+    "anomaly-windows",
+    "evidence-ir",
+    "get_evidence_bundle",
+    "build_timeline",
+    "compare_windows",
+    "rank_suspected_causes",
+    "suggest_next_checks",
+    "false-causality-guard"
+  ],
+  "inputs": ["resources", "traces", "metrics", "logs", "changes"],
+  "expected": ["entities", "relationships", "anomaly_windows", "log_patterns", "evidence_bundle", "timeline", "suspected_causes", "next_checks"]
+}

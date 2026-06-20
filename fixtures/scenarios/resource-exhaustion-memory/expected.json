@@ -1,0 +1,48 @@
+{
+  "_note": "Gold artifacts. The signature is a sawtooth RSS climbing to the limit, OOM kills, restarts, and error bursts at restart times only. The leak traces to the prior-day v3.0.0 deploy.",
+  "entities": [
+    { "id": "service:recommender", "kind": "service", "from": ["res:recommender"], "confidence": 0.99 },
+    { "id": "pod:recommender-5b8f", "kind": "pod", "from": ["res:recommender"], "confidence": 0.98 },
+    { "id": "host:node-c", "kind": "host", "from": ["res:recommender"], "confidence": 0.95 },
+    { "id": "db:feature-store", "kind": "cache", "from": ["res:feature-store"], "confidence": 0.97 }
+  ],
+  "relationships": [
+    { "src": "service:recommender", "type": "deployed-as", "dst": "pod:recommender-5b8f", "confidence": 0.98 },
+    { "src": "pod:recommender-5b8f", "type": "runs-on", "dst": "host:node-c", "confidence": 0.95 },
+    { "src": "service:recommender", "type": "reads-from", "dst": "db:feature-store", "confidence": 0.96, "evidence": ["trace:t-7002"] }
+  ],
+  "anomaly_windows": [
+    { "id": "aw-1", "entity": "pod:recommender-5b8f", "signal": "memory.rss_bytes", "start": "2026-06-15T08:00:00Z", "end": "2026-06-15T09:00:00Z", "baseline": 540, "peak": 1018, "pattern": "sawtooth", "detector_confidence": 0.9 },
+    { "id": "aw-2", "entity": "pod:recommender-5b8f", "signal": "pod.restarts.count", "start": "2026-06-15T08:21:00Z", "end": "2026-06-15T09:00:00Z", "baseline": 0, "peak": 2, "detector_confidence": 0.92 },
+    { "id": "aw-3", "entity": "service:recommender", "signal": "http.server.error_rate", "start": "2026-06-15T08:21:00Z", "end": "2026-06-15T08:51:00Z", "baseline": 0.003, "peak": 0.35, "pattern": "bursts-at-restart", "detector_confidence": 0.85 }
+  ],
+  "log_patterns": [
+    { "id": "lp-1", "template": "Container recommender OOMKilled (memory limit 1024MiB exceeded)", "entity": "pod:recommender-5b8f", "severity": "ERROR", "first_seen": "2026-06-15T08:20:55Z", "last_seen": "2026-06-15T08:49:50Z", "count": 2, "exemplars": ["log-1", "log-2"], "stability": "recurring-each-cycle" }
+  ],
+  "evidence_bundle": {
+    "question": "Why is recommender throwing brief error bursts and restarting repeatedly on 2026-06-15?",
+    "time_window": { "start": "2026-06-15T08:00:00Z", "end": "2026-06-15T09:00:00Z" },
+    "budget": { "max_items": 6, "max_tokens": 700, "tokens_used": 290, "items_dropped": 0 },
+    "items": [
+      { "id": "ev-1", "claim": "Pod RSS climbs to the 1024MiB limit then drops to ~180MiB twice, a leak sawtooth.", "kind": "metric_anomaly", "direction": "supports", "strength": 0.9, "time_window": { "start": "2026-06-15T08:00:00Z", "end": "2026-06-15T09:00:00Z" }, "entities": ["pod:recommender-5b8f"], "source_refs": [{ "signal": "metric", "ref": "memory.rss_bytes@pod:recommender-5b8f" }, { "signal": "anomaly_window", "ref": "aw-1" }], "freshness": "changing", "missing_data": [], "token_cost": 55, "privacy_scope": "none" },
+      { "id": "ev-2", "claim": "Two OOMKilled events and rising restart count line up with the RSS troughs.", "kind": "log_cluster", "direction": "supports", "strength": 0.9, "time_window": { "start": "2026-06-15T08:20:55Z", "end": "2026-06-15T08:50:00Z" }, "entities": ["pod:recommender-5b8f"], "source_refs": [{ "signal": "log", "ref": "lp-1" }, { "signal": "metric", "ref": "pod.restarts.count@pod:recommender-5b8f" }, { "signal": "change", "ref": "change:oom-restart-1" }], "freshness": "changing", "missing_data": [], "token_cost": 55, "privacy_scope": "none" },
+      { "id": "ev-3", "claim": "Error bursts occur only at restart times and the leak began after the v3.0.0 deploy the prior day.", "kind": "change_event", "direction": "supports", "strength": 0.78, "time_window": { "start": "2026-06-14T09:30:00Z", "end": "2026-06-15T09:00:00Z" }, "entities": ["service:recommender"], "source_refs": [{ "signal": "change", "ref": "change:recommender-v3-deploy" }, { "signal": "metric", "ref": "http.server.error_rate@service:recommender" }], "freshness": "changing", "missing_data": ["per-commit heap profile to confirm the leaking allocation"], "token_cost": 55, "privacy_scope": "none", "confidence": { "change_proximity": 0.7 } },
+      { "id": "ev-4", "claim": "A downstream dependency (feature-store) caused the failures.", "kind": "counter_evidence", "direction": "contradicts", "strength": 0.8, "time_window": { "start": "2026-06-15T08:00:00Z", "end": "2026-06-15T09:00:00Z" }, "entities": ["db:feature-store"], "source_refs": [{ "signal": "metric", "ref": "db.query.duration_p95_ms@db:feature-store" }, { "signal": "trace", "ref": "t-7002/s-3" }], "freshness": "settled", "missing_data": [], "token_cost": 45, "privacy_scope": "none", "note": "feature-store latency is flat at ~12ms; errors are connection_refused during restarts, not downstream timeouts." }
+    ]
+  },
+  "timeline": [
+    { "t": "2026-06-14T09:30:00Z", "marker": "change", "entity": "service:recommender", "text": "Deploy recommender 3.0.0 (new embedding cache)", "source_ref": "change:recommender-v3-deploy" },
+    { "t": "2026-06-15T08:19:00Z", "marker": "symptom", "entity": "pod:recommender-5b8f", "text": "RSS approaches 1024MiB limit", "source_ref": "aw-1" },
+    { "t": "2026-06-15T08:21:00Z", "marker": "symptom", "entity": "pod:recommender-5b8f", "text": "OOM kill + restart (cycle 1), error burst", "source_ref": "change:oom-restart-1" },
+    { "t": "2026-06-15T08:50:00Z", "marker": "symptom", "entity": "pod:recommender-5b8f", "text": "OOM kill + restart (cycle 2), error burst", "source_ref": "change:oom-restart-2" }
+  ],
+  "suspected_causes": [
+    { "rank": 1, "entity": "service:recommender", "hypothesis": "memory leak introduced by v3.0.0 drives an OOM/restart cycle", "score": 0.85, "reasons": ["sawtooth_rss", "oom_logs", "restart_aligned_errors", "deploy_origin"], "supporting": ["ev-1", "ev-2", "ev-3"], "counter": [] },
+    { "rank": 2, "entity": "db:feature-store", "hypothesis": "feature-store degradation caused the errors", "score": 0.07, "reasons": ["latency_flat"], "supporting": [], "counter": ["ev-4"] }
+  ],
+  "next_checks": [
+    { "action": "Capture a heap profile near the RSS peak and compare allocations against v2.9.1.", "rationale": "Pinpoints the leaking allocation introduced by v3.0.0.", "expected_signal": "profile_hotspot" },
+    { "action": "Roll back recommender to 2.9.1 (or disable the new embedding cache) and confirm RSS stops climbing.", "rationale": "Confirms the deploy as the leak origin.", "expected_signal": "metric_anomaly" },
+    { "action": "Temporarily raise the memory limit / add restart backoff to reduce user-facing burst impact while fixing.", "rationale": "Mitigates blast radius without masking the leak.", "expected_signal": "metric_anomaly" }
+  ]
+}

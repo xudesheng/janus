@@ -1,0 +1,36 @@
+{
+  "id": "config-change-timeout",
+  "title": "Lowered upstream timeout config turns slow-but-OK into 504s",
+  "version": 1,
+  "schema_version": "fixtures/v1",
+  "failure_class": "config-change",
+  "difficulty": "baseline",
+  "false_causality_trap": false,
+  "summary": "An api-gateway config change lowers the upstream request timeout from 5000ms to 500ms. The catalog service is healthy but routinely answers in 300-700ms, so requests above 500ms are now aborted as 504s. There is no code deploy and catalog's own latency is unchanged; the cause is a non-deploy configuration change.",
+  "question": "Why did api-gateway start returning 504s on catalog routes around 11:20 on 2026-06-12 with no deploy?",
+  "time_window": { "start": "2026-06-12T11:10:00Z", "end": "2026-06-12T11:35:00Z" },
+  "ground_truth": {
+    "primary_cause_entity": "service:api-gateway",
+    "cause_kind": "config_change",
+    "cause_ref": "change:api-gateway-timeout-lowered",
+    "blast_radius": ["service:api-gateway"],
+    "not_the_cause": ["service:catalog"],
+    "notes": "catalog latency is unchanged and its server spans complete successfully; the gateway aborts them at the new 500ms deadline. Change-ingestion must capture config changes, not just deploys, and the healthy-downstream signal rules catalog out."
+  },
+  "capabilities": [
+    "entity-resolution",
+    "relationship-building",
+    "change-ingestion",
+    "anomaly-windows",
+    "log-pattern-clustering",
+    "evidence-ir",
+    "get_evidence_bundle",
+    "build_timeline",
+    "compare_windows",
+    "rank_suspected_causes",
+    "suggest_next_checks",
+    "false-causality-guard"
+  ],
+  "inputs": ["resources", "traces", "metrics", "logs", "changes"],
+  "expected": ["entities", "relationships", "anomaly_windows", "log_patterns", "evidence_bundle", "timeline", "suspected_causes", "next_checks"]
+}

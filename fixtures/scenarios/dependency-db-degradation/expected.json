@@ -1,0 +1,70 @@
+{
+  "_note": "Gold derived artifacts. The key lesson is dependency direction: the anomaly originates at db:orders-pg and propagates up to checkout and api-gateway.",
+  "entities": [
+    { "id": "service:api-gateway", "kind": "service", "from": ["res:api-gateway"], "confidence": 0.99 },
+    { "id": "service:checkout", "kind": "service", "from": ["res:checkout"], "confidence": 0.99 },
+    { "id": "db:orders-pg", "kind": "database", "from": ["res:orders-pg"], "confidence": 0.98 },
+    { "id": "service:reporting-job", "kind": "service", "from": ["res:reporting-job"], "confidence": 0.97 }
+  ],
+  "relationships": [
+    { "src": "service:api-gateway", "type": "calls", "dst": "service:checkout", "confidence": 0.98, "evidence": ["trace:t-1001"] },
+    { "src": "service:checkout", "type": "reads-from", "dst": "db:orders-pg", "confidence": 0.97, "evidence": ["trace:t-1001"] },
+    { "src": "service:reporting-job", "type": "writes-to", "dst": "db:orders-pg", "confidence": 0.96, "evidence": ["trace:t-1002"] },
+    { "src": "service:checkout", "type": "shares-resource-with", "dst": "service:reporting-job", "confidence": 0.8, "evidence": ["db:orders-pg"] }
+  ],
+  "anomaly_windows": [
+    { "id": "aw-1", "entity": "db:orders-pg", "signal": "db.query.duration_p95_ms", "start": "2026-06-03T14:21:00Z", "end": "2026-06-03T14:33:00Z", "baseline": 32, "peak": 1320, "detector_confidence": 0.94 },
+    { "id": "aw-2", "entity": "db:orders-pg", "signal": "db.locks.waiting", "start": "2026-06-03T14:20:00Z", "end": "2026-06-03T14:33:00Z", "baseline": 0, "peak": 22, "detector_confidence": 0.9 },
+    { "id": "aw-3", "entity": "service:checkout", "signal": "http.server.duration_p95_ms", "start": "2026-06-03T14:22:00Z", "end": "2026-06-03T14:33:00Z", "baseline": 150, "peak": 1500, "detector_confidence": 0.88 }
+  ],
+  "related_anomalies": {
+    "_for_capability": "find_related_anomalies",
+    "seed": "aw-3",
+    "related": [
+      { "window": "aw-1", "relation": "downstream-dependency", "lag_seconds": 60, "note": "checkout reads-from orders-pg; DB slowdown precedes checkout slowdown" },
+      { "window": "aw-2", "relation": "downstream-dependency", "lag_seconds": 120, "note": "lock waits on orders-pg precede checkout latency" }
+    ]
+  },
+  "window_comparison": {
+    "_for_capability": "compare_windows",
+    "healthy": { "start": "2026-06-03T14:10:00Z", "end": "2026-06-03T14:19:00Z" },
+    "anomalous": { "start": "2026-06-03T14:21:00Z", "end": "2026-06-03T14:30:00Z" },
+    "deltas": [
+      { "entity": "db:orders-pg", "signal": "db.query.duration_p95_ms", "from": 32, "to": 1320, "factor": 41.3 },
+      { "entity": "db:orders-pg", "signal": "db.locks.waiting", "from": 0, "to": 22, "factor": null },
+      { "entity": "service:checkout", "signal": "http.server.error_rate", "from": 0.003, "to": 0.31, "factor": 103.3 }
+    ]
+  },
+  "log_patterns": [
+    { "id": "lp-1", "template": "db query timed out after 1000ms: SELECT * FROM cart", "entity": "service:checkout", "severity": "ERROR", "first_seen": "2026-06-03T14:22:10Z", "last_seen": "2026-06-03T14:24:55Z", "count": 2, "exemplars": ["log-1"], "stability": "new-since-incident" },
+    { "id": "lp-2", "template": "<n> transactions waiting on lock for relation orders", "entity": "db:orders-pg", "severity": "WARN", "first_seen": "2026-06-03T14:23:00Z", "last_seen": "2026-06-03T14:23:00Z", "count": 1, "exemplars": ["log-4"], "stability": "new-since-incident" }
+  ],
+  "evidence_bundle": {
+    "question": "Why did checkout latency and 5xx spike around 14:22 on 2026-06-03 with no deploy?",
+    "time_window": { "start": "2026-06-03T14:10:00Z", "end": "2026-06-03T14:35:00Z" },
+    "budget": { "max_items": 6, "max_tokens": 650, "tokens_used": 290, "items_dropped": 0 },
+    "items": [
+      { "id": "ev-1", "claim": "orders-pg query p95 rose ~40x (32ms -> 1320ms) with rising lock waits.", "kind": "metric_anomaly", "direction": "supports", "strength": 0.9, "time_window": { "start": "2026-06-03T14:21:00Z", "end": "2026-06-03T14:33:00Z" }, "entities": ["db:orders-pg"], "source_refs": [{ "signal": "metric", "ref": "db.query.duration_p95_ms@db:orders-pg" }, { "signal": "anomaly_window", "ref": "aw-1" }], "freshness": "settled", "missing_data": [], "token_cost": 50, "privacy_scope": "none" },
+      { "id": "ev-2", "claim": "checkout failures are statement timeouts waiting on the orders-pg span, not in-process exceptions.", "kind": "trace_exemplar", "direction": "supports", "strength": 0.88, "time_window": { "start": "2026-06-03T14:22:40Z", "end": "2026-06-03T14:22:42Z" }, "entities": ["service:checkout", "db:orders-pg"], "source_refs": [{ "signal": "trace", "ref": "t-1001/s-2" }, { "signal": "trace", "ref": "t-1001/s-3" }], "freshness": "settled", "missing_data": [], "token_cost": 55, "privacy_scope": "none", "confidence": { "dependency_direction": 0.92 } },
+      { "id": "ev-3", "claim": "A reporting-job VACUUM took a long lock on orders starting at 14:20, just before the slowdown.", "kind": "change_event", "direction": "supports", "strength": 0.84, "time_window": { "start": "2026-06-03T14:20:05Z", "end": "2026-06-03T14:33:50Z" }, "entities": ["service:reporting-job", "db:orders-pg"], "source_refs": [{ "signal": "change", "ref": "change:reporting-job-batch-start" }, { "signal": "trace", "ref": "t-1002/r-2" }], "freshness": "settled", "missing_data": [], "token_cost": 50, "privacy_scope": "none", "confidence": { "time_alignment": 0.9 } },
+      { "id": "ev-4", "claim": "The checkout service was the cause of its own failures.", "kind": "counter_evidence", "direction": "contradicts", "strength": 0.8, "time_window": { "start": "2026-06-03T14:10:00Z", "end": "2026-06-03T14:35:00Z" }, "entities": ["service:checkout"], "source_refs": [{ "signal": "trace", "ref": "t-1001/s-2" }], "freshness": "settled", "missing_data": ["no checkout deploy or config change in window"], "token_cost": 45, "privacy_scope": "none", "confidence": { "dependency_direction": 0.9 } }
+    ]
+  },
+  "timeline": [
+    { "t": "2026-06-03T14:20:05Z", "marker": "change", "entity": "service:reporting-job", "text": "nightly_rollup batch starts (VACUUM on orders)", "source_ref": "change:reporting-job-batch-start" },
+    { "t": "2026-06-03T14:21:00Z", "marker": "symptom", "entity": "db:orders-pg", "text": "Lock waits climb; query p95 spikes", "source_ref": "aw-1" },
+    { "t": "2026-06-03T14:22:00Z", "marker": "propagation", "entity": "service:checkout", "text": "Checkout latency and timeouts rise", "source_ref": "aw-3" },
+    { "t": "2026-06-03T14:22:40Z", "marker": "propagation", "entity": "service:api-gateway", "text": "User-facing 504 on POST /checkout", "source_ref": "t-1001/s-1" },
+    { "t": "2026-06-03T14:34:00Z", "marker": "recovery", "entity": "db:orders-pg", "text": "Batch finishes; query p95 returns to baseline", "source_ref": "db.query.duration_p95_ms@db:orders-pg" }
+  ],
+  "suspected_causes": [
+    { "rank": 1, "entity": "db:orders-pg", "hypothesis": "lock contention from reporting-job VACUUM degraded orders-pg, timing out checkout", "score": 0.86, "reasons": ["dependency_direction", "time_alignment", "lock_metric", "recovery_on_batch_end"], "supporting": ["ev-1", "ev-2", "ev-3"], "counter": [] },
+    { "rank": 2, "entity": "service:reporting-job", "hypothesis": "batch job is the upstream trigger of DB contention", "score": 0.6, "reasons": ["change_proximity", "writes-to orders-pg"], "supporting": ["ev-3"], "counter": [] },
+    { "rank": 3, "entity": "service:checkout", "hypothesis": "checkout regression caused the failures", "score": 0.08, "reasons": ["no_deploy", "timeout_not_exception"], "supporting": [], "counter": ["ev-4"] }
+  ],
+  "next_checks": [
+    { "action": "Confirm reporting-job nightly_rollup overlaps the incident window and reschedule it off-peak.", "rationale": "If the batch is the trigger, moving it should prevent recurrence.", "expected_signal": "change_event" },
+    { "action": "Check orders-pg pg_locks / blocking queries during 14:21-14:33.", "rationale": "Confirms the lock chain from VACUUM to cart reads.", "expected_signal": "metric_anomaly" },
+    { "action": "Verify other services that read orders-pg (not just checkout) also slowed.", "rationale": "A shared-dependency blast radius confirms the DB, not checkout, as cause.", "expected_signal": "find_related_anomalies" }
+  ]
+}

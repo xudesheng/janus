@@ -1,0 +1,36 @@
+{
+  "id": "schema-migration-errors",
+  "title": "Column rename migration breaks the profile read path",
+  "version": 1,
+  "schema_version": "fixtures/v1",
+  "failure_class": "schema-change",
+  "difficulty": "baseline",
+  "false_causality_trap": false,
+  "summary": "A users-pg migration renames column email to email_address at 10:30. The profile service still queries email, so its reads fail with UndefinedColumn errors. The database is otherwise healthy (latency fine, connections fine) and profile was not redeployed. The cause is the schema migration plus an un-coordinated reader.",
+  "question": "Why did profile start failing with database errors at 10:30 on 2026-06-16?",
+  "time_window": { "start": "2026-06-16T10:20:00Z", "end": "2026-06-16T10:45:00Z" },
+  "ground_truth": {
+    "primary_cause_entity": "db:users-pg",
+    "cause_kind": "schema_migration",
+    "cause_ref": "change:users-pg-rename-email",
+    "contributing_entity": "service:profile",
+    "blast_radius": ["service:profile"],
+    "not_the_cause": ["service:profile-as-deploy"],
+    "notes": "The error signature (UndefinedColumn: column \"email\" does not exist) appears exactly at the migration timestamp; DB latency is unchanged and there is no profile deploy. The migration and the lagging reader together are the cause."
+  },
+  "capabilities": [
+    "entity-resolution",
+    "relationship-building",
+    "change-ingestion",
+    "anomaly-windows",
+    "log-pattern-clustering",
+    "evidence-ir",
+    "get_evidence_bundle",
+    "build_timeline",
+    "rank_suspected_causes",
+    "suggest_next_checks",
+    "false-causality-guard"
+  ],
+  "inputs": ["resources", "traces", "metrics", "logs", "changes"],
+  "expected": ["entities", "relationships", "anomaly_windows", "log_patterns", "evidence_bundle", "timeline", "suspected_causes", "next_checks"]
+}

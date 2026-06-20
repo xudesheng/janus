@@ -1,0 +1,58 @@
+{
+  "_note": "Gold artifacts. The correct unit of analysis is the shard/tenant, not the service aggregate. shard-3 saturates from the acme ramp; shards 1 and 2 are flat.",
+  "entities": [
+    { "id": "service:orders", "kind": "service", "from": ["res:orders"], "confidence": 0.99 },
+    { "id": "shard:orders-shard-3", "kind": "partition", "from": ["res:orders"], "confidence": 0.9, "discriminators": { "orders.shard": "3" } },
+    { "id": "shard:orders-shard-1", "kind": "partition", "from": ["res:orders"], "confidence": 0.9, "discriminators": { "orders.shard": "1" } },
+    { "id": "shard:orders-shard-2", "kind": "partition", "from": ["res:orders"], "confidence": 0.9, "discriminators": { "orders.shard": "2" } },
+    { "id": "tenant:acme", "kind": "tenant", "from": ["res:orders"], "confidence": 0.88, "discriminators": { "tenant.id": "acme" } }
+  ],
+  "relationships": [
+    { "src": "service:orders", "type": "fans-out-to", "dst": "shard:orders-shard-3", "confidence": 0.9 },
+    { "src": "tenant:acme", "type": "calls", "dst": "service:orders", "confidence": 0.9, "evidence": ["trace:t-6001"], "attributes": { "routed_to_shard": "3" } }
+  ],
+  "anomaly_windows": [
+    { "id": "aw-1", "entity": "shard:orders-shard-3", "signal": "http.server.duration_p95_ms", "start": "2026-06-14T16:10:00Z", "end": "2026-06-14T16:30:00Z", "baseline": 130, "peak": 1310, "detector_confidence": 0.92 },
+    { "id": "aw-2", "entity": "shard:orders-shard-3", "signal": "queue.depth", "start": "2026-06-14T16:10:00Z", "end": "2026-06-14T16:30:00Z", "baseline": 2, "peak": 310, "detector_confidence": 0.9 },
+    { "id": "aw-3", "entity": "tenant:acme", "signal": "request.rate_rps", "start": "2026-06-14T16:10:00Z", "end": "2026-06-14T16:30:00Z", "baseline": 180, "peak": 1040, "detector_confidence": 0.9 }
+  ],
+  "log_patterns": [
+    { "id": "lp-1", "template": "queue depth high on shard 3 (<n>), processing delayed", "entity": "shard:orders-shard-3", "severity": "WARN", "first_seen": "2026-06-14T16:13:40Z", "last_seen": "2026-06-14T16:17:55Z", "count": 2, "exemplars": ["log-1"], "stability": "new-since-incident" }
+  ],
+  "window_comparison": {
+    "_for_capability": "compare_windows",
+    "healthy": { "start": "2026-06-14T16:00:00Z", "end": "2026-06-14T16:09:00Z" },
+    "anomalous": { "start": "2026-06-14T16:12:00Z", "end": "2026-06-14T16:26:00Z" },
+    "deltas": [
+      { "entity": "shard:orders-shard-3", "signal": "http.server.duration_p95_ms", "from": 130, "to": 1310, "factor": 10.1 },
+      { "entity": "shard:orders-shard-1", "signal": "http.server.duration_p95_ms", "from": 125, "to": 128, "factor": 1.02, "note": "flat" },
+      { "entity": "service:orders(aggregate)", "signal": "http.server.duration_p95_ms", "from": 132, "to": 372, "factor": 2.8, "note": "aggregate masks the 10x on shard-3" },
+      { "entity": "tenant:acme", "signal": "request.rate_rps", "from": 180, "to": 1040, "factor": 5.8 }
+    ]
+  },
+  "evidence_bundle": {
+    "question": "Why did some orders requests get slow around 16:10 on 2026-06-14 while the service average looks fine?",
+    "time_window": { "start": "2026-06-14T16:00:00Z", "end": "2026-06-14T16:30:00Z" },
+    "budget": { "max_items": 6, "max_tokens": 700, "tokens_used": 290, "items_dropped": 0 },
+    "items": [
+      { "id": "ev-1", "claim": "orders-shard-3 p95 rose ~10x (130ms -> 1310ms) with queue depth up to 310, while shards 1 and 2 stayed flat.", "kind": "metric_anomaly", "direction": "supports", "strength": 0.9, "time_window": { "start": "2026-06-14T16:10:00Z", "end": "2026-06-14T16:30:00Z" }, "entities": ["shard:orders-shard-3"], "source_refs": [{ "signal": "metric", "ref": "http.server.duration_p95_ms@shard:orders-shard-3" }, { "signal": "metric", "ref": "queue.depth@shard:orders-shard-3" }, { "signal": "anomaly_window", "ref": "aw-1" }], "freshness": "changing", "missing_data": [], "token_cost": 60, "privacy_scope": "none" },
+      { "id": "ev-2", "claim": "Tenant acme began a campaign ramp (~5.8x) at 16:10 routed onto shard-3.", "kind": "change_event", "direction": "supports", "strength": 0.85, "time_window": { "start": "2026-06-14T16:10:00Z", "end": "2026-06-14T16:30:00Z" }, "entities": ["tenant:acme", "shard:orders-shard-3"], "source_refs": [{ "signal": "change", "ref": "change:acme-traffic-ramp" }, { "signal": "metric", "ref": "request.rate_rps@tenant:acme" }], "freshness": "changing", "missing_data": [], "token_cost": 50, "privacy_scope": "tenant:acme", "confidence": { "time_alignment": 0.9 } },
+      { "id": "ev-3", "claim": "An exemplar shows a shard-3 acme request waiting 1100ms in queue before processing.", "kind": "trace_exemplar", "direction": "supports", "strength": 0.78, "time_window": { "start": "2026-06-14T16:18:00Z", "end": "2026-06-14T16:18:02Z" }, "entities": ["shard:orders-shard-3", "tenant:acme"], "source_refs": [{ "signal": "trace", "ref": "t-6001/s-1" }], "freshness": "settled", "missing_data": [], "token_cost": 50, "privacy_scope": "tenant:acme" },
+      { "id": "ev-4", "claim": "The orders service as a whole regressed (service-wide cause).", "kind": "counter_evidence", "direction": "weakens", "strength": 0.8, "time_window": { "start": "2026-06-14T16:00:00Z", "end": "2026-06-14T16:30:00Z" }, "entities": ["shard:orders-shard-1", "shard:orders-shard-2"], "source_refs": [{ "signal": "metric", "ref": "http.server.duration_p95_ms@shard:orders-shard-1" }, { "signal": "metric", "ref": "http.server.duration_p95_ms@shard:orders-shard-2" }], "freshness": "settled", "missing_data": [], "token_cost": 45, "privacy_scope": "none", "note": "shards 1 and 2 are flat; only shard-3 is hot." }
+    ]
+  },
+  "timeline": [
+    { "t": "2026-06-14T16:10:00Z", "marker": "change", "entity": "tenant:acme", "text": "acme campaign traffic ramp begins", "source_ref": "change:acme-traffic-ramp" },
+    { "t": "2026-06-14T16:12:00Z", "marker": "symptom", "entity": "shard:orders-shard-3", "text": "shard-3 latency and queue depth climb", "source_ref": "aw-1" },
+    { "t": "2026-06-14T16:18:00Z", "marker": "symptom", "entity": "shard:orders-shard-3", "text": "shard-3 p95 ~1280ms; queue depth 310", "source_ref": "aw-2" }
+  ],
+  "suspected_causes": [
+    { "rank": 1, "entity": "shard:orders-shard-3", "hypothesis": "acme traffic ramp concentrated on shard-3 saturated it", "score": 0.86, "reasons": ["hot_partition", "tenant_ramp_time_aligned", "other_shards_flat"], "supporting": ["ev-1", "ev-2", "ev-3"], "counter": [] },
+    { "rank": 2, "entity": "service:orders", "hypothesis": "an orders code/config regression slowed the service", "score": 0.1, "reasons": ["no_change", "shards_1_2_flat"], "supporting": [], "counter": ["ev-4"] }
+  ],
+  "next_checks": [
+    { "action": "Rebalance shard-3 key range or add capacity for the acme key space.", "rationale": "Relieves the hotspot if the hash skew is confirmed.", "expected_signal": "metric_anomaly" },
+    { "action": "Apply per-tenant rate limiting / fair queueing for acme.", "rationale": "Prevents one tenant's ramp from starving a shard.", "expected_signal": "compare_windows" },
+    { "action": "Verify the campaign was expected and check the shard hash key distribution.", "rationale": "Confirms the traffic shift is the trigger and whether skew is structural.", "expected_signal": "change_event" }
+  ]
+}

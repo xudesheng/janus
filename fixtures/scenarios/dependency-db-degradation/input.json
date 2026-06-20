@@ -1,0 +1,43 @@
+{
+  "_note": "Self-contained, OTel-shaped synthetic telemetry. ISO-8601 UTC timestamps. Not derived from any external dataset.",
+  "resources": [
+    { "id": "res:api-gateway", "attributes": { "service.name": "api-gateway", "service.version": "3.4.1", "deployment.environment": "prod" } },
+    { "id": "res:checkout", "attributes": { "service.name": "checkout", "service.version": "2.0.1", "deployment.environment": "prod", "k8s.namespace.name": "shop" } },
+    { "id": "res:orders-pg", "attributes": { "service.name": "orders-pg", "db.system": "postgresql", "deployment.environment": "prod", "host.name": "node-db-1" } },
+    { "id": "res:reporting-job", "attributes": { "service.name": "reporting-job", "service.version": "1.2.0", "deployment.environment": "prod", "k8s.namespace.name": "batch" } }
+  ],
+  "traces": [
+    {
+      "trace_id": "t-1001",
+      "exemplar_of": "slow",
+      "spans": [
+        { "span_id": "s-1", "parent_id": null, "resource": "res:api-gateway", "name": "POST /checkout", "kind": "SERVER", "start": "2026-06-03T14:22:40.000Z", "end": "2026-06-03T14:22:41.450Z", "status": "ERROR", "attributes": { "http.route": "/checkout", "http.status_code": 504 } },
+        { "span_id": "s-2", "parent_id": "s-1", "resource": "res:checkout", "name": "POST /checkout", "kind": "SERVER", "start": "2026-06-03T14:22:40.020Z", "end": "2026-06-03T14:22:41.440Z", "status": "ERROR", "attributes": { "http.route": "/checkout", "error.type": "timeout" } },
+        { "span_id": "s-3", "parent_id": "s-2", "resource": "res:orders-pg", "name": "SELECT cart", "kind": "CLIENT", "start": "2026-06-03T14:22:40.030Z", "end": "2026-06-03T14:22:41.420Z", "status": "ERROR", "attributes": { "db.system": "postgresql", "db.statement": "SELECT * FROM cart WHERE id=$1", "error.type": "statement_timeout" } }
+      ]
+    },
+    {
+      "trace_id": "t-1002",
+      "exemplar_of": "contention-source",
+      "spans": [
+        { "span_id": "r-1", "parent_id": null, "resource": "res:reporting-job", "name": "nightly.rollup", "kind": "INTERNAL", "start": "2026-06-03T14:20:05.000Z", "end": "2026-06-03T14:34:00.000Z", "status": "OK", "attributes": { "job.name": "nightly_rollup" } },
+        { "span_id": "r-2", "parent_id": "r-1", "resource": "res:orders-pg", "name": "VACUUM ANALYZE orders", "kind": "CLIENT", "start": "2026-06-03T14:20:06.000Z", "end": "2026-06-03T14:33:50.000Z", "status": "OK", "attributes": { "db.system": "postgresql", "db.statement": "VACUUM ANALYZE orders", "db.lock": "ShareUpdateExclusive" } }
+      ]
+    }
+  ],
+  "metrics": [
+    { "name": "db.query.duration_p95_ms", "entity": "db:orders-pg", "unit": "ms", "points": [ { "t": "2026-06-03T14:14:00Z", "v": 30 }, { "t": "2026-06-03T14:20:00Z", "v": 45 }, { "t": "2026-06-03T14:22:00Z", "v": 1180 }, { "t": "2026-06-03T14:28:00Z", "v": 1320 }, { "t": "2026-06-03T14:34:00Z", "v": 60 } ] },
+    { "name": "db.locks.waiting", "entity": "db:orders-pg", "unit": "count", "points": [ { "t": "2026-06-03T14:14:00Z", "v": 0 }, { "t": "2026-06-03T14:21:00Z", "v": 14 }, { "t": "2026-06-03T14:28:00Z", "v": 22 }, { "t": "2026-06-03T14:34:00Z", "v": 1 } ] },
+    { "name": "http.server.duration_p95_ms", "entity": "service:checkout", "unit": "ms", "points": [ { "t": "2026-06-03T14:14:00Z", "v": 150 }, { "t": "2026-06-03T14:22:00Z", "v": 1450 }, { "t": "2026-06-03T14:28:00Z", "v": 1500 }, { "t": "2026-06-03T14:34:00Z", "v": 180 } ] },
+    { "name": "http.server.error_rate", "entity": "service:checkout", "unit": "ratio", "points": [ { "t": "2026-06-03T14:14:00Z", "v": 0.003 }, { "t": "2026-06-03T14:22:00Z", "v": 0.27 }, { "t": "2026-06-03T14:28:00Z", "v": 0.31 }, { "t": "2026-06-03T14:34:00Z", "v": 0.01 } ] }
+  ],
+  "logs": [
+    { "id": "log-1", "t": "2026-06-03T14:22:10Z", "entity": "service:checkout", "severity": "ERROR", "body": "db query timed out after 1000ms: SELECT * FROM cart", "attributes": { "error.type": "statement_timeout" } },
+    { "id": "log-2", "t": "2026-06-03T14:24:55Z", "entity": "service:checkout", "severity": "ERROR", "body": "db query timed out after 1000ms: SELECT * FROM cart", "attributes": { "error.type": "statement_timeout" } },
+    { "id": "log-3", "t": "2026-06-03T14:20:06Z", "entity": "db:orders-pg", "severity": "WARN", "body": "process holding ShareUpdateExclusive lock on orders for 0s by reporting-job", "attributes": {} },
+    { "id": "log-4", "t": "2026-06-03T14:23:00Z", "entity": "db:orders-pg", "severity": "WARN", "body": "14 transactions waiting on lock for relation orders", "attributes": {} }
+  ],
+  "changes": [
+    { "id": "change:reporting-job-batch-start", "t": "2026-06-03T14:20:05Z", "kind": "job_start", "entity": "service:reporting-job", "summary": "nightly_rollup batch started (VACUUM ANALYZE on orders)", "attributes": { "schedule": "cron", "job.name": "nightly_rollup" } }
+  ]
+}

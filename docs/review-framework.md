@@ -36,8 +36,9 @@ Use this workflow for design documents, implementation plans, review submissions
 
 ```text
 docs/
+├── review-framework.md         # This file: the top-level process guide.
 ├── core/                       # Canonical design and vision (what_and_why.md, etc.).
-├── process/                    # Process docs, including this review framework.
+├── process/                    # Supporting process docs (e.g. fixtures.md).
 ├── under-review/               # Active review documents. New topics start here.
 ├── archived/                   # Historical review documents.
 │   └── <DATETIME_STAMP>/       # New archive batches, when requested by User.

@@ -1,0 +1,52 @@
+{
+  "_note": "Gold artifacts. The cause is an external dependency outage. All errors live on the stripe call span; checkout's own CPU/internal work is healthy and there is no recent internal change.",
+  "entities": [
+    { "id": "service:api-gateway", "kind": "service", "from": ["res:api-gateway"], "confidence": 0.99 },
+    { "id": "service:checkout", "kind": "service", "from": ["res:checkout"], "confidence": 0.99 },
+    { "id": "external-api:stripe", "kind": "external-api", "from": ["trace:t-9001/s-3"], "confidence": 0.9, "discriminators": { "peer.service": "stripe", "server.address": "api.stripe.com" } }
+  ],
+  "relationships": [
+    { "src": "service:api-gateway", "type": "calls", "dst": "service:checkout", "confidence": 0.98, "evidence": ["trace:t-9001"] },
+    { "src": "service:checkout", "type": "depends-on", "dst": "external-api:stripe", "confidence": 0.95, "evidence": ["trace:t-9001"], "attributes": { "role": "payment-provider" } }
+  ],
+  "anomaly_windows": [
+    { "id": "aw-1", "entity": "external-api:stripe", "signal": "dependency.error_rate", "start": "2026-06-17T13:00:00Z", "end": "2026-06-17T13:20:00Z", "baseline": 0.003, "peak": 0.92, "detector_confidence": 0.94 },
+    { "id": "aw-2", "entity": "service:checkout", "signal": "http.server.error_rate", "start": "2026-06-17T13:00:00Z", "end": "2026-06-17T13:20:00Z", "baseline": 0.004, "peak": 0.85, "detector_confidence": 0.92 }
+  ],
+  "related_anomalies": {
+    "_for_capability": "find_related_anomalies",
+    "seed": "aw-2",
+    "related": [
+      { "window": "aw-1", "relation": "downstream-dependency", "lag_seconds": 0, "note": "checkout error rate tracks the stripe dependency error rate ~1:1" }
+    ]
+  },
+  "log_patterns": [
+    { "id": "lp-1", "template": "payment provider stripe returned 503 (provider_unavailable)", "entity": "service:checkout", "severity": "ERROR", "first_seen": "2026-06-17T13:00:30Z", "last_seen": "2026-06-17T13:00:30Z", "count": 1, "exemplars": ["log-1"], "stability": "new-since-incident" },
+    { "id": "lp-2", "template": "payment provider stripe request timed out after 2000ms", "entity": "service:checkout", "severity": "ERROR", "first_seen": "2026-06-17T13:06:00Z", "last_seen": "2026-06-17T13:06:00Z", "count": 1, "exemplars": ["log-2"], "stability": "new-since-incident" }
+  ],
+  "evidence_bundle": {
+    "question": "Why did checkout payments start failing at 13:00 on 2026-06-17?",
+    "time_window": { "start": "2026-06-17T12:50:00Z", "end": "2026-06-17T13:20:00Z" },
+    "budget": { "max_items": 6, "max_tokens": 700, "tokens_used": 285, "items_dropped": 0 },
+    "items": [
+      { "id": "ev-1", "claim": "The stripe dependency error rate jumped to ~92% with p95 latency ~2000ms starting 13:00.", "kind": "metric_anomaly", "direction": "supports", "strength": 0.9, "time_window": { "start": "2026-06-17T13:00:00Z", "end": "2026-06-17T13:20:00Z" }, "entities": ["external-api:stripe"], "source_refs": [{ "signal": "metric", "ref": "dependency.error_rate@external-api:stripe" }, { "signal": "metric", "ref": "dependency.duration_p95_ms@external-api:stripe" }, { "signal": "anomaly_window", "ref": "aw-1" }], "freshness": "changing", "missing_data": [], "token_cost": 55, "privacy_scope": "none" },
+      { "id": "ev-2", "claim": "An exemplar shows the failure isolated to the stripe.charge external call (503), with checkout's own span failing only because of it.", "kind": "trace_exemplar", "direction": "supports", "strength": 0.9, "time_window": { "start": "2026-06-17T13:06:00Z", "end": "2026-06-17T13:06:03Z" }, "entities": ["service:checkout", "external-api:stripe"], "source_refs": [{ "signal": "trace", "ref": "t-9001/s-3" }], "freshness": "settled", "missing_data": [], "token_cost": 60, "privacy_scope": "none", "confidence": { "dependency_direction": 0.93 } },
+      { "id": "ev-3", "claim": "An ingested provider status event reports a stripe partial outage at 13:00.", "kind": "change_event", "direction": "supports", "strength": 0.8, "time_window": { "start": "2026-06-17T13:00:00Z", "end": "2026-06-17T13:00:00Z" }, "entities": ["external-api:stripe"], "source_refs": [{ "signal": "change", "ref": "change:stripe-provider-incident" }], "freshness": "changing", "missing_data": ["provider incident resolution time"], "token_cost": 45, "privacy_scope": "none" },
+      { "id": "ev-4", "claim": "A checkout code/config change or resource problem caused the failures.", "kind": "counter_evidence", "direction": "contradicts", "strength": 0.82, "time_window": { "start": "2026-06-17T12:50:00Z", "end": "2026-06-17T13:20:00Z" }, "entities": ["service:checkout"], "source_refs": [{ "signal": "metric", "ref": "cpu.utilization@service:checkout" }, { "signal": "change", "ref": "change:checkout-deploy-old" }], "freshness": "settled", "missing_data": ["no checkout change within the window; last deploy was 2 days prior"], "token_cost": 50, "privacy_scope": "none", "note": "checkout CPU is flat (~0.4) and there is no in-window internal change." }
+    ]
+  },
+  "timeline": [
+    { "t": "2026-06-17T13:00:00Z", "marker": "trigger", "entity": "external-api:stripe", "text": "stripe provider outage begins (ingested status)", "source_ref": "change:stripe-provider-incident" },
+    { "t": "2026-06-17T13:00:30Z", "marker": "symptom", "entity": "service:checkout", "text": "First stripe 503 on charge calls", "source_ref": "log-1" },
+    { "t": "2026-06-17T13:06:00Z", "marker": "propagation", "entity": "service:api-gateway", "text": "User-facing 502 on POST /checkout", "source_ref": "t-9001/s-1" }
+  ],
+  "suspected_causes": [
+    { "rank": 1, "entity": "external-api:stripe", "hypothesis": "external payment provider outage causes all checkout charge failures", "score": 0.9, "reasons": ["errors_on_external_span_only", "dependency_error_rate_spike", "provider_status_event", "checkout_internal_healthy"], "supporting": ["ev-1", "ev-2", "ev-3"], "counter": [] },
+    { "rank": 2, "entity": "service:checkout", "hypothesis": "a checkout regression caused the failures", "score": 0.07, "reasons": ["no_in_window_change", "cpu_flat"], "supporting": [], "counter": ["ev-4"] }
+  ],
+  "next_checks": [
+    { "action": "Confirm the stripe status page / provider incident and subscribe to updates.", "rationale": "Validates the external cause and gives a recovery ETA.", "expected_signal": "change_event" },
+    { "action": "Enable payment fallback / queue-and-retry-later or a secondary provider for charges.", "rationale": "Reduces user-facing blast radius during the provider outage.", "expected_signal": "metric_anomaly" },
+    { "action": "Add a circuit breaker on stripe.charge to fail fast and shed load while the provider is down.", "rationale": "Prevents pile-up of slow external calls.", "expected_signal": "relationship" }
+  ]
+}

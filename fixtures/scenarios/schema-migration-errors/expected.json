@@ -1,0 +1,42 @@
+{
+  "_note": "Gold artifacts. The error signature appears exactly at the migration time; DB latency is healthy. The cause is the schema migration plus a reader still using the old column.",
+  "entities": [
+    { "id": "service:profile", "kind": "service", "from": ["res:profile"], "confidence": 0.99 },
+    { "id": "db:users-pg", "kind": "database", "from": ["res:users-pg"], "confidence": 0.98 }
+  ],
+  "relationships": [
+    { "src": "service:profile", "type": "reads-from", "dst": "db:users-pg", "confidence": 0.97, "evidence": ["trace:t-8001"] }
+  ],
+  "anomaly_windows": [
+    { "id": "aw-1", "entity": "service:profile", "signal": "http.server.error_rate", "start": "2026-06-16T10:30:00Z", "end": "2026-06-16T10:45:00Z", "baseline": 0.002, "peak": 0.96, "detector_confidence": 0.95 },
+    { "id": "aw-2", "entity": "db:users-pg", "signal": "db.query.error_rate", "start": "2026-06-16T10:30:00Z", "end": "2026-06-16T10:45:00Z", "baseline": 0.001, "peak": 0.49, "detector_confidence": 0.9 }
+  ],
+  "log_patterns": [
+    { "id": "lp-1", "template": "ERROR: column \"email\" does not exist (SQLSTATE 42703)", "entity": "service:profile", "severity": "ERROR", "first_seen": "2026-06-16T10:30:20Z", "last_seen": "2026-06-16T10:33:00Z", "count": 2, "exemplars": ["log-1"], "stability": "new-since-incident" }
+  ],
+  "evidence_bundle": {
+    "question": "Why did profile start failing with database errors at 10:30 on 2026-06-16?",
+    "time_window": { "start": "2026-06-16T10:20:00Z", "end": "2026-06-16T10:45:00Z" },
+    "budget": { "max_items": 6, "max_tokens": 650, "tokens_used": 255, "items_dropped": 0 },
+    "items": [
+      { "id": "ev-1", "claim": "Migration 0142 renamed users.email -> users.email_address at 10:30, the exact onset.", "kind": "change_event", "direction": "supports", "strength": 0.93, "time_window": { "start": "2026-06-16T10:30:00Z", "end": "2026-06-16T10:30:00Z" }, "entities": ["db:users-pg"], "source_refs": [{ "signal": "change", "ref": "change:users-pg-rename-email" }], "freshness": "settled", "missing_data": [], "token_cost": 50, "privacy_scope": "none", "confidence": { "time_alignment": 0.97, "change_proximity": 0.96 } },
+      { "id": "ev-2", "claim": "profile's failing query still selects the old column email; the DB span returns UndefinedColumn (42703).", "kind": "trace_exemplar", "direction": "supports", "strength": 0.92, "time_window": { "start": "2026-06-16T10:33:00Z", "end": "2026-06-16T10:33:01Z" }, "entities": ["service:profile", "db:users-pg"], "source_refs": [{ "signal": "trace", "ref": "t-8001/s-2" }, { "signal": "log", "ref": "lp-1" }], "freshness": "settled", "missing_data": [], "token_cost": 55, "privacy_scope": "none" },
+      { "id": "ev-3", "claim": "profile error rate jumped to ~95% at 10:30.", "kind": "metric_anomaly", "direction": "supports", "strength": 0.85, "time_window": { "start": "2026-06-16T10:30:00Z", "end": "2026-06-16T10:45:00Z" }, "entities": ["service:profile"], "source_refs": [{ "signal": "metric", "ref": "http.server.error_rate@service:profile" }, { "signal": "anomaly_window", "ref": "aw-1" }], "freshness": "changing", "missing_data": [], "token_cost": 45, "privacy_scope": "none" },
+      { "id": "ev-4", "claim": "The database is down or overloaded.", "kind": "counter_evidence", "direction": "weakens", "strength": 0.82, "time_window": { "start": "2026-06-16T10:20:00Z", "end": "2026-06-16T10:45:00Z" }, "entities": ["db:users-pg"], "source_refs": [{ "signal": "metric", "ref": "db.query.duration_p95_ms@db:users-pg" }], "freshness": "settled", "missing_data": [], "token_cost": 45, "privacy_scope": "none", "note": "DB latency is flat at ~18ms; failures are query-level UndefinedColumn errors, not availability or latency." }
+    ]
+  },
+  "timeline": [
+    { "t": "2026-06-16T10:30:00Z", "marker": "change", "entity": "db:users-pg", "text": "Migration 0142 renames email -> email_address", "source_ref": "change:users-pg-rename-email" },
+    { "t": "2026-06-16T10:30:20Z", "marker": "symptom", "entity": "service:profile", "text": "First UndefinedColumn error", "source_ref": "log-1" },
+    { "t": "2026-06-16T10:32:00Z", "marker": "symptom", "entity": "service:profile", "text": "Error rate reaches 95%", "source_ref": "aw-1" }
+  ],
+  "suspected_causes": [
+    { "rank": 1, "entity": "db:users-pg", "hypothesis": "column rename migration broke profile's read query that still uses email", "score": 0.92, "reasons": ["exact_time_alignment", "error_signature_42703", "db_latency_healthy", "no_profile_deploy"], "supporting": ["ev-1", "ev-2", "ev-3"], "counter": [] },
+    { "rank": 2, "entity": "db:users-pg", "hypothesis": "database outage/overload caused the errors", "score": 0.05, "reasons": ["latency_flat", "error_is_query_level"], "supporting": [], "counter": ["ev-4"] }
+  ],
+  "next_checks": [
+    { "action": "Roll back migration 0142 or add a compatibility view/alias mapping email -> email_address.", "rationale": "Immediately restores the reader while a coordinated fix ships.", "expected_signal": "change_event" },
+    { "action": "Ship the profile query update to use email_address and confirm errors clear.", "rationale": "The durable fix once the reader is aligned with the new schema.", "expected_signal": "metric_anomaly" },
+    { "action": "Verify only email-reading queries failed and no other services read users.email.", "rationale": "Bounds blast radius and finds other un-coordinated readers.", "expected_signal": "log_cluster" }
+  ]
+}

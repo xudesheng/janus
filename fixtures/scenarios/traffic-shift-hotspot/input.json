@@ -1,0 +1,38 @@
+{
+  "_note": "Self-contained, OTel-shaped synthetic telemetry. Per-shard and per-tenant metric series; the service-aggregate series is included to show how it dilutes the hotspot.",
+  "resources": [
+    { "id": "res:orders", "attributes": { "service.name": "orders", "service.version": "8.2.0", "deployment.environment": "prod", "k8s.namespace.name": "orders" } }
+  ],
+  "traces": [
+    {
+      "trace_id": "t-6001",
+      "exemplar_of": "hot-shard-slow",
+      "spans": [
+        { "span_id": "s-1", "parent_id": null, "resource": "res:orders", "name": "POST /orders", "kind": "SERVER", "start": "2026-06-14T16:18:00.000Z", "end": "2026-06-14T16:18:01.250Z", "status": "OK", "attributes": { "http.route": "/orders", "orders.shard": "3", "tenant.id": "acme", "queue.wait_ms": 1100 } }
+      ]
+    },
+    {
+      "trace_id": "t-6002",
+      "exemplar_of": "cold-shard-ok",
+      "spans": [
+        { "span_id": "s-2", "parent_id": null, "resource": "res:orders", "name": "POST /orders", "kind": "SERVER", "start": "2026-06-14T16:18:05.000Z", "end": "2026-06-14T16:18:05.110Z", "status": "OK", "attributes": { "http.route": "/orders", "orders.shard": "1", "tenant.id": "globex" } }
+      ]
+    }
+  ],
+  "metrics": [
+    { "name": "http.server.duration_p95_ms", "entity": "shard:orders-shard-3", "unit": "ms", "points": [ { "t": "2026-06-14T16:04:00Z", "v": 130 }, { "t": "2026-06-14T16:12:00Z", "v": 760 }, { "t": "2026-06-14T16:18:00Z", "v": 1280 }, { "t": "2026-06-14T16:26:00Z", "v": 1310 } ] },
+    { "name": "http.server.duration_p95_ms", "entity": "shard:orders-shard-1", "unit": "ms", "points": [ { "t": "2026-06-14T16:04:00Z", "v": 125 }, { "t": "2026-06-14T16:18:00Z", "v": 132 }, { "t": "2026-06-14T16:26:00Z", "v": 128 } ] },
+    { "name": "http.server.duration_p95_ms", "entity": "shard:orders-shard-2", "unit": "ms", "points": [ { "t": "2026-06-14T16:04:00Z", "v": 140 }, { "t": "2026-06-14T16:18:00Z", "v": 138 }, { "t": "2026-06-14T16:26:00Z", "v": 141 } ] },
+    { "name": "http.server.duration_p95_ms", "entity": "service:orders(aggregate)", "unit": "ms", "_note": "Blended across shards; dilutes shard-3.", "points": [ { "t": "2026-06-14T16:04:00Z", "v": 132 }, { "t": "2026-06-14T16:18:00Z", "v": 360 }, { "t": "2026-06-14T16:26:00Z", "v": 372 } ] },
+    { "name": "request.rate_rps", "entity": "shard:orders-shard-3", "unit": "rps", "points": [ { "t": "2026-06-14T16:04:00Z", "v": 220 }, { "t": "2026-06-14T16:12:00Z", "v": 900 }, { "t": "2026-06-14T16:18:00Z", "v": 1150 } ] },
+    { "name": "request.rate_rps", "entity": "tenant:acme", "unit": "rps", "points": [ { "t": "2026-06-14T16:04:00Z", "v": 180 }, { "t": "2026-06-14T16:12:00Z", "v": 820 }, { "t": "2026-06-14T16:18:00Z", "v": 1040 } ] },
+    { "name": "queue.depth", "entity": "shard:orders-shard-3", "unit": "count", "points": [ { "t": "2026-06-14T16:04:00Z", "v": 2 }, { "t": "2026-06-14T16:12:00Z", "v": 140 }, { "t": "2026-06-14T16:18:00Z", "v": 310 } ] }
+  ],
+  "logs": [
+    { "id": "log-1", "t": "2026-06-14T16:13:40Z", "entity": "shard:orders-shard-3", "severity": "WARN", "body": "queue depth high on shard 3 (140), processing delayed", "attributes": { "orders.shard": "3" } },
+    { "id": "log-2", "t": "2026-06-14T16:17:55Z", "entity": "shard:orders-shard-3", "severity": "WARN", "body": "queue depth high on shard 3 (310), processing delayed", "attributes": { "orders.shard": "3" } }
+  ],
+  "changes": [
+    { "id": "change:acme-traffic-ramp", "t": "2026-06-14T16:10:00Z", "kind": "traffic_shift", "entity": "tenant:acme", "summary": "Tenant acme started a marketing campaign; traffic ramping ~5x", "attributes": { "tenant.id": "acme", "reason": "campaign", "target_shard": "3" } }
+  ]
+}

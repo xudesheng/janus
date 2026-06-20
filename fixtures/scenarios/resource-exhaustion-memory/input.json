@@ -1,0 +1,40 @@
+{
+  "_note": "Self-contained, OTel-shaped synthetic telemetry. memory.rss_bytes is a sawtooth across two OOM/restart cycles in-window; the leak-introducing deploy is one day before the window.",
+  "resources": [
+    { "id": "res:recommender", "attributes": { "service.name": "recommender", "service.version": "3.0.0", "deployment.environment": "prod", "k8s.namespace.name": "ml", "k8s.pod.name": "recommender-5b8f", "host.name": "node-c", "k8s.container.memory_limit_mib": "1024" } },
+    { "id": "res:feature-store", "attributes": { "service.name": "feature-store", "db.system": "redis", "deployment.environment": "prod" } }
+  ],
+  "traces": [
+    {
+      "trace_id": "t-7001",
+      "exemplar_of": "restart-window-error",
+      "spans": [
+        { "span_id": "s-1", "parent_id": null, "resource": "res:recommender", "name": "GET /recommend", "kind": "SERVER", "start": "2026-06-15T08:21:00.000Z", "end": "2026-06-15T08:21:00.050Z", "status": "ERROR", "attributes": { "http.route": "/recommend", "http.status_code": 503, "error.type": "connection_refused" } }
+      ]
+    },
+    {
+      "trace_id": "t-7002",
+      "exemplar_of": "healthy-between-restarts",
+      "spans": [
+        { "span_id": "s-2", "parent_id": null, "resource": "res:recommender", "name": "GET /recommend", "kind": "SERVER", "start": "2026-06-15T08:10:00.000Z", "end": "2026-06-15T08:10:00.070Z", "status": "OK", "attributes": { "http.route": "/recommend", "http.status_code": 200 } },
+        { "span_id": "s-3", "parent_id": "s-2", "resource": "res:feature-store", "name": "MGET features", "kind": "CLIENT", "start": "2026-06-15T08:10:00.010Z", "end": "2026-06-15T08:10:00.022Z", "status": "OK", "attributes": { "db.system": "redis" } }
+      ]
+    }
+  ],
+  "metrics": [
+    { "name": "memory.rss_bytes", "entity": "pod:recommender-5b8f", "unit": "MiB", "points": [ { "t": "2026-06-15T08:00:00Z", "v": 540 }, { "t": "2026-06-15T08:10:00Z", "v": 760 }, { "t": "2026-06-15T08:19:00Z", "v": 1015 }, { "t": "2026-06-15T08:21:00Z", "v": 180 }, { "t": "2026-06-15T08:35:00Z", "v": 720 }, { "t": "2026-06-15T08:48:00Z", "v": 1018 }, { "t": "2026-06-15T08:50:00Z", "v": 190 } ] },
+    { "name": "pod.restarts.count", "entity": "pod:recommender-5b8f", "unit": "count", "points": [ { "t": "2026-06-15T08:00:00Z", "v": 0 }, { "t": "2026-06-15T08:21:00Z", "v": 1 }, { "t": "2026-06-15T08:50:00Z", "v": 2 } ] },
+    { "name": "http.server.error_rate", "entity": "service:recommender", "unit": "ratio", "points": [ { "t": "2026-06-15T08:00:00Z", "v": 0.002 }, { "t": "2026-06-15T08:18:00Z", "v": 0.004 }, { "t": "2026-06-15T08:21:00Z", "v": 0.35 }, { "t": "2026-06-15T08:23:00Z", "v": 0.01 }, { "t": "2026-06-15T08:48:00Z", "v": 0.005 }, { "t": "2026-06-15T08:50:00Z", "v": 0.33 } ] },
+    { "name": "db.query.duration_p95_ms", "entity": "db:feature-store", "unit": "ms", "points": [ { "t": "2026-06-15T08:00:00Z", "v": 12 }, { "t": "2026-06-15T08:21:00Z", "v": 13 }, { "t": "2026-06-15T08:50:00Z", "v": 12 } ] }
+  ],
+  "logs": [
+    { "id": "log-1", "t": "2026-06-15T08:20:55Z", "entity": "pod:recommender-5b8f", "severity": "ERROR", "body": "Container recommender OOMKilled (memory limit 1024MiB exceeded)", "attributes": { "reason": "OOMKilled" } },
+    { "id": "log-2", "t": "2026-06-15T08:49:50Z", "entity": "pod:recommender-5b8f", "severity": "ERROR", "body": "Container recommender OOMKilled (memory limit 1024MiB exceeded)", "attributes": { "reason": "OOMKilled" } },
+    { "id": "log-3", "t": "2026-06-15T08:21:05Z", "entity": "service:recommender", "severity": "WARN", "body": "connection refused during pod restart", "attributes": { "error.type": "connection_refused" } }
+  ],
+  "changes": [
+    { "id": "change:recommender-v3-deploy", "t": "2026-06-14T09:30:00Z", "kind": "deploy", "entity": "service:recommender", "summary": "recommender 2.9.1 -> 3.0.0 (new embedding cache)", "attributes": { "from_version": "2.9.1", "to_version": "3.0.0", "commit": "beadfeed" } },
+    { "id": "change:oom-restart-1", "t": "2026-06-15T08:21:00Z", "kind": "infrastructure_event", "entity": "pod:recommender-5b8f", "summary": "OOM kill and restart (cycle 1)", "attributes": { "reason": "OOMKilled" } },
+    { "id": "change:oom-restart-2", "t": "2026-06-15T08:50:00Z", "kind": "infrastructure_event", "entity": "pod:recommender-5b8f", "summary": "OOM kill and restart (cycle 2)", "attributes": { "reason": "OOMKilled" } }
+  ]
+}

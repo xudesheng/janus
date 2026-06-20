@@ -1,0 +1,38 @@
+{
+  "_note": "Gold artifacts. The correct output is honest uncertainty: report the telemetry gap as missing data, keep the partial signal weak, and rank the best hypothesis with an explicitly low score. Do NOT assert a confident root cause.",
+  "entities": [
+    { "id": "service:inventory", "kind": "service", "from": ["res:inventory"], "confidence": 0.98 },
+    { "id": "db:inventory-pg", "kind": "database", "from": ["res:inventory-pg"], "confidence": 0.97 },
+    { "id": "service:otel-collector", "kind": "service", "from": ["res:otel-collector"], "confidence": 0.95 }
+  ],
+  "relationships": [
+    { "src": "service:inventory", "type": "reads-from", "dst": "db:inventory-pg", "confidence": 0.96, "evidence": ["trace:t-b001"] }
+  ],
+  "anomaly_windows": [
+    { "id": "aw-1", "entity": "service:inventory", "signal": "http.server.error_rate", "start": "2026-06-18T08:04:00Z", "end": "2026-06-18T08:14:00Z", "baseline": 0.004, "peak_observed": 0.06, "detector_confidence": 0.35, "note": "window boundaries and true peak are uncertain: metrics are missing 08:05-08:13 (telemetry_gap:inventory-0805)" }
+  ],
+  "evidence_bundle": {
+    "question": "What caused the inventory errors around 08:05 on 2026-06-18?",
+    "time_window": { "start": "2026-06-18T07:55:00Z", "end": "2026-06-18T08:25:00Z" },
+    "budget": { "max_items": 6, "max_tokens": 700, "tokens_used": 240, "items_dropped": 0, "note": "fewer items than usual because key signals are unavailable in the window" },
+    "items": [
+      { "id": "ev-1", "claim": "inventory and inventory-pg metrics are missing from 08:05 to 08:13, across the incident peak, due to a collector restart.", "kind": "missing_data", "direction": "neutral", "strength": 0.6, "time_window": { "start": "2026-06-18T08:05:00Z", "end": "2026-06-18T08:13:00Z" }, "entities": ["service:inventory", "db:inventory-pg"], "source_refs": [{ "signal": "telemetry_gap", "ref": "telemetry_gap:inventory-0805" }, { "signal": "change", "ref": "change:collector-restart" }, { "signal": "log", "ref": "log-2" }], "freshness": "settled", "missing_data": ["inventory metrics 08:05-08:13", "inventory-pg metrics 08:05-08:13"], "token_cost": 55, "privacy_scope": "none" },
+      { "id": "ev-2", "claim": "Just before the gap, an inventory request failed on an inventory-pg connection_refused.", "kind": "trace_exemplar", "direction": "supports", "strength": 0.45, "time_window": { "start": "2026-06-18T08:03:30Z", "end": "2026-06-18T08:03:31Z" }, "entities": ["service:inventory", "db:inventory-pg"], "source_refs": [{ "signal": "trace", "ref": "t-b001/s-2" }, { "signal": "log", "ref": "log-1" }], "freshness": "settled", "missing_data": ["whether the connection errors continued through the gap"], "token_cost": 50, "privacy_scope": "none", "confidence": { "coverage": 0.3 } },
+      { "id": "ev-3", "claim": "inventory-pg connectivity was the root cause of the incident.", "kind": "counter_evidence", "direction": "weakens", "strength": 0.4, "time_window": { "start": "2026-06-18T07:55:00Z", "end": "2026-06-18T08:25:00Z" }, "entities": ["db:inventory-pg"], "source_refs": [{ "signal": "telemetry_gap", "ref": "telemetry_gap:inventory-0805" }], "freshness": "settled", "missing_data": ["inventory-pg metrics across the peak"], "token_cost": 45, "privacy_scope": "none", "note": "the single pre-gap error is suggestive but insufficient; the peak is unobserved, so causation cannot be confirmed." }
+    ]
+  },
+  "timeline": [
+    { "t": "2026-06-18T08:03:30Z", "marker": "symptom", "entity": "service:inventory", "text": "Pre-gap inventory-pg connection_refused error", "source_ref": "t-b001/s-2" },
+    { "t": "2026-06-18T08:05:00Z", "marker": "data-gap", "entity": "service:otel-collector", "text": "Collector restart; inventory metrics drop (gap begins)", "source_ref": "telemetry_gap:inventory-0805" },
+    { "t": "2026-06-18T08:13:00Z", "marker": "data-gap", "entity": "service:otel-collector", "text": "Metrics resume (gap ends)", "source_ref": "telemetry_gap:inventory-0805" }
+  ],
+  "suspected_causes": [
+    { "rank": 1, "entity": "db:inventory-pg", "hypothesis": "inventory-pg connectivity problem (LOW CONFIDENCE: peak unobserved)", "score": 0.35, "reasons": ["pre_gap_connection_error"], "supporting": ["ev-2"], "counter": ["ev-3"], "note": "best available hypothesis, deliberately low score due to the data gap" },
+    { "rank": 2, "entity": "under-determined", "hypothesis": "cause cannot be confirmed without the missing 08:05-08:13 metrics", "score": 0.55, "reasons": ["telemetry_gap_across_peak"], "supporting": ["ev-1"], "counter": [], "note": "'insufficient evidence' is ranked above a confident-but-unsupported root cause" }
+  ],
+  "next_checks": [
+    { "action": "Backfill inventory metrics 08:05-08:13 from the raw telemetry store / object storage if retained.", "rationale": "Recovers the unobserved peak so the incident can actually be diagnosed.", "expected_signal": "metric_anomaly" },
+    { "action": "Query inventory-pg server logs and connection metrics directly for 08:03-08:13.", "rationale": "An out-of-band source that bypasses the collector gap to confirm or refute the connectivity hypothesis.", "expected_signal": "log_cluster" },
+    { "action": "Fix collector restart behavior (buffering/HA) so scrapes are not dropped on config reload.", "rationale": "Prevents future blind spots during incidents.", "expected_signal": "change_event" }
+  ]
+}

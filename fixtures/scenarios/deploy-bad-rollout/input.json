@@ -1,0 +1,88 @@
+{
+  "_note": "Self-contained, OTel-shaped synthetic telemetry. Timestamps are ISO-8601 UTC for readability; real OTLP uses unix-nanos. Not derived from any external dataset.",
+  "resources": [
+    {
+      "id": "res:api-gateway",
+      "attributes": { "service.name": "api-gateway", "service.version": "3.4.1", "deployment.environment": "prod", "k8s.namespace.name": "edge" }
+    },
+    {
+      "id": "res:checkout-v2",
+      "attributes": { "service.name": "checkout", "service.version": "2.0.0", "deployment.environment": "prod", "k8s.namespace.name": "shop", "k8s.pod.name": "checkout-7c9d-abcde", "host.name": "node-a" }
+    },
+    {
+      "id": "res:orders-pg",
+      "attributes": { "service.name": "orders-pg", "db.system": "postgresql", "deployment.environment": "prod", "host.name": "node-db-1" }
+    }
+  ],
+  "traces": [
+    {
+      "trace_id": "t-0001",
+      "exemplar_of": "error",
+      "spans": [
+        { "span_id": "s-1", "parent_id": null, "resource": "res:api-gateway", "name": "POST /checkout", "kind": "SERVER", "start": "2026-06-01T14:05:11.000Z", "end": "2026-06-01T14:05:11.840Z", "status": "ERROR", "attributes": { "http.method": "POST", "http.route": "/checkout", "http.status_code": 502 } },
+        { "span_id": "s-2", "parent_id": "s-1", "resource": "res:api-gateway", "name": "checkout.create", "kind": "CLIENT", "start": "2026-06-01T14:05:11.010Z", "end": "2026-06-01T14:05:11.830Z", "status": "ERROR", "attributes": { "peer.service": "checkout" } },
+        { "span_id": "s-3", "parent_id": "s-2", "resource": "res:checkout-v2", "name": "POST /checkout", "kind": "SERVER", "start": "2026-06-01T14:05:11.020Z", "end": "2026-06-01T14:05:11.820Z", "status": "ERROR", "attributes": { "http.route": "/checkout", "http.status_code": 500, "exception.type": "NullPointerException", "code.function": "applyDiscount" } },
+        { "span_id": "s-4", "parent_id": "s-3", "resource": "res:orders-pg", "name": "SELECT cart", "kind": "CLIENT", "start": "2026-06-01T14:05:11.030Z", "end": "2026-06-01T14:05:11.061Z", "status": "OK", "attributes": { "db.system": "postgresql", "db.statement": "SELECT * FROM cart WHERE id=$1" } }
+      ]
+    },
+    {
+      "trace_id": "t-0002",
+      "exemplar_of": "baseline",
+      "spans": [
+        { "span_id": "b-1", "parent_id": null, "resource": "res:api-gateway", "name": "POST /checkout", "kind": "SERVER", "start": "2026-06-01T14:01:02.000Z", "end": "2026-06-01T14:01:02.180Z", "status": "OK", "attributes": { "http.method": "POST", "http.route": "/checkout", "http.status_code": 200 } },
+        { "span_id": "b-3", "parent_id": "b-1", "resource": "res:checkout-v2", "name": "POST /checkout", "kind": "SERVER", "start": "2026-06-01T14:01:02.020Z", "end": "2026-06-01T14:01:02.150Z", "status": "OK", "attributes": { "http.route": "/checkout", "http.status_code": 200, "service.version": "1.9.4" } },
+        { "span_id": "b-4", "parent_id": "b-3", "resource": "res:orders-pg", "name": "SELECT cart", "kind": "CLIENT", "start": "2026-06-01T14:01:02.030Z", "end": "2026-06-01T14:01:02.060Z", "status": "OK", "attributes": { "db.system": "postgresql" } }
+      ]
+    }
+  ],
+  "metrics": [
+    {
+      "name": "http.server.error_rate",
+      "entity": "service:checkout",
+      "unit": "ratio",
+      "points": [
+        { "t": "2026-06-01T14:00:00Z", "v": 0.002 },
+        { "t": "2026-06-01T14:02:00Z", "v": 0.003 },
+        { "t": "2026-06-01T14:04:00Z", "v": 0.21 },
+        { "t": "2026-06-01T14:06:00Z", "v": 0.38 },
+        { "t": "2026-06-01T14:10:00Z", "v": 0.41 }
+      ]
+    },
+    {
+      "name": "http.server.duration_p95_ms",
+      "entity": "service:checkout",
+      "unit": "ms",
+      "points": [
+        { "t": "2026-06-01T14:00:00Z", "v": 140 },
+        { "t": "2026-06-01T14:04:00Z", "v": 520 },
+        { "t": "2026-06-01T14:08:00Z", "v": 610 }
+      ]
+    },
+    {
+      "name": "db.query.duration_p95_ms",
+      "entity": "db:orders-pg",
+      "unit": "ms",
+      "points": [
+        { "t": "2026-06-01T14:00:00Z", "v": 28 },
+        { "t": "2026-06-01T14:04:00Z", "v": 30 },
+        { "t": "2026-06-01T14:08:00Z", "v": 29 }
+      ]
+    }
+  ],
+  "logs": [
+    { "id": "log-1", "t": "2026-06-01T14:03:21Z", "entity": "service:checkout", "severity": "ERROR", "body": "Unhandled NullPointerException in CheckoutHandler.applyDiscount: coupon is null", "attributes": { "exception.type": "NullPointerException", "code.function": "applyDiscount" } },
+    { "id": "log-2", "t": "2026-06-01T14:04:02Z", "entity": "service:checkout", "severity": "ERROR", "body": "Unhandled NullPointerException in CheckoutHandler.applyDiscount: coupon is null", "attributes": { "exception.type": "NullPointerException", "code.function": "applyDiscount" } },
+    { "id": "log-3", "t": "2026-06-01T14:06:44Z", "entity": "service:checkout", "severity": "ERROR", "body": "Unhandled NullPointerException in CheckoutHandler.applyDiscount: coupon is null", "attributes": { "exception.type": "NullPointerException", "code.function": "applyDiscount" } },
+    { "id": "log-4", "t": "2026-06-01T14:00:50Z", "entity": "service:checkout", "severity": "INFO", "body": "checkout completed order=ord_771 amount=42.10", "attributes": {} }
+  ],
+  "changes": [
+    {
+      "id": "change:deploy-checkout-v2",
+      "t": "2026-06-01T14:03:05Z",
+      "kind": "deploy",
+      "entity": "service:checkout",
+      "summary": "Rollout checkout 1.9.4 -> 2.0.0",
+      "attributes": { "from_version": "1.9.4", "to_version": "2.0.0", "trigger": "ci-pipeline", "commit": "c0ffee1" }
+    }
+  ]
+}

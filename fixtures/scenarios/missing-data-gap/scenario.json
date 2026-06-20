@@ -1,0 +1,34 @@
+{
+  "id": "missing-data-gap",
+  "title": "Telemetry gap during the incident forces honest uncertainty",
+  "version": 1,
+  "schema_version": "fixtures/v1",
+  "failure_class": "missing-data",
+  "difficulty": "hard",
+  "false_causality_trap": false,
+  "summary": "inventory shows a brief connection error just before its metrics pipeline goes dark: the otel-collector restarts at 08:05 and drops inventory samples until 08:13, exactly across the incident. Only a partial pre-gap signal (an inventory-pg connection error) is available. A correct bundle reports the gap as missing data, keeps confidence low, and recommends filling the gap rather than inventing a cause.",
+  "question": "What caused the inventory errors around 08:05 on 2026-06-18?",
+  "time_window": { "start": "2026-06-18T07:55:00Z", "end": "2026-06-18T08:25:00Z" },
+  "ground_truth": {
+    "primary_cause_entity": "under-determined",
+    "cause_kind": "missing-data",
+    "partial_signal_entity": "db:inventory-pg",
+    "gap_ref": "telemetry_gap:inventory-0805",
+    "blast_radius": ["service:inventory"],
+    "notes": "The cause cannot be confidently determined because inventory metrics are missing across the incident window. There is a weak pre-gap signal (inventory-pg connection error) but it is insufficient. The correct behavior is to return missing_data and next-checks to backfill, not a confident root cause."
+  },
+  "capabilities": [
+    "entity-resolution",
+    "relationship-building",
+    "anomaly-windows",
+    "change-ingestion",
+    "evidence-ir",
+    "get_evidence_bundle",
+    "build_timeline",
+    "rank_suspected_causes",
+    "suggest_next_checks",
+    "false-causality-guard"
+  ],
+  "inputs": ["resources", "traces", "metrics", "logs", "changes", "telemetry_gaps"],
+  "expected": ["entities", "relationships", "anomaly_windows", "evidence_bundle", "timeline", "suspected_causes", "next_checks"]
+}

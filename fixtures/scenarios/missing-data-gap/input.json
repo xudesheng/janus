@@ -1,0 +1,32 @@
+{
+  "_note": "Self-contained, OTel-shaped synthetic telemetry. The inventory metric series has an explicit hole (no points 08:05-08:13); the optional telemetry_gaps key documents the collector outage that caused it. The only in-window error signal is a single pre-gap trace/log.",
+  "resources": [
+    { "id": "res:inventory", "attributes": { "service.name": "inventory", "service.version": "5.4.0", "deployment.environment": "prod", "k8s.namespace.name": "warehouse" } },
+    { "id": "res:inventory-pg", "attributes": { "service.name": "inventory-pg", "db.system": "postgresql", "deployment.environment": "prod" } },
+    { "id": "res:otel-collector", "attributes": { "service.name": "otel-collector", "service.version": "0.102.0", "deployment.environment": "prod" } }
+  ],
+  "traces": [
+    {
+      "trace_id": "t-b001",
+      "exemplar_of": "pre-gap-error",
+      "spans": [
+        { "span_id": "s-1", "parent_id": null, "resource": "res:inventory", "name": "GET /stock", "kind": "SERVER", "start": "2026-06-18T08:03:30.000Z", "end": "2026-06-18T08:03:30.090Z", "status": "ERROR", "attributes": { "http.route": "/stock", "http.status_code": 500 } },
+        { "span_id": "s-2", "parent_id": "s-1", "resource": "res:inventory-pg", "name": "SELECT stock", "kind": "CLIENT", "start": "2026-06-18T08:03:30.010Z", "end": "2026-06-18T08:03:30.085Z", "status": "ERROR", "attributes": { "db.system": "postgresql", "error.type": "connection_refused" } }
+      ]
+    }
+  ],
+  "metrics": [
+    { "name": "http.server.error_rate", "entity": "service:inventory", "unit": "ratio", "_gap": { "start": "2026-06-18T08:05:00Z", "end": "2026-06-18T08:13:00Z", "ref": "telemetry_gap:inventory-0805" }, "points": [ { "t": "2026-06-18T08:00:00Z", "v": 0.004 }, { "t": "2026-06-18T08:04:00Z", "v": 0.06 }, { "t": "2026-06-18T08:14:00Z", "v": 0.02 }, { "t": "2026-06-18T08:20:00Z", "v": 0.005 } ] },
+    { "name": "db.query.error_rate", "entity": "db:inventory-pg", "unit": "ratio", "_gap": { "start": "2026-06-18T08:05:00Z", "end": "2026-06-18T08:13:00Z", "ref": "telemetry_gap:inventory-0805" }, "points": [ { "t": "2026-06-18T08:00:00Z", "v": 0.002 }, { "t": "2026-06-18T08:04:00Z", "v": 0.05 }, { "t": "2026-06-18T08:14:00Z", "v": 0.01 } ] }
+  ],
+  "logs": [
+    { "id": "log-1", "t": "2026-06-18T08:03:35Z", "entity": "service:inventory", "severity": "ERROR", "body": "inventory-pg connection refused", "attributes": { "error.type": "connection_refused" } },
+    { "id": "log-2", "t": "2026-06-18T08:05:02Z", "entity": "service:otel-collector", "severity": "WARN", "body": "scrape target inventory unreachable; dropping samples", "attributes": { "target": "inventory" } }
+  ],
+  "changes": [
+    { "id": "change:collector-restart", "t": "2026-06-18T08:05:00Z", "kind": "infrastructure_event", "entity": "service:otel-collector", "summary": "otel-collector restarted; inventory scrape paused", "attributes": { "reason": "config_reload" } }
+  ],
+  "telemetry_gaps": [
+    { "id": "telemetry_gap:inventory-0805", "start": "2026-06-18T08:05:00Z", "end": "2026-06-18T08:13:00Z", "affected_entities": ["service:inventory", "db:inventory-pg"], "affected_signals": ["metrics"], "cause": "change:collector-restart", "note": "Metrics for inventory and inventory-pg are absent across the incident peak. Traces/logs are sparse but partially present." }
+  ]
+}

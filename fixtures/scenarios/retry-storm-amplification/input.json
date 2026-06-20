@@ -1,0 +1,36 @@
+{
+  "_note": "Self-contained, OTel-shaped synthetic telemetry. ISO-8601 UTC timestamps. The only change record is OLD (outside the incident window) on purpose: to test that change-proximity reasoning does not over-fire.",
+  "resources": [
+    { "id": "res:checkout", "attributes": { "service.name": "checkout", "service.version": "2.0.1", "deployment.environment": "prod", "checkout.retry.max_attempts": "5", "checkout.retry.backoff": "none" } },
+    { "id": "res:payment-svc", "attributes": { "service.name": "payment-svc", "service.version": "4.1.0", "deployment.environment": "prod", "k8s.namespace.name": "payments" } }
+  ],
+  "traces": [
+    {
+      "trace_id": "t-2001",
+      "exemplar_of": "retry-fanout",
+      "spans": [
+        { "span_id": "s-1", "parent_id": null, "resource": "res:checkout", "name": "POST /checkout", "kind": "SERVER", "start": "2026-06-05T14:45:00.000Z", "end": "2026-06-05T14:45:03.900Z", "status": "ERROR", "attributes": { "http.route": "/checkout" } },
+        { "span_id": "s-2", "parent_id": "s-1", "resource": "res:payment-svc", "name": "charge attempt=1", "kind": "CLIENT", "start": "2026-06-05T14:45:00.100Z", "end": "2026-06-05T14:45:00.700Z", "status": "ERROR", "attributes": { "peer.service": "payment-svc", "http.status_code": 503, "retry.attempt": 1 } },
+        { "span_id": "s-3", "parent_id": "s-1", "resource": "res:payment-svc", "name": "charge attempt=2", "kind": "CLIENT", "start": "2026-06-05T14:45:00.710Z", "end": "2026-06-05T14:45:01.320Z", "status": "ERROR", "attributes": { "http.status_code": 503, "retry.attempt": 2 } },
+        { "span_id": "s-4", "parent_id": "s-1", "resource": "res:payment-svc", "name": "charge attempt=3", "kind": "CLIENT", "start": "2026-06-05T14:45:01.330Z", "end": "2026-06-05T14:45:01.980Z", "status": "ERROR", "attributes": { "http.status_code": 503, "retry.attempt": 3 } },
+        { "span_id": "s-5", "parent_id": "s-1", "resource": "res:payment-svc", "name": "charge attempt=4", "kind": "CLIENT", "start": "2026-06-05T14:45:01.990Z", "end": "2026-06-05T14:45:02.700Z", "status": "ERROR", "attributes": { "http.status_code": 503, "retry.attempt": 4 } },
+        { "span_id": "s-6", "parent_id": "s-1", "resource": "res:payment-svc", "name": "charge attempt=5", "kind": "CLIENT", "start": "2026-06-05T14:45:02.710Z", "end": "2026-06-05T14:45:03.850Z", "status": "ERROR", "attributes": { "http.status_code": 503, "retry.attempt": 5 } }
+      ]
+    }
+  ],
+  "metrics": [
+    { "name": "http.server.error_rate", "entity": "service:payment-svc", "unit": "ratio", "points": [ { "t": "2026-06-05T14:38:00Z", "v": 0.004 }, { "t": "2026-06-05T14:40:00Z", "v": 0.02 }, { "t": "2026-06-05T14:42:00Z", "v": 0.35 }, { "t": "2026-06-05T14:48:00Z", "v": 0.62 }, { "t": "2026-06-05T14:55:00Z", "v": 0.6 } ] },
+    { "name": "request.rate_rps", "entity": "service:payment-svc", "unit": "rps", "points": [ { "t": "2026-06-05T14:38:00Z", "v": 480 }, { "t": "2026-06-05T14:40:00Z", "v": 500 }, { "t": "2026-06-05T14:42:00Z", "v": 1900 }, { "t": "2026-06-05T14:48:00Z", "v": 2350 }, { "t": "2026-06-05T14:55:00Z", "v": 2300 } ] },
+    { "name": "cpu.utilization", "entity": "service:payment-svc", "unit": "ratio", "points": [ { "t": "2026-06-05T14:38:00Z", "v": 0.45 }, { "t": "2026-06-05T14:42:00Z", "v": 0.92 }, { "t": "2026-06-05T14:48:00Z", "v": 0.99 } ] },
+    { "name": "client.retry.rate_rps", "entity": "service:checkout", "unit": "rps", "points": [ { "t": "2026-06-05T14:38:00Z", "v": 5 }, { "t": "2026-06-05T14:40:00Z", "v": 40 }, { "t": "2026-06-05T14:42:00Z", "v": 1400 }, { "t": "2026-06-05T14:48:00Z", "v": 1850 } ] }
+  ],
+  "logs": [
+    { "id": "log-1", "t": "2026-06-05T14:40:12Z", "entity": "service:payment-svc", "severity": "WARN", "body": "upstream provider transient error, returning 503", "attributes": { "http.status_code": 503 } },
+    { "id": "log-2", "t": "2026-06-05T14:42:30Z", "entity": "service:payment-svc", "severity": "ERROR", "body": "request queue full, shedding load", "attributes": {} },
+    { "id": "log-3", "t": "2026-06-05T14:45:01Z", "entity": "service:checkout", "severity": "WARN", "body": "charge failed, retrying attempt 3/5 with no backoff", "attributes": { "retry.attempt": 3 } },
+    { "id": "log-4", "t": "2026-06-05T14:46:00Z", "entity": "service:checkout", "severity": "WARN", "body": "charge failed, retrying attempt 5/5 with no backoff", "attributes": { "retry.attempt": 5 } }
+  ],
+  "changes": [
+    { "id": "change:payment-svc-deploy-old", "t": "2026-05-28T09:00:00Z", "kind": "deploy", "entity": "service:payment-svc", "summary": "payment-svc 4.1.0 (8 days before incident)", "attributes": { "to_version": "4.1.0" } }
+  ]
+}

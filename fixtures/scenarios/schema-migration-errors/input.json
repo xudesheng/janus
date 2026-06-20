@@ -1,0 +1,37 @@
+{
+  "_note": "Self-contained, OTel-shaped synthetic telemetry. The DB query span carries the UndefinedColumn error while DB latency stays healthy.",
+  "resources": [
+    { "id": "res:profile", "attributes": { "service.name": "profile", "service.version": "4.7.2", "deployment.environment": "prod", "k8s.namespace.name": "accounts" } },
+    { "id": "res:users-pg", "attributes": { "service.name": "users-pg", "db.system": "postgresql", "deployment.environment": "prod", "host.name": "node-db-2" } }
+  ],
+  "traces": [
+    {
+      "trace_id": "t-8001",
+      "exemplar_of": "undefined-column",
+      "spans": [
+        { "span_id": "s-1", "parent_id": null, "resource": "res:profile", "name": "GET /profile", "kind": "SERVER", "start": "2026-06-16T10:33:00.000Z", "end": "2026-06-16T10:33:00.040Z", "status": "ERROR", "attributes": { "http.route": "/profile", "http.status_code": 500 } },
+        { "span_id": "s-2", "parent_id": "s-1", "resource": "res:users-pg", "name": "SELECT user", "kind": "CLIENT", "start": "2026-06-16T10:33:00.010Z", "end": "2026-06-16T10:33:00.028Z", "status": "ERROR", "attributes": { "db.system": "postgresql", "db.statement": "SELECT id, email FROM users WHERE id=$1", "error.type": "UndefinedColumn", "db.error_code": "42703" } }
+      ]
+    },
+    {
+      "trace_id": "t-8002",
+      "exemplar_of": "baseline",
+      "spans": [
+        { "span_id": "b-1", "parent_id": null, "resource": "res:profile", "name": "GET /profile", "kind": "SERVER", "start": "2026-06-16T10:22:00.000Z", "end": "2026-06-16T10:22:00.035Z", "status": "OK", "attributes": { "http.route": "/profile", "http.status_code": 200 } },
+        { "span_id": "b-2", "parent_id": "b-1", "resource": "res:users-pg", "name": "SELECT user", "kind": "CLIENT", "start": "2026-06-16T10:22:00.010Z", "end": "2026-06-16T10:22:00.026Z", "status": "OK", "attributes": { "db.system": "postgresql" } }
+      ]
+    }
+  ],
+  "metrics": [
+    { "name": "http.server.error_rate", "entity": "service:profile", "unit": "ratio", "points": [ { "t": "2026-06-16T10:24:00Z", "v": 0.002 }, { "t": "2026-06-16T10:30:00Z", "v": 0.04 }, { "t": "2026-06-16T10:32:00Z", "v": 0.95 }, { "t": "2026-06-16T10:40:00Z", "v": 0.96 } ] },
+    { "name": "db.query.error_rate", "entity": "db:users-pg", "unit": "ratio", "points": [ { "t": "2026-06-16T10:24:00Z", "v": 0.001 }, { "t": "2026-06-16T10:32:00Z", "v": 0.48 }, { "t": "2026-06-16T10:40:00Z", "v": 0.49 } ] },
+    { "name": "db.query.duration_p95_ms", "entity": "db:users-pg", "unit": "ms", "points": [ { "t": "2026-06-16T10:24:00Z", "v": 18 }, { "t": "2026-06-16T10:32:00Z", "v": 17 }, { "t": "2026-06-16T10:40:00Z", "v": 19 } ] }
+  ],
+  "logs": [
+    { "id": "log-1", "t": "2026-06-16T10:30:20Z", "entity": "service:profile", "severity": "ERROR", "body": "ERROR: column \"email\" does not exist (SQLSTATE 42703)", "attributes": { "error.type": "UndefinedColumn", "db.error_code": "42703" } },
+    { "id": "log-2", "t": "2026-06-16T10:33:00Z", "entity": "service:profile", "severity": "ERROR", "body": "ERROR: column \"email\" does not exist (SQLSTATE 42703)", "attributes": { "error.type": "UndefinedColumn", "db.error_code": "42703" } }
+  ],
+  "changes": [
+    { "id": "change:users-pg-rename-email", "t": "2026-06-16T10:30:00Z", "kind": "schema_migration", "entity": "db:users-pg", "summary": "Migration 0142: rename users.email -> users.email_address", "attributes": { "migration": "0142_rename_email", "operation": "rename_column", "table": "users", "from": "email", "to": "email_address" } }
+  ]
+}

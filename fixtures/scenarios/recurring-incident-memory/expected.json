@@ -1,0 +1,49 @@
+{
+  "_note": "Gold artifacts. The distinctive output is a previous_incident evidence item that matches the current anomaly to prior:inc-0603 and surfaces its recorded mitigation.",
+  "entities": [
+    { "id": "service:checkout", "kind": "service", "from": ["res:checkout"], "confidence": 0.99 },
+    { "id": "db:orders-pg", "kind": "database", "from": ["res:orders-pg"], "confidence": 0.98 },
+    { "id": "service:reporting-job", "kind": "service", "from": ["res:reporting-job"], "confidence": 0.97 }
+  ],
+  "relationships": [
+    { "src": "service:checkout", "type": "reads-from", "dst": "db:orders-pg", "confidence": 0.97, "evidence": ["trace:t-a001"] },
+    { "src": "service:reporting-job", "type": "writes-to", "dst": "db:orders-pg", "confidence": 0.95 }
+  ],
+  "anomaly_windows": [
+    { "id": "aw-1", "entity": "db:orders-pg", "signal": "db.query.duration_p95_ms", "start": "2026-06-18T03:04:00Z", "end": "2026-06-18T03:18:00Z", "baseline": 31, "peak": 1250, "detector_confidence": 0.93 },
+    { "id": "aw-2", "entity": "db:orders-pg", "signal": "db.locks.waiting", "start": "2026-06-18T03:04:00Z", "end": "2026-06-18T03:18:00Z", "baseline": 0, "peak": 21, "detector_confidence": 0.9 }
+  ],
+  "related_anomalies": {
+    "_for_capability": "find_related_anomalies",
+    "seed": "aw-1",
+    "related": [
+      { "prior_incident": "prior:inc-0603", "relation": "recurring-signature", "similarity": 0.93, "note": "same orders-pg lock-contention signature triggered by a reporting VACUUM" }
+    ]
+  },
+  "evidence_bundle": {
+    "question": "Why is checkout slow again at 03:05 on 2026-06-18, and have we seen this before?",
+    "time_window": { "start": "2026-06-18T02:55:00Z", "end": "2026-06-18T03:25:00Z" },
+    "budget": { "max_items": 6, "max_tokens": 700, "tokens_used": 280, "items_dropped": 0 },
+    "items": [
+      { "id": "ev-1", "claim": "orders-pg query p95 spiked ~36x with lock waits up to 21, starting at 03:04.", "kind": "metric_anomaly", "direction": "supports", "strength": 0.9, "time_window": { "start": "2026-06-18T03:04:00Z", "end": "2026-06-18T03:18:00Z" }, "entities": ["db:orders-pg"], "source_refs": [{ "signal": "metric", "ref": "db.query.duration_p95_ms@db:orders-pg" }, { "signal": "metric", "ref": "db.locks.waiting@db:orders-pg" }, { "signal": "anomaly_window", "ref": "aw-1" }], "freshness": "settled", "missing_data": [], "token_cost": 55, "privacy_scope": "none" },
+      { "id": "ev-2", "claim": "This matches prior incident inc-0603 (same lock-contention signature from a reporting VACUUM); its recorded mitigation was to reschedule the batch off-peak.", "kind": "previous_incident", "direction": "supports", "strength": 0.88, "time_window": { "start": "2026-06-03T14:20:00Z", "end": "2026-06-03T14:42:00Z" }, "entities": ["db:orders-pg", "service:reporting-job"], "source_refs": [{ "signal": "prior_incident", "ref": "prior:inc-0603" }], "freshness": "settled", "missing_data": [], "token_cost": 60, "privacy_scope": "none", "confidence": { "signature_similarity": 0.93 } },
+      { "id": "ev-3", "claim": "An ad-hoc reporting VACUUM batch started at 03:04:30, just before the contention.", "kind": "change_event", "direction": "supports", "strength": 0.82, "time_window": { "start": "2026-06-18T03:04:30Z", "end": "2026-06-18T03:18:00Z" }, "entities": ["service:reporting-job", "db:orders-pg"], "source_refs": [{ "signal": "change", "ref": "change:reporting-job-batch-start-2" }], "freshness": "settled", "missing_data": [], "token_cost": 50, "privacy_scope": "none", "confidence": { "time_alignment": 0.9 } },
+      { "id": "ev-4", "claim": "checkout itself regressed (its own code is the cause).", "kind": "counter_evidence", "direction": "contradicts", "strength": 0.8, "time_window": { "start": "2026-06-18T02:55:00Z", "end": "2026-06-18T03:25:00Z" }, "entities": ["service:checkout"], "source_refs": [{ "signal": "trace", "ref": "t-a001/s-2" }], "freshness": "settled", "missing_data": ["no checkout change in window"], "token_cost": 45, "privacy_scope": "none", "note": "checkout failures are statement timeouts waiting on the orders-pg span, matching the prior incident." }
+    ]
+  },
+  "timeline": [
+    { "t": "2026-06-18T03:04:30Z", "marker": "change", "entity": "service:reporting-job", "text": "Ad-hoc rollup VACUUM batch starts", "source_ref": "change:reporting-job-batch-start-2" },
+    { "t": "2026-06-18T03:05:00Z", "marker": "symptom", "entity": "db:orders-pg", "text": "Lock waits and query p95 spike", "source_ref": "aw-1" },
+    { "t": "2026-06-18T03:06:00Z", "marker": "propagation", "entity": "service:checkout", "text": "checkout statement timeouts rise", "source_ref": "log-2" },
+    { "t": "2026-06-18T03:20:00Z", "marker": "recovery", "entity": "db:orders-pg", "text": "Batch ends; query p95 returns to baseline", "source_ref": "db.query.duration_p95_ms@db:orders-pg" }
+  ],
+  "suspected_causes": [
+    { "rank": 1, "entity": "db:orders-pg", "hypothesis": "recurring reporting-batch lock contention on orders-pg, matching inc-0603", "score": 0.88, "reasons": ["lock_metric", "time_alignment", "prior_incident_match", "recovery_on_batch_end"], "supporting": ["ev-1", "ev-2", "ev-3"], "counter": [] },
+    { "rank": 2, "entity": "service:reporting-job", "hypothesis": "ad-hoc batch is the upstream trigger", "score": 0.55, "reasons": ["change_proximity", "matches_prior_trigger"], "supporting": ["ev-3"], "counter": [] }
+  ],
+  "next_checks": [
+    { "action": "Apply the inc-0603 mitigation: stop/reschedule the ad-hoc reporting batch off-peak.", "rationale": "The recorded prior fix resolved the same signature in ~22 minutes.", "expected_signal": "change_event" },
+    { "action": "Confirm the current lock chain (pg_locks) matches the prior incident's VACUUM-on-orders pattern.", "rationale": "Validates the recurrence before applying the known fix.", "expected_signal": "metric_anomaly" },
+    { "action": "Add a guard preventing ad-hoc reporting batches during peak checkout hours.", "rationale": "Prevents a third recurrence of the same incident.", "expected_signal": "relationship" }
+  ]
+}

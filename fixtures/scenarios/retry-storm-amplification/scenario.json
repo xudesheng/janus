@@ -1,0 +1,45 @@
+{
+  "id": "retry-storm-amplification",
+  "title": "Retry storm amplifies a transient blip into an outage",
+  "version": 1,
+  "schema_version": "fixtures/v1",
+  "failure_class": "retry-storm",
+  "difficulty": "hard",
+  "false_causality_trap": true,
+  "summary": "payment-svc has a brief transient 503 blip. checkout retries failed payments aggressively with no backoff, multiplying payment-svc load ~5x and driving it into sustained overload. The visible errors concentrate on payment-svc, but the lever is checkout's retry policy amplifying a transient. There is no recent deploy or config change in the window, so change-proximity reasoning alone is misleading.",
+  "question": "Why is payment-svc returning sustained 503s since 14:41 on 2026-06-05?",
+  "time_window": { "start": "2026-06-05T14:30:00Z", "end": "2026-06-05T15:00:00Z" },
+  "ground_truth": {
+    "primary_cause_entity": "service:checkout",
+    "cause_kind": "retry_amplification",
+    "trigger_entity": "service:payment-svc",
+    "cause_ref": "config:checkout-retry-policy",
+    "blast_radius": ["service:payment-svc", "service:checkout"],
+    "not_the_cause": ["service:payment-svc-as-root"],
+    "notes": "payment-svc is the amplified victim. The root lever is checkout's no-backoff retry policy. The naive suspect (payment-svc, where errors concentrate) must be ranked below the amplification hypothesis, and the absence of any in-window change must be reported, not ignored."
+  },
+  "capabilities": [
+    "entity-resolution",
+    "relationship-building",
+    "anomaly-windows",
+    "log-pattern-clustering",
+    "evidence-ir",
+    "get_evidence_bundle",
+    "build_timeline",
+    "find_related_anomalies",
+    "rank_suspected_causes",
+    "suggest_next_checks",
+    "false-causality-guard"
+  ],
+  "inputs": ["resources", "traces", "metrics", "logs", "changes"],
+  "expected": [
+    "entities",
+    "relationships",
+    "anomaly_windows",
+    "log_patterns",
+    "evidence_bundle",
+    "timeline",
+    "suspected_causes",
+    "next_checks"
+  ]
+}

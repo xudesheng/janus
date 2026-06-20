@@ -1,0 +1,35 @@
+{
+  "id": "resource-exhaustion-memory",
+  "title": "Memory leak drives an OOM-kill / restart cycle",
+  "version": 1,
+  "schema_version": "fixtures/v1",
+  "failure_class": "resource-exhaustion",
+  "difficulty": "hard",
+  "false_causality_trap": false,
+  "summary": "The recommender service has a memory leak introduced by its v3.0.0 deploy a day earlier. RSS climbs in a sawtooth: it hits the container limit, gets OOM-killed, restarts, and repeats. Errors are brief bursts at each restart rather than continuous, and the anomaly spans multiple restart cycles. The cause is resource exhaustion from the leak, not a downstream dependency.",
+  "question": "Why is recommender throwing brief error bursts and restarting repeatedly on 2026-06-15?",
+  "time_window": { "start": "2026-06-15T08:00:00Z", "end": "2026-06-15T09:00:00Z" },
+  "ground_truth": {
+    "primary_cause_entity": "service:recommender",
+    "cause_kind": "resource_exhaustion",
+    "cause_ref": "change:recommender-v3-deploy",
+    "blast_radius": ["service:recommender", "pod:recommender-5b8f"],
+    "not_the_cause": ["db:feature-store"],
+    "notes": "The sawtooth memory pattern plus rising restart count is the signature. Error bursts coincide with restarts, not with downstream calls. The leak traces to the v3.0.0 deploy the previous day, so change-ingestion must connect an out-of-window deploy to in-window exhaustion."
+  },
+  "capabilities": [
+    "entity-resolution",
+    "relationship-building",
+    "anomaly-windows",
+    "change-ingestion",
+    "log-pattern-clustering",
+    "evidence-ir",
+    "get_evidence_bundle",
+    "build_timeline",
+    "rank_suspected_causes",
+    "suggest_next_checks",
+    "false-causality-guard"
+  ],
+  "inputs": ["resources", "traces", "metrics", "logs", "changes"],
+  "expected": ["entities", "relationships", "anomaly_windows", "log_patterns", "evidence_bundle", "timeline", "suspected_causes", "next_checks"]
+}
