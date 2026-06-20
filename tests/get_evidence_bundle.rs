@@ -115,6 +115,22 @@ fn rejects_budget_that_cannot_fit_gold_bundle() {
 }
 
 #[test]
+fn rejects_unsatisfied_counter_evidence_requirement() {
+    let mut query = coincidental_deploy_trap_query();
+    query.require_counter_evidence = true;
+    query.budget.min_counter_evidence_items = Some(3);
+
+    let error = get_evidence_bundle(query).unwrap_err();
+    assert!(matches!(
+        error,
+        GetEvidenceBundleError::UnsatisfiedRequirement {
+            requirement: "counter_evidence",
+            ..
+        }
+    ));
+}
+
+#[test]
 fn serializes_returned_bundle_to_json() {
     let bundle = get_evidence_bundle(deploy_bad_rollout_query()).unwrap();
     let json = serde_json::to_value(&bundle).unwrap();
