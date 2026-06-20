@@ -30,6 +30,28 @@ The implementation topic should deliver:
 - tests covering baseline and false-causality fixtures;
 - a small CLI or test helper that emits Evidence IR JSON for a selected fixture.
 
+## Design Review Gate
+
+No Rust implementation should start for this topic until every active reviewer
+has agreed on the design direction in their `Direction Verdict`. Until then,
+review rounds for `get-evidence-bundle-contract` are design-only or
+diagnosis-only rounds.
+
+This topic should finalize the whole Milestone 2 contract before coding by
+default. After reviewer agreement, the implementation can land as one walking
+skeleton or be split into small implementation phases:
+
+1. `EvidenceQuery`, supporting request types, validation helpers, and query
+   schema generation.
+2. Fixture-backed `get_evidence_bundle` using the narrow loader, including
+   budget and raw-ref guard behavior.
+3. An emit path plus tests for fixture round trips, counter-evidence
+   preservation, schema repeatability, and strict array schemas.
+
+These phases are sequencing guidance, not separate product milestones. All
+three remain part of Milestone 2, and none should pull real retrieval, storage,
+MCP tool schemas, or registry-wide fixture validation into this topic.
+
 ## Scope
 
 In scope for this topic:
@@ -329,4 +351,3 @@ The review for this topic should focus on:
 - whether counter-evidence and source refs survive round-trip unchanged;
 - whether the schema is strict enough for later agent-facing use without pulling
   MCP tool details into this milestone.
-
