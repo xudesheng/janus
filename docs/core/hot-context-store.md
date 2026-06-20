@@ -50,6 +50,18 @@ This topic should finalize the Milestone 4 store contract before coding by
 default. Reviewers may explicitly approve phase-by-phase implementation, but
 each phase must preserve the same Definition Of Done below.
 
+If reviewers approve phase-by-phase implementation, the recommended slices are:
+
+1. Store envelope, fixture loading, deterministic source keys, aliases, and
+   source-reference resolution.
+2. Time-window and entity selectors plus store-aware source lookup checks in
+   the fixture-backed `get_evidence_bundle` path.
+3. Optional inspection CLI and error-report polish.
+
+These are implementation slices only. They do not split the Milestone 4
+acceptance criteria, and none may start until reviewers agree on the design
+direction for this topic or explicitly approve the corresponding phase.
+
 ## Scope
 
 In scope:
@@ -194,6 +206,19 @@ that visible. For committed corpus behavior this should usually be an error, but
 a warning path can remain for compatibility tests if the fixture validation
 harness already treats a shape as warning-only.
 
+Primary keys and aliases should remain distinct in the implementation model.
+Primary keys identify stored records. Aliases such as `trace:t-0001` or
+`trace:t-0001/s-3` are additional lookup routes to the same record, not extra
+records. Alias conflicts should be reported unless both aliases resolve to the
+same concrete target.
+
+Signal-aware resolution should report both the requested signal and the matched
+record kind when they differ. This is especially important for the known
+fixture compatibility pressure where an Evidence IR source ref may use
+`signal: "log"` while the ref string points at a derived log pattern id. The hot
+store should preserve that distinction instead of silently accepting the closest
+record.
+
 ## Store API Shape
 
 The implementation should expose a small library surface, not only a CLI:
@@ -235,6 +260,36 @@ repeatable.
 
 Do not collapse these cases into `Option<&StoredRecord>`. Ambiguity and mismatch
 are important investigation signals.
+
+## Error And Resolution Semantics
+
+The implementation should keep loader errors separate from lookup outcomes.
+Fixture loading errors describe invalid store construction. Source resolution
+outcomes describe what an investigation or validation lookup found inside a
+successfully constructed store.
+
+Loader errors should cover at least:
+
+- duplicate primary source keys;
+- alias conflicts;
+- missing required fixture fields for a recognized record kind;
+- malformed time windows where the fixture field is present but unusable;
+- unsupported or ambiguous derived artifact shape when expected artifacts are
+  loaded as reference targets.
+
+Resolution outcomes should cover at least:
+
+- unsupported `external` refs;
+- missing refs;
+- ambiguous refs;
+- signal/category mismatches;
+- found refs with the concrete stored record payload.
+
+The store-aware `get_evidence_bundle` integration should fail on missing,
+ambiguous, unsupported, or mismatched source refs unless the existing fixture
+validation compatibility policy explicitly classifies that mismatch as a
+warning-only case for the current corpus. Do not let the integration silently
+drop unverifiable refs.
 
 ## Fixture Loading
 
@@ -308,6 +363,11 @@ If this integration makes the existing public function too heavy, add a
 store-aware helper first and keep the old fixture-backed function as a thin
 wrapper. The tests should prove the source lookup path is exercised.
 
+The store-aware path should not filter or rewrite the returned gold bundle in
+this milestone. Time-window and entity selector checks should prove that the
+store can retrieve relevant records for the query, while budgeted selection,
+evidence pruning, and query-dependent bundle generation remain Milestone 6 work.
+
 ## CLI
 
 A small inspection command is useful for development and demos, but it is not
@@ -366,7 +426,7 @@ This topic is complete when:
 
 ## Review Focus
 
-Reviewers should focus on three points:
+Reviewers should focus on these points:
 
 1. Whether the store boundary is strong enough for later simulator and OTLP
    ingest topics.
@@ -374,3 +434,10 @@ Reviewers should focus on three points:
    repeating Milestone 3 closure checks.
 3. Whether this topic stays small enough by excluding derivation, ranking, live
    ingest, and durable persistence.
+4. Whether signal/category mismatches should be hard failures immediately or
+   retain a narrow compatibility warning path until current fixtures are clean.
+5. Whether the recommended implementation slices are acceptable after design
+   approval, or whether reviewers want the whole Milestone 4 implementation
+   reviewed as one coding round.
+6. Whether the selector semantics and error model are explicit enough to test
+   without inventing retrieval behavior.
