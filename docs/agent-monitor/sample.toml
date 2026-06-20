@@ -1,0 +1,44 @@
+# agent-loop project config (TOML). Copy to config.toml and edit, or regenerate
+# with: agent-loop sample-config > config.toml
+# Point CONFIG_FILE (env/.env) or --config-file at the file you use.
+# The target repo (WORK_ROOT) MUST contain docs/review-framework.md.
+
+# Roles. Each is one of: claude | codex | cursor.
+ROLE_IMPLEMENTOR = "codex"   # writes {TOPIC}-review-{n+1}.md
+
+# One reviewer:
+# ROLE_REVIEWER = "codex"       # reviews the latest doc, appends "## Review"
+# …or several, run serially in order (";"-separated). If set, ROLE_REVIEWER is
+# ignored. Each must differ from the implementor and from each other.
+ROLE_REVIEWERS = "claude"
+
+# Review-doc topic: files are {TOPIC}-review-{n}.md under docs/under-review.
+TOPIC = "sample"
+
+# Repo the loop drives. If omitted, the current working directory is used.
+# TOML literal strings (single quotes) need no backslash escaping on Windows.
+WORK_ROOT = 'C:\Users\xudes\Documents\github\rust\janus'
+
+# Optional: work in a git worktree instead of WORK_ROOT itself. When true, the
+# loop requires WORK_ROOT to be on 'main', runs `git pull`, ensures a branch named
+# {TOPIC}, and a sibling worktree dir (default {repo}-{TOPIC}) checked out on it;
+# the agents then run inside the worktree. Session ids are still written back to
+# THIS file, and only this file is committed/pushed (in WORK_ROOT's repo).
+USE_WORKTREE = true
+# WORKTREE_NAME = "parler-improvement"   # default: {repo-name}-{TOPIC}
+
+# Resume targets for the agents named by the roles above. Leave an entry blank to
+# have it AUTO-GENERATED on first run (the agent is initialised with the prompt
+# "please read docs/review-framework.md" and the new id is written back here).
+[sessions]
+claude = ""
+codex = ""
+cursor = ""
+
+# All optional; defaults shown.
+[options]
+show_reasoning = true       # stream Codex reasoning (drops hide_agent_reasoning)
+reasoning_view = "brief"    # console reasoning detail: full | brief | off
+log_dir        = "./target/logs"   # where log files go (relative to cwd is fine)
+plain          = false      # true = plain console (bypass the TUI renderer)
+cursor_bin     = "agent"    # cursor CLI executable (or "cursor-agent")
