@@ -107,3 +107,119 @@ Commands run:
   created
 
 <!-- Reviewer appends below; the Implementor must not edit past this line. -->
+
+## Review (by Claude)
+
+### Direction Verdict
+
+**Continue.** Milestone progress first: this round resolves both review-3
+blockers correctly and lands Slice 3 (log-pattern derivation) matching the
+log-pattern gold across the corpus. I reproduced verification against baseline
+`276d520`: 13 `derived_context` tests pass, full suite green, `cargo clippy
+--all-targets --all-features` clean. The Verification section is truthful.
+
+I re-checked the generator-integrity invariant for the new slice:
+`derive_log_context` reads only `store` (raw `Log` records) plus the
+`log-pattern-clustering` capability tag — no `case.expected` access in the
+generator region. The "expected gold only in tests" boundary holds (answers Focus
+Q5: yes).
+
+Two things I want to credit explicitly, because they are exactly the integrity
+behavior this topic is supposed to produce: (1) you applied the secondary-note
+channel to *related-anomaly* notes pre-emptively, before that slice can lean on
+exact prose; and (2) you surfaced the retry-storm gold id inconsistency honestly
+(`log_pattern_id_differences`, nonfatal) instead of hiding it behind a per-fixture
+id table. Both are the right call.
+
+Next action: **proceed to Slice 4 (timeline)**. That is the higher-value step and
+the one that finally exercises the `non-causal-change` rule and its required
+negative test — the original must-fix from rounds 0–1. The lower-severity metric
+ordering cleanup (old Finding 3) stays low priority and can ride along later.
+
+### Review-3 Findings — Confirmed Resolved
+
+- **Finding 1 (note overfitting): resolved as recommended.** The
+  `(failure_class, entity)` prose lookup is gone; `window_delta_note` now derives
+  a compact `"flat"` note purely from the computed `from/to/factor`, and `note`
+  comparison moved to `window_delta_note_differences`, which is **excluded** from
+  `has_expected_mismatches` (verified). The regression test confirms an editorial
+  expected note vs a derived `flat` note is non-fatal. Good.
+- **Finding 2 (magic baseline): resolved via the sanctioned path.** The weight is
+  now `PRE_ONSET_WARMUP_BLEND_LATEST_WEIGHT`, commented with a real rationale
+  (keep the earliest stable point dominant, acknowledge one pre-onset warm-up
+  point), and covered by a focused test. It is still corpus-tuned and
+  class-gated, but that is now a *named, explained, tested* threshold — within the
+  design's allowance. Acceptable.
+
+### Findings
+
+**Finding 1 (medium-low, generalize as the corpus grows) — log clustering's three
+rule families are coupled to current fixture wording.**
+
+`include_log_record_for_pattern` (`:744`) decides "notable WARN" with a hardcoded
+substring allowlist (`"waiting on lock"`, `"oomkilled"`, `"returning 503"`,
+`"retrying attempt"`, …); `normalize_log_template` (`:773`) applies three bespoke
+normalizers (leading lock-wait count, retry numerator, parenthesized integer);
+`log_pattern_stability` (`:837`) keys labels on template phrases (`"oomkilled"`,
+`"transient"`, `"queue full"`). All three are tied to the exact phrasing the
+current corpus uses.
+
+This is a real but *lesser* version of the round-3 concern, and I want to be fair
+about the difference: these are **heuristic rules over log content, not gold
+answer text reproduced verbatim** — a meaningful improvement. The
+"preserve-semantic-numbers" instinct (only normalizing known-variable positions,
+not blindly collapsing status codes/versions) is correct, and the design permits
+a corpus-focused first slice. So this is acceptable to ship. The asks for later:
+
+- the design's general normalization intent (integers, durations, quoted request
+  ids, long ids) is not yet met — only three syntactic positions are normalized,
+  so two logs differing by an integer elsewhere will split into separate
+  templates. Move toward general variable-value normalization as new fixtures
+  arrive, or note in code that these are corpus-scoped stopgaps.
+- the WARN allowlist fails *closed*: an unrecognized WARN phrase is silently
+  dropped. For a small curated corpus that is fine, but a silently-dropped log is
+  exactly the kind of missing evidence Janus is supposed to surface, so consider
+  making "dropped WARN" visible (count/log) rather than invisible.
+
+**Finding 2 (minor / spec) — retry-storm gold log-pattern ids are
+non-chronological, contradicting the design's stated id rule.**
+
+The design's "Stable id assignment" says sort by first seen, entity, severity,
+template; the retry-storm gold ids do not follow that. Your nonfatal
+natural-identity matching is a reasonable interim response *and* is consistent
+with the design — the design's log-pattern comparison field list deliberately does
+not include `id`. But the underlying gold/spec mismatch should be resolved rather
+than left as standing drift: either correct the retry-storm gold ids to be
+chronological, or add a one-line note to the design that log-pattern ids are not
+guaranteed chronological. Flagging for resolution; the workaround is fine for now.
+
+**Finding 3 (minor) — `new-since-incident` is the catch-all stability label.**
+
+`log_pattern_stability` returns `new-since-incident` for anything not matching the
+three keyword branches. A pattern that genuinely predates the incident would still
+be labelled "new-since-incident." Harmless for the current corpus (included
+WARN/ERROR are incident-related), but worth a guard or comment before warm-memory
+work, where pre-existing patterns become real.
+
+### Answers To Reviewer Focus
+
+1. **Yes** — secondary note treatment resolves the overfitting without hiding
+   differences (they remain visible in `window_delta_note_differences`).
+2. **Yes, acceptable** — the named, commented, tested warm-up blend is within the
+   allowance; no need to replace it now.
+3. **Yes** — natural-identity matching with separate id-drift reporting is the
+   right response to the non-chronological gold ids (see Finding 2 for the
+   follow-up).
+4. **Acceptable for this slice, but corpus-coupled** — see Finding 1.
+5. **Yes** — `derive_log_context` is correctly bounded to raw logs + capability
+   metadata; expected gold is used only by tests (verified).
+6. **Proceed to Slice 4 (timeline).** The metric ordering cleanup is genuinely
+   low priority; Slice 4 is where the `non-causal-change` rule and its negative
+   test finally land, so it should come first.
+
+### Round Termination
+
+This round leaves actionable feedback (Findings 1–3) and the milestone is
+incomplete (Slice 4 timeline, Slice 5 related anomalies, final integration all
+remain), so a `review-5` round is justified — carrying Slice 4, including the
+long-pending `non-causal-change` positive/negative tests.
