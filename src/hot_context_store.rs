@@ -253,7 +253,7 @@ impl HotContextStore {
                 StoredRecordKind::Resource,
                 required_str("ingest", ingest_path(), &payload, "$", "id")?.to_string(),
                 None,
-                Vec::new(),
+                entities_from_common_fields(&payload),
                 payload,
             ),
             HotIngestEvent::Trace(payload) => {

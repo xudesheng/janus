@@ -129,6 +129,10 @@ The optional receiver should accept JSON requests on these OTLP/HTTP paths:
 It should not implement binary protobuf, gRPC, TLS, auth, gzip, retry semantics,
 or production flow control in this topic.
 
+Review 0 decision: the first implementation is file/stdin JSON only. The
+OTLP/HTTP JSON receiver is not approved for this topic and needs a separate
+explicit review decision before implementation.
+
 ## Relationship To The Fixture Simulator
 
 The simulator and this topic should share the same store boundary:
@@ -146,6 +150,12 @@ log record fields.
 The store should not know whether an event came from a fixture or OTLP JSON
 except through provenance metadata on payloads or source refs. That keeps future
 OTLP/HTTP, OTLP/gRPC, and Collector integration paths replaceable.
+
+OTLP adapter errors should be adapter-level errors with input path, OTLP envelope
+path, and record path. The adapter must validate required fields before emitting
+`HotIngestEvent` values. It should not fake fixture ids to fit
+fixture-oriented store errors; store errors may still be wrapped if the
+normalized event unexpectedly violates the hot-store contract.
 
 ## Normalization Model
 
@@ -173,6 +183,22 @@ The normalized payloads should preserve:
 - instrumentation scope name and version when present;
 - timestamps used by the hot store;
 - original attributes that may later matter for evidence or entity resolution.
+
+The adapter should attach provenance under `_janus.provenance`, for example:
+
+```json
+{
+  "_janus.provenance": {
+    "source": "otlp-json",
+    "input": "fixtures/otel/deploy-bad-rollout.otlp.json",
+    "envelope_path": "$.resourceSpans[0].scopeSpans[0].spans[0]"
+  }
+}
+```
+
+The `_janus.provenance` key is intentionally `_`-prefixed so it does not collide
+with real OTLP fields and matches the hot-store convention that helper
+annotations are not indexed as records.
 
 ## Source Keys And Source Refs
 
@@ -202,6 +228,32 @@ Metric points should update a metric-series record in the same way the fixture
 simulator does. The source ref should identify the series, while the stored
 payload preserves individual points and timestamps.
 
+OTLP resource keys are expected to differ from fixture resource ids. A store
+populated from OTLP JSON may contain resource keys such as
+`resource:checkout@checkout-v2-7f9` or `resource:checkout`; a fixture-loaded
+store may contain keys such as `res:checkout-v2`. That is acceptable because the
+stores are per-source/per-run and source refs are scoped to the material being
+ingested. The resolver must not assume the fixture resource id shape.
+
+Metric-series `<entity>` is derived exactly as follows:
+
+1. If the resource has `service.name`, use `service:<service.name>`.
+2. If `service.name` is absent but a deterministic resource key can be derived,
+   use that resource key as the low-quality entity fallback and count the record
+   as accepted with a low-quality entity hint.
+3. If the resource has no stable attributes, derive a deterministic
+   position-scoped resource key from the OTLP envelope path, mark the hint as
+   missing-quality, and count the record accordingly. This keeps same-file
+   source refs stable and avoids collapsing unrelated anonymous resources.
+
+Data-point attributes do not override the resource service entity in this topic.
+They are preserved for later entity resolution.
+
+Generated log ids must be reported as a counted summary field. Logs with an
+explicit `janus.log.id` are counted separately from logs whose ids are generated
+from trace id, span id, timestamp, and record sequence. Generated log ids are
+only guaranteed stable for the same input file and envelope order.
+
 ## Minimal Entity Hints
 
 This topic should not implement `entity-resolver-confidence`. It should only
@@ -214,12 +266,21 @@ Minimum rules:
   the service entity;
 - span names, routes, hosts, pods, containers, databases, queues, and peer
   services should be preserved as attributes for later entity resolution;
-- when the adapter cannot identify a service entity, it should leave the record
-  unresolved and count the missing hint.
+- when the adapter cannot identify a service entity, it should attach the
+  deterministic resource-key fallback as a synthetic entity and count the hint
+  as low-quality or missing-quality. This is not a high-confidence service
+  identity.
 
 Do not invent high-confidence relationships in this topic. Relationship
 building belongs to `entity-resolver-confidence` or a later derived-context
 topic.
+
+Resource-derived service entities are the only high-quality entity hints in
+this topic. Resource-key fallbacks are low-quality hints when based on resource
+attributes and missing-quality hints when based only on envelope position. The
+summary counters count accepted stored records that directly carry a low-quality
+or missing-quality entity hint; deduped resources and metric-series updates do
+not double-count.
 
 ## Error And Partial-Ingest Behavior
 
@@ -238,6 +299,9 @@ unless a reviewer-approved `--allow-partial` option exists. For optional HTTP
 mode, the receiver may return a simple failure response for malformed payloads.
 It does not need to implement the full OTLP partial-success response contract in
 this topic.
+
+Metric-point merges reported by `IngestOutcome::Updated` are successful updates.
+They must not be counted as rejected records and must not trigger nonzero exit.
 
 ## CLI
 
@@ -283,6 +347,12 @@ The sample should include:
 - one log record correlated by trace id or span id;
 - at least one record with missing or weak entity hints if that is useful for
   testing error reporting.
+
+The sample must use true OTLP JSON envelope names, including
+`resourceSpans/scopeSpans/spans`,
+`resourceMetrics/scopeMetrics/metrics/.../dataPoints`, and
+`resourceLogs/scopeLogs/logRecords`, with lowerCamelCase fields and hex
+`traceId` / `spanId` values. It should not be a flat fixture re-skin.
 
 Keep the sample small. The goal is ingest correctness and source refs, not a
 large telemetry corpus.
