@@ -1,15 +1,22 @@
 use janus::{
     entity_context::{
         EntityAlternative, EntityKind, RelationshipIdentity, RelationshipType, ResolvedEntity,
-        ResolvedRelationship, compare_entity_context, relationship_store_key, resolve_entities,
-        resolve_relationships,
+        ResolvedRelationship, compare_entity_context, insert_derived_entity_context,
+        relationship_store_key, resolve_entities, resolve_relationships,
     },
-    evidence::UnitInterval,
+    evidence::{SourceRef, SourceSignal, UnitInterval},
+    fixture_simulator::plan_fixture_replay,
     fixture_validation::{FixtureCase, FixtureCorpus, FixtureSelector},
-    hot_context_store::{HotContextStore, SourceKey, StoredRecord, StoredRecordKind},
+    hot_context_store::{
+        HotContextStore, HotIngestEvent, SourceKey, SourceResolution, StoredRecord,
+        StoredRecordKind,
+    },
 };
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
 #[test]
 fn ambiguous_fixture_entities_deserialize_into_phase1_model() {
@@ -288,6 +295,30 @@ fn comparison_accepts_current_fixture_gold_contract() {
             "derived entity context mismatched expected gold for {}:\n{comparison:#?}",
             case.registry_entry.id
         );
+
+        let gold_entity_ids = expected_entities
+            .iter()
+            .map(|entity| entity.id.as_str())
+            .collect::<BTreeSet<_>>();
+        let extra_gold_relationships = comparison
+            .extra_relationships
+            .iter()
+            .filter(|relationship| {
+                gold_entity_ids.contains(relationship.src.as_str())
+                    && gold_entity_ids.contains(relationship.dst.as_str())
+            })
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let reviewed_extras =
+            reviewed_extra_relationships_between_gold_entities(&case.registry_entry.id);
+        let unreviewed_extras = extra_gold_relationships
+            .difference(&reviewed_extras)
+            .collect::<Vec<_>>();
+        assert!(
+            unreviewed_extras.is_empty(),
+            "derived entity context produced unreviewed extra relationships between gold entities for {}:\n{unreviewed_extras:#?}",
+            case.registry_entry.id
+        );
     }
 }
 
@@ -445,6 +476,68 @@ fn relationship_builder_preserves_retry_and_cache_fallback_attributes() {
 }
 
 #[test]
+fn derived_entity_context_records_resolve_through_hot_store_reference_boundary() {
+    let mut store = source_only_store(fixture_case("deploy-bad-rollout"));
+    let entities = resolve_entities(&store);
+    let relationships = resolve_relationships(&store, &entities);
+
+    insert_derived_entity_context(&mut store, &entities, &relationships).unwrap();
+
+    let entity_record =
+        found(store.resolve_source_ref(&source_ref(SourceSignal::Entity, "service:checkout")));
+    assert_eq!(entity_record.kind, StoredRecordKind::Entity);
+    assert_eq!(entity_record.key.as_str(), "service:checkout");
+    assert_eq!(entity_record.entities, vec!["service:checkout"]);
+    assert_eq!(entity_record.payload["id"], "service:checkout");
+    assert_eq!(entity_record.payload["kind"], "service");
+
+    let relationship_key = relationship_store_key(
+        "service:api-gateway",
+        RelationshipType::Calls,
+        "service:checkout",
+    );
+    let relationship_record =
+        found(store.resolve_source_ref(&source_ref(SourceSignal::Relationship, &relationship_key)));
+    assert_eq!(relationship_record.kind, StoredRecordKind::Relationship);
+    assert_eq!(relationship_record.key.as_str(), relationship_key);
+    assert_eq!(
+        relationship_record.entities,
+        vec!["service:api-gateway", "service:checkout"]
+    );
+    assert_eq!(relationship_record.payload["src"], "service:api-gateway");
+    assert_eq!(relationship_record.payload["type"], "calls");
+    assert_eq!(relationship_record.payload["dst"], "service:checkout");
+}
+
+#[test]
+fn inserted_derived_records_are_not_raw_resolver_inputs() {
+    let mut store = source_only_store(fixture_case("ambiguous-entity-resolution"));
+    let before_count = store.raw_source_records().count();
+    let entities = resolve_entities(&store);
+    let relationships = resolve_relationships(&store, &entities);
+
+    insert_derived_entity_context(&mut store, &entities, &relationships).unwrap();
+
+    assert_eq!(
+        store.raw_source_records().count(),
+        before_count,
+        "derived entity context records must not widen the raw-source resolver boundary"
+    );
+    assert!(
+        store
+            .records()
+            .iter()
+            .any(|record| record.kind == StoredRecordKind::Entity)
+    );
+    assert!(
+        store
+            .records()
+            .iter()
+            .any(|record| record.kind == StoredRecordKind::Relationship)
+    );
+}
+
+#[test]
 fn relationship_builder_ignores_derived_gold_relationship_records() {
     let mut store = HotContextStore::new();
     store
@@ -585,6 +678,48 @@ fn relationship<'a>(
                 && relationship.dst == dst
         })
         .expect("relationship should exist")
+}
+
+fn source_only_store(case: &FixtureCase) -> HotContextStore {
+    let plan = plan_fixture_replay(case).unwrap();
+    let mut store = HotContextStore::new();
+
+    for event in plan.events() {
+        let ingest_event = HotIngestEvent::try_from(event).unwrap();
+        store.ingest(ingest_event).unwrap();
+    }
+
+    store
+}
+
+fn source_ref(signal: SourceSignal, raw_ref: &str) -> SourceRef {
+    SourceRef {
+        signal,
+        r#ref: raw_ref.to_string(),
+    }
+}
+
+fn reviewed_extra_relationships_between_gold_entities(
+    fixture_id: &str,
+) -> BTreeSet<RelationshipIdentity> {
+    let mut relationships = BTreeSet::new();
+
+    if fixture_id == "traffic-shift-hotspot" {
+        relationships.insert(RelationshipIdentity {
+            src: "service:orders".to_string(),
+            relationship_type: RelationshipType::FansOutTo,
+            dst: "shard:orders-shard-1".to_string(),
+        });
+    }
+
+    relationships
+}
+
+fn found(resolution: SourceResolution<'_>) -> &StoredRecord {
+    match resolution {
+        SourceResolution::Found(record) => record,
+        other => panic!("expected found record, got {other:?}"),
+    }
 }
 
 fn test_entity(id: &str, kind: EntityKind, confidence: f64) -> ResolvedEntity {

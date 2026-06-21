@@ -1,6 +1,8 @@
 use crate::{
     evidence::UnitInterval,
-    hot_context_store::{HotContextStore, StoredRecord, StoredRecordKind},
+    hot_context_store::{
+        HotContextStore, HotStoreError, SourceKey, StoredRecord, StoredRecordKind,
+    },
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -266,6 +268,39 @@ pub fn resolve_relationships(
 
 pub fn relationship_store_key(src: &str, relationship_type: RelationshipType, dst: &str) -> String {
     format!("relationship:{src}|{}|{dst}", relationship_type.as_str())
+}
+
+pub fn insert_derived_entity_context(
+    store: &mut HotContextStore,
+    entities: &[ResolvedEntity],
+    relationships: &[ResolvedRelationship],
+) -> Result<(), HotStoreError> {
+    for entity in entities {
+        store.insert_record(StoredRecord {
+            key: SourceKey::new(entity.id.clone()),
+            kind: StoredRecordKind::Entity,
+            time_window: None,
+            entities: vec![entity.id.clone()],
+            payload: serde_json::to_value(entity).expect("resolved entity should serialize"),
+        })?;
+    }
+
+    for relationship in relationships {
+        store.insert_record(StoredRecord {
+            key: SourceKey::new(relationship_store_key(
+                &relationship.src,
+                relationship.relationship_type,
+                &relationship.dst,
+            )),
+            kind: StoredRecordKind::Relationship,
+            time_window: None,
+            entities: dedupe_stable(vec![relationship.src.clone(), relationship.dst.clone()]),
+            payload: serde_json::to_value(relationship)
+                .expect("resolved relationship should serialize"),
+        })?;
+    }
+
+    Ok(())
 }
 
 pub fn compare_entity_context(
@@ -1037,7 +1072,7 @@ fn insert_logical_span_relationships(
                 RelationshipType::FansOutTo,
                 shard_id,
                 UnitInterval(0.90),
-                Vec::new(),
+                vec![format!("trace:{}", span.trace_id)],
                 BTreeMap::new(),
                 entity_confidences,
             ),
