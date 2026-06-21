@@ -70,3 +70,66 @@ Reviewers should focus on:
    roadmap work returns to `entity-resolver-confidence`.
 
 <!-- Reviewer appends below; the Implementor must not edit past this line. -->
+
+## Review (by Claude)
+
+### Direction Verdict
+
+**On critical path:** Yes — this is the single closing round Review 1 asked for
+before terminating the approved demo-bridge topic.
+
+**Milestone progress: complete.** All three Review-1 findings are resolved
+cleanly, and I verified each one independently rather than from the round's
+summary:
+
+- **D1 (must-fix) — fixed and pinned.** Entity-hint counting moved into the
+  single `apply` path, keyed by a per-event `entity_hint_quality`, and counted
+  only on `IngestOutcome::Inserted`. The over-count in `push_resource` (before
+  dedup) and the per-child double-count in `entity_hint` are both gone. I re-ran
+  my original Review-1 reproduction (one low-quality resource across
+  `resourceSpans` + `resourceMetrics`): it now reports
+  `low_quality_entity_hints = 3` (resource + span + metric-series = 3 stored
+  records carrying the hint), down from the buggy `4`. The new test
+  `low_quality_entity_hint_count_tracks_stored_records_not_envelopes` pins the
+  multi-signal case at `4` (adds the log record), so the regression can't
+  reappear. The counter now has a precise, defensible definition: accepted
+  stored records that directly carry a low/missing-quality hint.
+- **D2 — fixed.** `ResourceContext.entity` is now a non-optional `String`, so
+  the unreachable `entity.is_none()` branch and the dead "no stable entity"
+  metric reject branch are removed. Metric points are still rejected for genuinely
+  missing/malformed required fields (`name`, timestamp, value), which is correct.
+- **D3 — fixed.** The design doc no longer contains the contradictory "leave the
+  record unresolved" / "reject the metric point" language (grep-confirmed clean);
+  it now states one rule — missing service identity gets a deterministic
+  synthetic resource entity (low-quality for attribute-derived keys,
+  missing-quality for envelope-position keys) — and documents the counter
+  semantics including the no-double-count guarantee.
+- **D4 — appropriately deferred** as a non-blocking follow-up note, as agreed.
+  Trace time-window derivation is not in this topic's DoD.
+
+**Independent verification (all green):** `cargo test`, `cargo clippy
+--all-targets --all-features`, `cargo fmt --check`, and `cargo run --bin
+validate_fixtures` (0 errors) all pass on the baseline tree. The sample CLI run
+reproduces the reported summary (2 resources, 1 trace, 2 spans, 3 metric points,
+2 logs; 2 low-quality hints; 9 source refs resolved).
+
+**Verdict: stop — topic complete.** The Definition Of Done is met: OTLP JSON is
+ingested through the existing `HotIngestEvent` / `HotContextStore` boundary,
+source refs are stable and resolvable, metric points accumulate into
+metric-series records, entity hints are conservative and accurately counted, the
+CLI prints a deterministic summary, and the scope stayed file/JSON-first with no
+HTTP/persistence/derivation/ranking/MCP/dashboard work. This round leaves **no
+actionable feedback and no new requirements**, so per the framework's Round
+Termination rule I am **not** requesting a review-3.
+
+### Next step
+
+Terminate `otel-ingest-prototype` and return to the strict roadmap topic
+`entity-resolver-confidence` (Milestone 5A). The boundary-reuse thesis that
+justified both `fixture-otel-simulator` and this topic is now validated end to
+end by a non-fixture source, so there is no remaining reason to continue down the
+Milestone 9 ingest chain (HTTP receiver, persistence, `change-event-ingest`)
+before derived context. Archiving the `otel-ingest-prototype-review-*` rounds is
+a User decision and should be done only on explicit request.
+
+No further review rounds for this topic.
