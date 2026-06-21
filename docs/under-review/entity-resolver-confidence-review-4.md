@@ -114,3 +114,94 @@ cargo run --bin validate_fixtures
 Fixture validation reported 12 fixtures, 0 errors, and 0 warnings.
 
 <!-- Reviewer appends below; the Implementor must not edit past this line. -->
+
+## Review (by Claude (Opus 4.8))
+
+### Direction Verdict
+
+On critical path: **yes** — Phase 4 (the fixture comparison helper) is the gate
+that proves the derived entity/relationship context against the full gold corpus.
+
+Milestone progress (judged before local defects): **delivered and verified — the
+strongest round so far.** I read the code and reproduced the suite:
+
+- `compare_entity_context` covers the full Fixture Comparison Contract: per-entity
+  kind, confidence (±0.05), `from` (gold ⊆ derived), discriminators
+  (order-independent via `json_values_equivalent`), alternatives (by id, with
+  reason + confidence tolerance), `unresolved`, `missing_attributes` (set
+  equality), `estimated_share`; per-relationship confidence (±0.05), evidence
+  (gold ⊆ derived), attributes. `has_expected_mismatches()` deliberately excludes
+  `extra_entities`/`extra_relationships`, so useful extras are visible but
+  non-fatal — exactly the contract the design specifies.
+- The decisive test, `comparison_accepts_current_fixture_gold_contract`, runs all
+  12 fixtures and asserts **no expected mismatches** on every dimension above. It
+  passes. This is the end-to-end proof Phase 4 was meant to produce, and it
+  retroactively confirms round 3's claim: the property-derived confidence rule
+  lands within `0.05` of gold for every gold entity corpus-wide, by rule, not by
+  name lookup. The earlier rounds' coverage only checked id/kind presence; this
+  closes that gap.
+- The targeted tests pin real behavior: extras (including a spurious `calls` edge
+  between two gold ids) are surfaced; confidence/discriminator/alternative,
+  unresolved/missing-attr/share, and relationship confidence/evidence/attribute
+  mismatches each produce the expected report entries.
+- Honest signal of a working harness: enabling the stricter comparison exposed a
+  real resolver gap (`external-api:stripe` lacked the gold `peer.service` /
+  `server.address` discriminators), which was then fixed at the source span. A
+  comparison that finds a real defect on first strict run is doing its job.
+
+All three review-3 findings are addressed:
+
+- **Finding 1 (document/bound bridge rules):** done well. The new "Accepted
+  Milestone 5A Inference Rules" section names and scopes each bridge
+  (`*-ui`->`*-api`, `VACUUM` change-summary, prior-incident signature,
+  `charge`/payment-provider, `checkout.retry.*`), explicitly marks them
+  current-corpus-only and not a general inference/causality engine, and points
+  forward to structured attributes.
+- **Finding 2 (report extras/spurious):** done. Extras are reported separately
+  and non-fatal, with a test proving a spurious gold-id `calls` edge is surfaced.
+- **Finding 3 (full-corpus confidence/discriminators/alternatives):** done — see
+  the decisive test above.
+
+Verification reproduced locally: `cargo test` (all suites pass), `cargo clippy
+--all-targets --all-features` clean, `cargo fmt --check` clean,
+`validate_fixtures` 12/0/0. Process correct: baseline `52794da` is pushed, an
+ancestor, and the pre-review-document tree; covered code was pushed before the
+review document.
+
+Verdict: **continue.** Phase 4 is complete and verified. I **approve proceeding
+to the final Milestone 5A slice**: derived entity/relationship record insertion
+or exposure through the hot-store reference boundary (review focus #5). That is
+the one remaining Definition-of-Done item ("derived ... records are usable by the
+hot-store reference boundary or have an explicitly reviewed path to become
+usable"); the topic is not complete until it lands or is explicitly reviewed.
+One minor finding below should ride along with that slice. Next action: continue.
+
+### Finding 1 — bound *actual* corpus extras, not just the mechanism (minor)
+
+`comparison_accepts_current_fixture_gold_contract` asserts no *expected*
+mismatches, and the synthetic test proves the *extras* machinery works — but
+nothing asserts the *current corpus* produces no unexpected extra
+**relationships**. So a bridge rule that already over-fires on a real fixture
+today (a `*-ui`/`*-api` pair that should not call, a stray `charge` span) would
+appear only in the unchecked `extra_relationships` field and pass silently. The
+design's own new text promises these rules "cannot silently over-fire on future
+fixtures"; close the loop now by adding a corpus-level assertion that
+`extra_relationships` whose `src` and `dst` are both gold entity ids is empty (or
+an explicitly reviewed allowlist). Extra lower-level *entities* (instances,
+routes) are legitimately allowed and need no such bound. This is cheap and turns
+the documented promise into an enforced one.
+
+### Answers to the round's review-focus questions
+
+1. `EntityContextComparison` reports the right fields and keeps extras visible
+   without making them fatal: **yes**.
+2. Formal doc sufficiently documents/bounds the bridge rules: **yes** — named,
+   scoped, and marked current-corpus-only.
+3. Full-corpus comparison strict enough on confidence/discriminators/
+   alternatives/unresolved/missing-attrs/evidence/attributes: **yes** — and it
+   asserts zero expected mismatches across all 12 fixtures.
+4. Preserving `peer.service`/`server.address` discriminators for external APIs is
+   the right source-backed fix: **yes** — it reads them from the source span, not
+   a fixture-name table.
+5. Proceed to the store-insertion/exposure slice: **yes** — it is the last DoD
+   item; carry Finding 1 with it.
