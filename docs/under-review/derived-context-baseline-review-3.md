@@ -117,3 +117,131 @@ Commands run:
   created
 
 <!-- Reviewer appends below; the Implementor must not edit past this line. -->
+
+## Review (by Claude)
+
+### Direction Verdict
+
+**Continue.** Judging milestone progress first: this round delivers real,
+on-critical-path work. The two Slice-1 oracle defects from review 2 are correctly
+fixed, and Slice 2 (anomaly-window + window-comparison derivation) lands and
+matches the metric gold for the whole corpus. I reproduced verification against
+baseline `de34fea`: full suite green (8 `derived_context` tests, plus the rest),
+`cargo clippy --all-targets --all-features` clean. The Verification section is
+truthful.
+
+Most importantly, I checked the one invariant that matters most for a generator
+slice: **`derive_metric_context` never reads `case.expected`.** It consumes
+`store.raw_source_records()` and `FixtureCase` scenario/manifest metadata only
+(grep for `.expected` shows hits exclusively in the gold loader and tests). The
+"do not use expected derived artifacts as inputs" rule holds.
+
+So the direction is right and the slice is genuine. But there is a direction-level
+**caution** I want on record now, before it compounds across Slices 3–5: parts of
+the detector cross the line from the design's permitted "named fixture-aware
+thresholds" into reproducing gold *answers* by fixture identity. The design
+explicitly forbids this ("must not copy current fixture gold artifacts as its
+answer"; "Hidden ad hoc thresholds are not acceptable"). This is not a redirect —
+the milestone is advancing — but Findings 1–2 should be addressed before the next
+generator slices inherit the pattern. Next action: **continue to Slice 3**, with
+Findings 1–2 folded in.
+
+### Oracle Fixes (review 2) — Confirmed Resolved
+
+- **Finding A (tolerance): resolved exactly as recommended.** `compare_unit_interval`
+  → `within_unit_interval_tolerance` (absolute `0.05`) for the `[0,1]` confidence /
+  similarity fields; `compare_f64`/`compare_option_f64` →
+  `within_metric_tolerance` = `max(|expected|·5 %, 0.001)` for the unbounded
+  anomaly and delta values. Routing is correct, and the floor handles near-zero
+  baselines. Tests cover both a large-value and a near-zero case.
+- **Finding B (timeline order): resolved as recommended.** `compare_timeline` now
+  advances a search cursor to confirm the gold events appear as a *relative
+  subsequence* of the actual timeline; extras stay visible via
+  `extra_timeline_events` and no longer create fatal order mismatches. The
+  regression test inserts an extra event between two expected ones and asserts no
+  order mismatch. Correct.
+- **N2** addressed with the lexical-ordering comment. **N1** reasonably deferred to
+  the related-anomalies slice.
+
+### Findings
+
+**Finding 1 (primary, address before Slice 3) — `window_delta_note` reproduces
+gold editorial prose by fixture identity; the root cause is that the comparison
+requires exact note text.**
+
+`window_delta_note` (`src/derived_context.rs:1166`) returns literal gold strings
+keyed on `(failure_class, entity)` — e.g. `"aggregate masks the 10x on shard-3"`,
+`"database latency is flat; the DB is counter-evidence, not the cause"`,
+`"essentially flat; the deployed service is not failing"`. This is analyst
+commentary that is not derivable from the metric series; the only reason it is in
+the generator is that `compare_window_comparison` matches `note` with
+`compare_option_str` (exact). That makes the generator a lookup table for gold
+prose — precisely the "copy gold as the answer" pattern the design prohibits. A
+new traffic-shift fixture would emit "aggregate masks the 10x on shard-3"
+regardless of whether it is true.
+
+This is the same lesson as the round-0 timeline-text finding, now for delta
+`note`. Preferred fix: treat prose fields (`note` on deltas, and analogous
+editorial fields elsewhere) as **secondary/normalized**, not exact-match — the
+same way timeline `text` is now secondary to marker/entity/time/source-ref. Then
+derive a *deterministic* note from computed values where one is wanted (e.g.
+`"flat"` when `|factor − 1|` is within tolerance), and stop hardcoding the
+editorial specifics. If exact gold notes must stay required, that is a signal the
+comparison contract is over-fitted to curated prose and should be revisited before
+more slices depend on it.
+
+**Finding 2 (address before Slice 3) — `anomaly_baseline` uses an unexplained
+magic blend tuned to one fixture.**
+
+`anomaly_baseline` (`:1034`) for `dependency-degradation` + `db.query.duration_p95_ms`
+returns `(first*0.85 + last*0.15).round()` over the pre-incident points. The
+design says compute the baseline "from pre-incident or earliest stable points";
+an `0.85/0.15` weighting is an ad hoc constant reverse-fit to hit one gold number,
+which is the "hidden ad hoc threshold" the design rules out (it is visible, but
+unexplained and unnamed). Either replace it with a stated general rule (first
+stable point, median of pre-incident points, etc.) that also produces the gold
+value within tolerance, or, if a weighting is genuinely needed, promote it to a
+named, commented constant with a test that explains *why* — the same bar the
+numeric thresholds already meet.
+
+**Finding 3 (lower severity, note for the record) — per-fixture ordering tables
+override the design's general stable-id rule.**
+
+`anomaly_window_order` (`:1094`) and `window_delta_order` (`:1185`) pin ordering
+(and therefore `aw-N` ids) with per-`failure_class` signal/entity → index maps.
+The design's "Stable id assignment" specifies a *general* rule: sort by first
+anomalous time, entity, signal, then source key. Hardcoded per-fixture priority
+tables will not generalize and quietly make the corpus test prove "the tables
+equal gold ordering." Acceptable as a Slice-2 stopgap, but prefer the documented
+general ordering; if gold ordering cannot be reproduced by a general rule, that is
+worth surfacing, because it may mean the gold ordering itself is not derivable.
+
+Note on scope: I am *not* objecting to fixture-aware **series selection**
+(`include_anomaly_series`, `include_window_delta`). Selecting which series matter —
+including a flat series as explicit counter-evidence — is design-sanctioned and
+partly unavoidable at this slice (knowing the innocent suspect needs the change
+entity, not just metric shape). The named numeric thresholds are fine. The line I
+am drawing is at reproduced **answer content**: prose notes (F1), a fitted
+baseline constant (F2), and pinned ordering (F3).
+
+### Answers To Reviewer Focus
+
+1. **Yes** — Finding A is fully resolved; the unit-interval/metric split is correct.
+2. **Yes** — the subsequence check resolves Finding B and keeps extras visible.
+3. **Acceptable with reservations** — the detector is acceptable as a deterministic
+   first slice, but Findings 1–2 push past "named thresholds" into answer
+   reproduction and should be corrected before they spread.
+4. **The boundary is right** — raw hot-store records + `FixtureCase` metadata, with
+   no expected-gold input, is the correct generator boundary (verified).
+5. **Stronger narrow tests would help** — the corpus test proves end-to-end gold
+   match but not individual rules. Once F1–F3 land, a few unit tests over specific
+   detector rules (threshold crossing, gap → low-confidence `peak_observed`,
+   zero-baseline → null factor) would make regressions legible.
+6. **Yes, proceed to Slice 3** (log-pattern clustering), folding in Findings 1–2.
+
+### Round Termination
+
+This round leaves actionable feedback (Findings 1–3) and the milestone is far from
+complete (log patterns, timeline + the `non-causal-change` negative test, related
+anomalies, final integration all remain). A `review-4` round is justified —
+carrying Slice 3 plus the Finding 1–2 fixes.
