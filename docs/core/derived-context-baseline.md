@@ -316,7 +316,8 @@ Input event candidates:
 
 Timeline rules:
 
-- sort by timestamp, marker priority, entity id, and source ref;
+- sort by timestamp minute bucket, marker priority, exact timestamp, entity id,
+  and source ref;
 - use the earliest relevant time for each artifact;
 - avoid duplicate events that say the same thing about the same source ref;
 - keep text deterministic and compact;
@@ -486,7 +487,10 @@ Recommended slices:
 5. Related anomalies: connect anomaly windows through relationships and time,
    compare relation labels and lag.
 6. Final integration: insert derived records into the hot store, prove source
-   refs resolve where applicable, and run full-corpus comparison.
+   refs resolve where applicable, run full-corpus comparison, and either
+   generalize timeline marker assignment through entity/relationship/onset
+   context or explicitly record the current timeline algorithm as
+   fixture-corpus scaffolding to be generalized after this milestone.
 
 Slice 1 should land and pass before the generator slices produce anomaly,
 pattern, timeline, related-anomaly, or comparison artifacts. The comparison

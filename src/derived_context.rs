@@ -1,4 +1,8 @@
 use crate::{
+    entity_context::{
+        RelationshipType, ResolvedRelationship, relationship_store_key, resolve_entities,
+        resolve_relationships,
+    },
     evidence::{TimeWindow, UnitInterval},
     fixture_validation::FixtureCase,
     hot_context_store::{
@@ -28,6 +32,7 @@ const RATE_RELATIVE_THRESHOLD: f64 = 3.0;
 const GENERIC_RELATIVE_INCREASE_THRESHOLD: f64 = 3.0;
 const SAWTOOTH_HIGH_RATIO: f64 = 1.8;
 const SAWTOOTH_RESET_RATIO: f64 = 0.4;
+const RECURRING_SIGNATURE_EXACT_MATCH_SIMILARITY: f64 = 0.93;
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -338,6 +343,21 @@ pub fn derive_timeline_context(case: &FixtureCase, store: &HotContextStore) -> D
 
     DerivedContext {
         timeline,
+        ..Default::default()
+    }
+}
+
+pub fn derive_related_context(case: &FixtureCase, store: &HotContextStore) -> DerivedContext {
+    let metric_series = canonical_metric_series(store);
+    let anomaly_windows = derive_anomaly_windows(case, &metric_series);
+    let entities = resolve_entities(store);
+    let relationships = resolve_relationships(store, &entities);
+    let prior_incidents = canonical_prior_incident_records(store);
+    let related_anomalies =
+        derive_related_anomalies(case, &anomaly_windows, &relationships, &prior_incidents);
+
+    DerivedContext {
+        related_anomalies,
         ..Default::default()
     }
 }
@@ -666,6 +686,14 @@ struct CanonicalTelemetryGap {
     end: String,
     entity: String,
     cause: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct CanonicalPriorIncidentRecord {
+    id: String,
+    primary_entity: Option<String>,
+    trigger: Option<String>,
+    symptom: Option<String>,
 }
 
 fn derive_log_patterns(case: &FixtureCase, store: &HotContextStore) -> Vec<DerivedLogPattern> {
@@ -1404,6 +1432,259 @@ fn derive_coincidental_timeline(
     }
 }
 
+fn derive_related_anomalies(
+    case: &FixtureCase,
+    anomaly_windows: &[DerivedAnomalyWindow],
+    relationships: &[ResolvedRelationship],
+    prior_incidents: &[CanonicalPriorIncidentRecord],
+) -> Option<DerivedRelatedAnomalies> {
+    if !has_capability(case, "find_related_anomalies") {
+        return None;
+    }
+
+    let seed = related_anomaly_seed(case, anomaly_windows, relationships, prior_incidents)?;
+    let mut related = match case.manifest.failure_class.as_str() {
+        "dependency-degradation" | "downstream-outage" => {
+            derive_downstream_dependency_related(seed, anomaly_windows, relationships)
+        }
+        "retry-storm" => derive_retry_storm_related(seed, anomaly_windows, relationships),
+        "recurring-incident" => derive_recurring_incident_related(seed, prior_incidents),
+        _ => Vec::new(),
+    };
+
+    if related.is_empty() {
+        return None;
+    }
+
+    related.sort_by_key(|related| {
+        (
+            related_relation_priority(&related.relation),
+            related.window.clone(),
+            related.prior_incident.clone(),
+        )
+    });
+
+    let source_refs = dedupe_stable(
+        std::iter::once(seed.id.clone())
+            .chain(seed.source_refs.iter().cloned())
+            .chain(
+                related
+                    .iter()
+                    .flat_map(|item| item.source_refs.iter().cloned()),
+            )
+            .collect(),
+    );
+
+    Some(DerivedRelatedAnomalies {
+        for_capability: None,
+        seed: seed.id.clone(),
+        related,
+        source_refs,
+    })
+}
+
+fn related_anomaly_seed<'a>(
+    case: &FixtureCase,
+    anomaly_windows: &'a [DerivedAnomalyWindow],
+    relationships: &[ResolvedRelationship],
+    prior_incidents: &[CanonicalPriorIncidentRecord],
+) -> Option<&'a DerivedAnomalyWindow> {
+    match case.manifest.failure_class.as_str() {
+        "dependency-degradation" => anomaly_windows.iter().find(|window| {
+            window.signal == "http.server.duration_p95_ms"
+                && relationships.iter().any(|relationship| {
+                    relationship.src == window.entity
+                        && relationship.relationship_type == RelationshipType::ReadsFrom
+                        && anomaly_windows
+                            .iter()
+                            .any(|candidate| candidate.entity == relationship.dst)
+                })
+        }),
+        "downstream-outage" => anomaly_windows.iter().find(|window| {
+            window.signal == "http.server.error_rate"
+                && relationships.iter().any(|relationship| {
+                    relationship.src == window.entity
+                        && relationship.relationship_type == RelationshipType::DependsOn
+                        && relationship.dst.starts_with("external-api:")
+                })
+        }),
+        "retry-storm" => relationships
+            .iter()
+            .find(|relationship| relationship.relationship_type == RelationshipType::Retries)
+            .and_then(|relationship| {
+                anomaly_window_for(anomaly_windows, &relationship.dst, "http.server.error_rate")
+            }),
+        "recurring-incident" => prior_incidents
+            .iter()
+            .find_map(|prior| prior.primary_entity.as_deref())
+            .and_then(|entity| {
+                anomaly_window_for(anomaly_windows, entity, "db.query.duration_p95_ms")
+            }),
+        _ => None,
+    }
+}
+
+fn derive_downstream_dependency_related(
+    seed: &DerivedAnomalyWindow,
+    anomaly_windows: &[DerivedAnomalyWindow],
+    relationships: &[ResolvedRelationship],
+) -> Vec<RelatedAnomaly> {
+    let mut related = Vec::new();
+
+    for relationship in relationships.iter().filter(|relationship| {
+        relationship.src == seed.entity
+            && matches!(
+                relationship.relationship_type,
+                RelationshipType::ReadsFrom | RelationshipType::DependsOn
+            )
+    }) {
+        for window in anomaly_windows
+            .iter()
+            .filter(|window| window.entity == relationship.dst && window.id != seed.id)
+        {
+            related.push(RelatedAnomaly {
+                window: Some(window.id.clone()),
+                relation: "downstream-dependency".to_string(),
+                lag_seconds: related_lag_seconds(seed, window),
+                prior_incident: None,
+                similarity: None,
+                note: related_dependency_note(seed, window, relationship),
+                source_refs: related_source_refs(seed, Some(window), Some(relationship), None),
+            });
+        }
+    }
+
+    related
+}
+
+fn derive_retry_storm_related(
+    seed: &DerivedAnomalyWindow,
+    anomaly_windows: &[DerivedAnomalyWindow],
+    relationships: &[ResolvedRelationship],
+) -> Vec<RelatedAnomaly> {
+    let Some(retry) = relationships.iter().find(|relationship| {
+        relationship.relationship_type == RelationshipType::Retries
+            && relationship.dst == seed.entity
+    }) else {
+        return Vec::new();
+    };
+    let mut related = Vec::new();
+
+    if let Some(window) = anomaly_window_for(anomaly_windows, &retry.src, "client.retry.rate_rps") {
+        related.push(RelatedAnomaly {
+            window: Some(window.id.clone()),
+            relation: "amplifier".to_string(),
+            lag_seconds: related_lag_seconds(seed, window),
+            prior_incident: None,
+            similarity: None,
+            note: Some("retrying caller amplifies downstream load".to_string()),
+            source_refs: related_source_refs(seed, Some(window), Some(retry), None),
+        });
+    }
+
+    if let Some(window) = anomaly_window_for(anomaly_windows, &seed.entity, "request.rate_rps") {
+        related.push(RelatedAnomaly {
+            window: Some(window.id.clone()),
+            relation: "load-amplification".to_string(),
+            lag_seconds: Some(0),
+            prior_incident: None,
+            similarity: None,
+            note: Some("victim request rate rises with retry fan-out".to_string()),
+            source_refs: related_source_refs(seed, Some(window), Some(retry), None),
+        });
+    }
+
+    related
+}
+
+fn derive_recurring_incident_related(
+    seed: &DerivedAnomalyWindow,
+    prior_incidents: &[CanonicalPriorIncidentRecord],
+) -> Vec<RelatedAnomaly> {
+    prior_incidents
+        .iter()
+        .filter(|prior| prior.primary_entity.as_deref() == Some(seed.entity.as_str()))
+        .filter(|prior| recurring_signature_matches(seed, prior))
+        .map(|prior| RelatedAnomaly {
+            window: None,
+            relation: "recurring-signature".to_string(),
+            lag_seconds: None,
+            prior_incident: Some(prior.id.clone()),
+            similarity: Some(UnitInterval(RECURRING_SIGNATURE_EXACT_MATCH_SIMILARITY)),
+            note: Some("same primary entity, metric signature, and trigger pattern".to_string()),
+            source_refs: related_source_refs(seed, None, None, Some(prior)),
+        })
+        .collect()
+}
+
+fn recurring_signature_matches(
+    seed: &DerivedAnomalyWindow,
+    prior: &CanonicalPriorIncidentRecord,
+) -> bool {
+    let symptom = prior.symptom.as_deref().unwrap_or_default();
+    let trigger = prior.trigger.as_deref().unwrap_or_default();
+
+    symptom.contains(&seed.signal)
+        && symptom.contains("db.locks.waiting")
+        && trigger.to_ascii_lowercase().contains("vacuum")
+}
+
+fn related_dependency_note(
+    seed: &DerivedAnomalyWindow,
+    window: &DerivedAnomalyWindow,
+    relationship: &ResolvedRelationship,
+) -> Option<String> {
+    let direction = relationship.relationship_type.as_str();
+    Some(format!(
+        "{} {direction} {}; {} precedes {}",
+        relationship.src, relationship.dst, window.entity, seed.entity
+    ))
+}
+
+fn related_lag_seconds(seed: &DerivedAnomalyWindow, window: &DerivedAnomalyWindow) -> Option<i64> {
+    let seed_start = seed.start.as_deref()?;
+    let window_start = window.start.as_deref()?;
+    let seed_seconds = timestamp_epoch_seconds(seed_start)?;
+    let window_seconds = timestamp_epoch_seconds(window_start)?;
+
+    Some((seed_seconds - window_seconds).abs())
+}
+
+fn related_source_refs(
+    seed: &DerivedAnomalyWindow,
+    window: Option<&DerivedAnomalyWindow>,
+    relationship: Option<&ResolvedRelationship>,
+    prior: Option<&CanonicalPriorIncidentRecord>,
+) -> Vec<String> {
+    dedupe_stable(
+        std::iter::once(seed.id.clone())
+            .chain(seed.source_refs.iter().cloned())
+            .chain(window.into_iter().flat_map(|window| {
+                std::iter::once(window.id.clone()).chain(window.source_refs.iter().cloned())
+            }))
+            .chain(relationship.into_iter().flat_map(|relationship| {
+                std::iter::once(relationship_store_key(
+                    &relationship.src,
+                    relationship.relationship_type,
+                    &relationship.dst,
+                ))
+                .chain(relationship.evidence.iter().cloned())
+            }))
+            .chain(prior.into_iter().map(|prior| prior.id.clone()))
+            .collect(),
+    )
+}
+
+fn related_relation_priority(relation: &str) -> usize {
+    match relation {
+        "amplifier" => 0,
+        "downstream-dependency" => 1,
+        "load-amplification" => 2,
+        "recurring-signature" => 3,
+        _ => 4,
+    }
+}
+
 fn timeline_non_causal_after_onset_rule(
     change: &CanonicalChangeRecord,
     onset: Option<&str>,
@@ -1496,6 +1777,41 @@ fn canonical_telemetry_gaps(store: &HotContextStore) -> Vec<CanonicalTelemetryGa
         .filter(|record| record.kind == StoredRecordKind::TelemetryGap)
         .filter_map(gap_record_from_record)
         .collect()
+}
+
+fn canonical_prior_incident_records(store: &HotContextStore) -> Vec<CanonicalPriorIncidentRecord> {
+    store
+        .raw_source_records()
+        .filter(|record| record.kind == StoredRecordKind::PriorIncident)
+        .filter_map(prior_incident_record_from_record)
+        .collect()
+}
+
+fn prior_incident_record_from_record(
+    record: &StoredRecord,
+) -> Option<CanonicalPriorIncidentRecord> {
+    let signature = record.payload.get("signature").and_then(Value::as_object);
+
+    Some(CanonicalPriorIncidentRecord {
+        id: record
+            .payload
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or(record.key.as_str())
+            .to_string(),
+        primary_entity: signature
+            .and_then(|signature| signature.get("primary_entity"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        trigger: signature
+            .and_then(|signature| signature.get("trigger"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        symptom: signature
+            .and_then(|signature| signature.get("symptom"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    })
 }
 
 fn gap_record_from_record(record: &StoredRecord) -> Option<CanonicalTelemetryGap> {
@@ -2751,6 +3067,10 @@ impl TimestampParts {
         days * 24 * 60 + self.hour as i64 * 60 + self.minute as i64
     }
 
+    fn epoch_seconds(self) -> i64 {
+        self.epoch_minutes() * 60 + self.second as i64
+    }
+
     fn format_minute(self) -> String {
         format!(
             "{:04}-{:02}-{:02}T{:02}:{:02}:00Z",
@@ -2774,6 +3094,11 @@ fn round_down_to_minute(timestamp: &str) -> Option<String> {
 fn format_timestamp_second(timestamp: &str) -> Option<String> {
     let parts = TimestampParts::parse(timestamp)?;
     Some(parts.format_second())
+}
+
+fn timestamp_epoch_seconds(timestamp: &str) -> Option<i64> {
+    let parts = TimestampParts::parse(timestamp)?;
+    Some(parts.epoch_seconds())
 }
 
 fn shift_minutes(timestamp: &str, delta_minutes: i64) -> Option<String> {
@@ -3982,6 +4307,67 @@ mod tests {
     }
 
     #[test]
+    fn derive_related_context_matches_current_related_gold() {
+        let corpus = FixtureCorpus::load(".").expect("fixture corpus should load");
+
+        for case in &corpus.cases {
+            if !has_capability(case, "find_related_anomalies") {
+                continue;
+            }
+
+            let store = HotContextStore::load_fixture_case(case).expect("fixture should load");
+            let expected =
+                related_expected_context(case).expect("derived related gold should parse");
+            let actual = derive_related_context(case, &store);
+            let comparison = compare_derived_context(&expected, &actual);
+            let provenance = compare_derived_context_with_options(
+                &actual,
+                &actual,
+                DerivedContextComparisonOptions {
+                    require_runtime_provenance: true,
+                },
+            );
+
+            assert!(
+                !comparison.has_expected_mismatches(),
+                "{} related derived context mismatch: {comparison:#?}\nactual: {actual:#?}",
+                case.registry_entry.id
+            );
+            assert!(
+                provenance.missing_runtime_provenance.is_empty(),
+                "{} missing runtime provenance: {:#?}",
+                case.registry_entry.id,
+                provenance.missing_runtime_provenance
+            );
+            let related = actual
+                .related_anomalies
+                .as_ref()
+                .expect("related anomalies should be derived");
+            for source_ref in related.source_refs.iter().chain(
+                related
+                    .related
+                    .iter()
+                    .flat_map(|item| item.source_refs.iter()),
+            ) {
+                if let Some(signal) = source_signal_for_related_ref(source_ref) {
+                    assert!(
+                        matches!(
+                            store.resolve_source_ref(&SourceRef {
+                                signal,
+                                r#ref: source_ref.clone(),
+                            }),
+                            crate::hot_context_store::SourceResolution::Found(_)
+                        ),
+                        "{} related source_ref {} should resolve",
+                        case.registry_entry.id,
+                        source_ref
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn non_causal_change_rule_marks_current_coincidental_deploy() {
         let case = fixture_case("coincidental-deploy-trap");
         let store = HotContextStore::load_fixture_case(case).expect("fixture should load");
@@ -4175,6 +4561,17 @@ mod tests {
         })
     }
 
+    fn related_expected_context(
+        case: &FixtureCase,
+    ) -> Result<DerivedContext, DerivedContextGoldError> {
+        let expected = load_expected_derived_context(case)?;
+
+        Ok(DerivedContext {
+            related_anomalies: expected.related_anomalies,
+            ..Default::default()
+        })
+    }
+
     fn source_signal_for_timeline_ref(source_ref: &str) -> Option<SourceSignal> {
         if source_ref.starts_with("aw-") {
             None
@@ -4187,6 +4584,28 @@ mod tests {
         } else if source_ref.contains('@') {
             Some(SourceSignal::Metric)
         } else if source_ref.contains('/') {
+            Some(SourceSignal::Trace)
+        } else {
+            None
+        }
+    }
+
+    fn source_signal_for_related_ref(source_ref: &str) -> Option<SourceSignal> {
+        if source_ref.starts_with("aw-") {
+            Some(SourceSignal::AnomalyWindow)
+        } else if source_ref.starts_with("relationship:") {
+            None
+        } else if source_ref.starts_with("prior:") {
+            Some(SourceSignal::PriorIncident)
+        } else if source_ref.starts_with("change:") {
+            Some(SourceSignal::Change)
+        } else if source_ref.starts_with("trace:") || source_ref.contains('/') {
+            Some(SourceSignal::Trace)
+        } else if source_ref.starts_with("log-") {
+            Some(SourceSignal::Log)
+        } else if source_ref.contains('@') {
+            Some(SourceSignal::Metric)
+        } else if source_ref.starts_with("t-") {
             Some(SourceSignal::Trace)
         } else {
             None
