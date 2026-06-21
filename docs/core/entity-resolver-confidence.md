@@ -65,6 +65,11 @@ model below are strong enough for Milestone 5A, especially for the
 contract is too loose, the implementation should not start until that contract
 is tightened.
 
+Default review mode is whole-design approval for Milestone 5A before any Rust
+implementation. Reviewers may instead approve phase-by-phase implementation,
+but their `Direction Verdict` must name the approved phase explicitly. A later
+phase must not start just because an earlier phase was accepted.
+
 ## Scope
 
 In scope:
@@ -108,6 +113,27 @@ OTLP JSON ingest sample -> HotContextStore -> entity resolver
 If the current store API does not expose enough read access, add a narrow
 read-only iterator or query method. Do not make the resolver reach into private
 store internals or parse fixture files as its primary path.
+
+The resolver must derive only from raw source records. The existing
+`HotContextStore::load_fixture_case` path loads same-fixture expected artifacts
+as derived reference targets, including gold `Entity` and `Relationship`
+records. Those records are comparison targets, not resolver inputs. Tests may
+load a full fixture store for convenience, but the resolver must filter its
+input to raw source kinds or use a raw-input-only store construction path so it
+cannot copy `expected.json`.
+
+Phase 1 must make this a structural API boundary, not only an implementor
+discipline rule. The store should expose a raw-source read path or equivalent
+kind predicate that excludes all derived record kinds, including gold entities,
+relationships, anomaly windows, log patterns, evidence items, timeline events,
+suspected causes, next checks, entity context, related anomalies, and window
+comparisons.
+
+Store `entities` metadata is a selector hint, not the entity-resolution source
+of truth. For example, resource records may need to be resolved from
+`payload.attributes["service.name"]`, `service.version`,
+`service.instance.id`, Kubernetes attributes, or deployment attributes even
+when the store record's `entities` field is empty.
 
 The first implementation should use these source record kinds:
 
@@ -165,20 +191,24 @@ resolution and fixture comparison.
 
 ## Entity Identity Rules
 
-Entity ids should follow the fixture convention:
+Entity ids should follow the fixture id-prefix convention:
 
 ```text
-{kind}:{name}
-{kind}:{name}@{variant}
+{id-prefix}:{name}
+{id-prefix}:{name}@{variant}
 ```
 
-Minimum supported kinds:
+The id prefix is not always identical to the entity kind. The resolver must
+emit both fields correctly because fixture comparison checks exact id and exact
+kind.
+
+Minimum supported kind values:
 
 - `service`;
 - `route`;
 - `instance`;
 - `pod`;
-- `db`;
+- `database`;
 - `queue`;
 - `cache`;
 - `external-api`;
@@ -187,7 +217,26 @@ Minimum supported kinds:
 - `deployment`;
 - `host`;
 - `container`;
-- `shard`.
+- `partition`.
+
+Current id-prefix mapping:
+
+| Kind | Accepted id prefixes |
+|---|---|
+| `service` | `service:` |
+| `route` | `route:` |
+| `instance` | `instance:` |
+| `pod` | `pod:` |
+| `database` | `db:` |
+| `queue` | `queue:` |
+| `cache` | `cache:`, `infra:`, or `db:` when the fixture models the cache that way |
+| `external-api` | `external-api:` |
+| `tenant` | `tenant:` |
+| `infra` | `infra:` |
+| `deployment` | `deployment:` |
+| `host` | `host:` |
+| `container` | `container:` |
+| `partition` | `shard:` |
 
 The first slice does not need perfect semantic-convention coverage. It does need
 deterministic rules for the current fixtures.
@@ -205,6 +254,18 @@ investigation unit, the resolver should produce variant identities:
   `service:<name>@stable` when fixture evidence clearly models a stable fleet;
 - explicit version or deployment attributes may be used as discriminators, but
   should not create noisy variants when there is no ambiguity.
+
+For the `ambiguous-entity-resolution` fixture, the variant token rule is pinned:
+
+- records with `rollout=canary` map to `service:payments@canary`;
+- non-canary records with the same `service.name`, a concrete
+  `service.version`, and concrete `service.instance.id` values merge into
+  `service:payments@stable`;
+- records with the same `service.name` but missing both `service.version` and
+  `service.instance.id` map to `service:payments@unresolved`;
+- the stable resources `res:payments-stable-a` and
+  `res:payments-stable-b` merge into one stable service identity, with separate
+  `deployed-as` relationships to their instance identities.
 
 The `ambiguous-entity-resolution` fixture is the required test case. The
 resolver must keep `service:payments@canary`,
@@ -243,10 +304,10 @@ the fixture already treats the value as a route.
 Database, queue, cache, and external API identities should come from resource or
 span attributes when present:
 
-- database names or systems -> `db:<name>`;
+- database resources -> `db:<name>` with kind `database`;
 - queue names -> `queue:<name>`;
-- cache or redis-like resources -> `cache:<name>` or `infra:<name>` when the
-  fixture already uses `infra`;
+- cache or redis-like resources -> `cache:<name>`, `infra:<name>`, or
+  `db:<name>` with kind `cache` when the fixture models the cache that way;
 - external service or provider names -> `external-api:<name>`.
 
 When a span only has an operation name such as `stripe.charge`, use a
@@ -274,6 +335,14 @@ Suggested bands:
 - `0.30` to `0.59`: unresolved or ambiguous identity with plausible
   alternatives;
 - below `0.30`: too weak to promote unless needed as explicit missing data.
+
+The bands are explanatory defaults, not the fixture comparison oracle. When a
+fixture provides a concrete confidence value, the deterministic resolver value
+must fall within the comparison tolerance for that concrete value. For the
+ambiguous payments fixture, this means the resolver should target approximately
+`0.96` for `service:payments@canary`, `0.95` for
+`service:payments@stable`, and `0.40` for
+`service:payments@unresolved`, not merely any value inside the unresolved band.
 
 Confidence must not be reused as causal confidence. It answers "how sure are we
 that this record maps to this entity or relationship?", not "is this the root
@@ -356,6 +425,44 @@ Relationship confidence should combine:
 Do not infer ownership or causal direction from time correlation alone in this
 topic. Ownership and root-cause ranking belong later.
 
+### Accepted Milestone 5A Inference Rules
+
+The first relationship builder prefers direct trace, resource, and dependency
+attributes. A few deterministic fixture-corpus bridge rules are accepted for
+Milestone 5A only because current gold relationships intentionally model
+operational context that has no direct source evidence yet. These rules are
+reviewed scope, not a general natural-language inference engine:
+
+- If two non-ambiguous service resources share a base name and one is named
+  `<base>-ui` while the other is named `<base>-api`, the builder may emit a
+  `calls` edge from the UI service to the API service with no evidence and
+  fixture-level confidence. This is a current-corpus convention, not a general
+  ownership or dependency rule.
+- Change records may infer a `writes-to` database edge only when the change has
+  a service entity, a summary token that names a database operation represented
+  in the current fixtures, and a database resource whose service name or stem is
+  present in that summary. The current `VACUUM` bridge is intentionally narrow.
+  Future fixtures should prefer structured change attributes for database
+  targets and operation kind.
+- Prior incident records may infer a current `writes-to` edge only from a
+  structured signature with a service trigger and database `primary_entity`.
+  The prior incident record itself is evidence for the inferred edge; it is not
+  causal proof for the current incident.
+- A span with `peer.service` that does not match a local service resource may
+  derive an `external-api` dependency. The current `charge` operation-name check
+  only assigns the fixture-specific `role: payment-provider` attribute and
+  should be replaced by structured dependency role attributes when new fixtures
+  need this behavior.
+- Retry relationship attributes currently accept the
+  `checkout.retry.max_attempts` and `checkout.retry.backoff` resource attribute
+  names because the current retry fixture uses that namespace. New retry
+  namespaces must be explicitly added or normalized before they are treated as
+  first-class comparison attributes.
+
+Phase 4 comparison must surface all extra derived entities and relationships,
+including relationships between gold entity ids that are not present in gold, so
+these accepted bridge rules cannot silently over-fire on future fixtures.
+
 ## Fixture Comparison Contract
 
 The topic should add a comparison helper, for example:
@@ -379,12 +486,23 @@ For the first implementation, gold fixture records are the required subset. The
 resolver may produce extra lower-level entities, such as instances, as long as
 they are deterministic, source-backed, and do not contradict the gold output.
 
+The required fixture set for Phase 4 is all currently registered fixtures that
+declare `entity-resolution` or `relationship-building`; today that is the full
+current fixture corpus. There are no pre-approved unsupported fixtures. If an
+implementation cannot derive a fixture's expected entity or relationship, the
+next review round must name the fixture, the exact missing relationship or
+entity class, and why it cannot land in that round. Silent omission is a
+failure.
+
 Recommended tolerances:
 
 - exact id and kind match for expected entities;
 - exact `src`, `type`, and `dst` match for expected relationships;
 - confidence may differ by a small tolerance, such as `0.05`;
 - alternatives and missing attributes should match by id/name, not array order;
+- discriminator values should match by JSON value, with JSON arrays compared as
+  order-independent sets when the fixture uses an array to represent multiple
+  equivalent observed values;
 - relationship evidence should include at least one resolvable supporting ref
   when the gold relationship has evidence.
 
@@ -417,6 +535,13 @@ store.insert_record(StoredRecord {
 
 Relationship records should include both endpoints in their store `entities`
 field so entity selectors can find them.
+
+Fixture gold relationships use the tuple `src`, `type`, and `dst` as the
+comparison identity and do not need an `id`. If derived relationships are
+inserted into the hot store, the implementation should assign a deterministic
+store key from that tuple, for example
+`relationship:{src}|{type}|{dst}`, instead of requiring fixture authors to add
+relationship ids. Relationship evidence remains a separate list of source refs.
 
 This topic may add a query or inspection helper for tests, but it should not
 change `get_evidence_bundle` from fixture-backed output into generated evidence.

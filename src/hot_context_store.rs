@@ -372,6 +372,12 @@ impl HotContextStore {
         &self.records
     }
 
+    pub fn raw_source_records(&self) -> impl Iterator<Item = &StoredRecord> + '_ {
+        self.records
+            .iter()
+            .filter(|record| record.kind.is_raw_source())
+    }
+
     pub fn record_count(&self) -> usize {
         self.records.len()
     }
@@ -845,6 +851,20 @@ impl StoredRecord {
 }
 
 impl StoredRecordKind {
+    pub fn is_raw_source(self) -> bool {
+        matches!(
+            self,
+            StoredRecordKind::Resource
+                | StoredRecordKind::Trace
+                | StoredRecordKind::Span
+                | StoredRecordKind::MetricSeries
+                | StoredRecordKind::Log
+                | StoredRecordKind::Change
+                | StoredRecordKind::PriorIncident
+                | StoredRecordKind::TelemetryGap
+        )
+    }
+
     fn ref_category(self) -> Option<RefCategory> {
         match self {
             StoredRecordKind::Resource => Some(RefCategory::Resource),

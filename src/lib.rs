@@ -1,3 +1,4 @@
+pub mod entity_context;
 pub mod evidence;
 pub mod fixture_simulator;
 pub mod fixture_validation;
