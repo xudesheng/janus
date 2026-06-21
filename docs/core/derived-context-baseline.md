@@ -69,6 +69,18 @@ Milestone 5B and whether the comparison contract below is strict enough. If a
 reviewer wants implementation in phases, their verdict must name the approved
 phase.
 
+The first review round should resolve these design decisions before any coding:
+
+- whether Milestone 5B should be approved as one whole implementation topic or
+  only phase by phase;
+- whether `non-causal-change` belongs in the Milestone 5B timeline output, or
+  should be held until the evidence compiler can classify nearby changes;
+- whether the derived provenance contract below is strong enough even where
+  current fixture gold shapes do not expose explicit `source_refs`;
+- whether stable natural-language timeline text is acceptable for the current
+  corpus, or whether the timeline payload should become more structured before
+  implementation.
+
 ## Scope
 
 In scope:
@@ -157,8 +169,7 @@ Exact Rust names are flexible. The required contract is:
 - every derived object is source-backed;
 - ids are deterministic for the same fixture input;
 - time ordering is stable;
-- source refs resolve through existing reference rules where the artifact shape
-  has a source field;
+- source refs resolve through existing reference rules;
 - confidence fields describe derivation quality, not causal confidence;
 - missing data reduces confidence or appears as a data-gap timeline marker.
 
@@ -176,6 +187,34 @@ struct WindowComparison {
     deltas: Vec<WindowDelta>,
 }
 ```
+
+### Provenance Contract
+
+Fixture gold shapes are the comparison target, but they are not always the full
+runtime shape Janus needs. The implementation may therefore carry additional
+provenance fields in derived outputs or store envelopes, as long as serialized
+comparison can still match the fixture artifacts.
+
+Minimum provenance expectations:
+
+- anomaly windows point back to the metric series and any telemetry gap records
+  that affected the window or confidence;
+- log patterns point back to representative log exemplar ids, and those
+  exemplar ids resolve through the hot store;
+- timeline events carry one scalar `source_ref` that resolves to the source or
+  derived artifact represented by the event;
+- the scalar timeline `source_ref` is the fixture-compatible projection, not
+  necessarily the full runtime provenance set;
+- related anomalies point back to the seed anomaly, related anomaly windows,
+  and relationship or prior-incident refs when those inputs explain the
+  relation label;
+- window comparisons point back to the compared metric series and selected
+  healthy/anomalous windows.
+
+If a fixture gold artifact lacks a provenance field, comparison should still
+verify provenance on the derived runtime object before projecting it into the
+fixture-compatible shape. A derived object without inspectable provenance is not
+acceptable just because the current gold JSON can be matched without it.
 
 ## Anomaly Windows
 
@@ -277,7 +316,8 @@ Input event candidates:
 
 Timeline rules:
 
-- sort by timestamp, marker priority, entity id, and source ref;
+- sort by timestamp minute bucket, marker priority, exact timestamp, entity id,
+  and source ref;
 - use the earliest relevant time for each artifact;
 - avoid duplicate events that say the same thing about the same source ref;
 - keep text deterministic and compact;
@@ -285,14 +325,41 @@ Timeline rules:
 
 Boundary:
 
-- `non-causal-change` may be preserved when the fixture has explicit timing and
-  counter-evidence, such as a change after incident onset;
+- `non-causal-change` may be emitted only by a named
+  `timeline_non_causal_after_onset_rule`;
+- that rule may mark a change as `non-causal-change` only when the change
+  timestamp is strictly after the earliest derived symptom or anomaly onset for
+  the active incident, and the changed entity is not already on the derived
+  symptom or propagation path at that time;
+- if the active incident onset or path cannot be established from source-backed
+  derived context, the builder must emit an ordinary `change` marker instead of
+  guessing `non-causal-change`;
 - the timeline must not produce suspected-cause ranks or final causal labels;
 - final classification of nearby changes belongs to the evidence compiler.
 
+Slice 6 marker-assignment decision:
+
+- timeline event candidate selection remains intentionally corpus-bounded for
+  this milestone, because Janus does not yet have a general agent query surface
+  or evidence-ranking surface to decide which possible event candidates are
+  worth emitting;
+- anomaly marker assignment is no longer purely fixture-class hardcoding where
+  the current source context is strong enough: retry-source anomaly windows are
+  marked as `amplification` from resolved `retries` relationships, and dependent
+  latency/duration anomaly windows are marked as `propagation` only when a
+  downstream anomaly on a `calls`, `reads-from`, or `depends-on` relationship
+  starts strictly earlier;
+- all other anomaly windows remain `symptom` unless a named source-backed rule
+  assigns a narrower marker, so the false-causality fixtures do not turn every
+  dependency edge into propagation;
+- broad event selection and richer role assignment are tracked for the later
+  agent/evidence API milestone, after caller-provided questions and seeds exist.
+
 Comparison should check marker, entity, time, source ref, and stable text for
-the current corpus. If stable natural text proves too brittle, reviewers should
-approve a structured timeline payload before implementation broadens.
+the current corpus. Timeline text comparison should normalize insignificant
+whitespace and treat text as secondary to marker, entity, time, and source ref.
+If stable natural text proves too brittle, reviewers should approve a
+structured timeline payload before implementation broadens.
 
 ## Related Anomalies
 
@@ -317,6 +384,13 @@ Minimum behavior:
 - preserve a simple relation label such as `downstream-dependency`,
   `amplifier`, `load-amplification`, or `same-signature`;
 - preserve optional prior incident references when fixture data supports it.
+
+Current milestone boundary: because `find_related_anomalies` has no public
+caller-provided seed/query surface yet, the first implementation selects the
+seed deterministically from the fixture failure class and source-derived context.
+That selection is a placeholder for the later agent API; relationship traversal,
+lag calculation, and prior-incident matching remain source-driven derivation
+logic.
 
 This is relationship-aware retrieval, not causality ranking. A related anomaly
 can support, weaken, or remain neutral later; this topic only makes it
@@ -358,6 +432,8 @@ by entity and signal, with numeric tolerance for values and factors.
 Derived artifacts should be inserted into or exposed through the hot-store
 derived-record boundary:
 
+- `StoredRecordKind::Entity`;
+- `StoredRecordKind::Relationship`;
 - `StoredRecordKind::AnomalyWindow`;
 - `StoredRecordKind::LogPattern`;
 - `StoredRecordKind::TimelineEvent`;
@@ -366,6 +442,9 @@ derived-record boundary:
 
 Anomaly windows and log patterns already have source-ref categories. They must
 resolve through `SourceSignal::AnomalyWindow` and `SourceSignal::LogPattern`.
+Derived relationships must be inserted before relationship-backed related
+anomalies so `relationship:` provenance refs resolve through
+`SourceSignal::Relationship`.
 
 Timeline events, related anomalies, and window comparisons currently do not map
 to first-class `SourceSignal` variants. They still should be inspectable through
@@ -402,6 +481,12 @@ objects are allowed only when they are deterministic, source-backed, and do not
 contradict current gold. The comparison report must make extras visible so they
 can be reviewed.
 
+When a runtime object carries richer provenance than the fixture shape, the
+comparison should validate the runtime provenance first and then project the
+object into the fixture-compatible shape. For example, a timeline event may
+carry multiple provenance refs internally while matching one scalar
+`source_ref` in gold.
+
 The current corpus has mixed coverage:
 
 - all fixtures declare `anomaly-windows`;
@@ -412,6 +497,12 @@ The current corpus has mixed coverage:
 
 The comparison tests should follow those capability tags instead of requiring
 every artifact type from every fixture.
+
+If a fixture contains gold for an artifact whose capability tag is missing, the
+capability-projected comparison must surface that as undeclared gold coverage
+rather than silently comparing empty output against empty expected output. The
+fixture metadata should then be corrected, or the gold artifact should be
+removed if it is not meant to be exercised.
 
 ## Suggested Implementation Slices After Design Approval
 
@@ -432,7 +523,14 @@ Recommended slices:
 5. Related anomalies: connect anomaly windows through relationships and time,
    compare relation labels and lag.
 6. Final integration: insert derived records into the hot store, prove source
-   refs resolve where applicable, and run full-corpus comparison.
+   refs resolve where applicable, run full-corpus comparison, and generalize the
+   current supported timeline marker roles through entity/relationship/onset
+   context while keeping broader event selection as corpus-bounded milestone
+   scaffolding.
+
+Slice 1 should land and pass before the generator slices produce anomaly,
+pattern, timeline, related-anomaly, or comparison artifacts. The comparison
+shell is the guardrail against drifting fixture gold output.
 
 These are implementation slices only. The topic is complete only when the
 Definition Of Done below is met or reviewers explicitly narrow the milestone.
@@ -453,6 +551,9 @@ Add tests that prove:
 - missing-data fixtures lower confidence or produce data-gap markers;
 - false-causality trap fixtures preserve counter-evidence context without
   producing final root-cause ranks;
+- the `timeline_non_causal_after_onset_rule` has both a positive test for the
+  current coincidental-change fixture and a negative test proving the timeline
+  builder does not over-label nearby changes as non-causal;
 - `entity-resolver-confidence` tests continue to pass.
 
 Existing verification should continue to pass:

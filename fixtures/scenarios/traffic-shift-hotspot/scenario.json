@@ -22,6 +22,7 @@
     "entity-resolution",
     "relationship-building",
     "anomaly-windows",
+    "log-pattern-clustering",
     "evidence-ir",
     "get_evidence_bundle",
     "build_timeline",
