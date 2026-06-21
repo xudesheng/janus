@@ -4,12 +4,15 @@ use janus::{
         EvidenceCandidateSource, EvidenceCompileError, EvidenceCompilerInput, NextCheck,
         SuspectedCause, apply_compiler_token_estimates, canonical_evidence_item_payload_json_bytes,
         compare_compiled_evidence, compare_compiled_evidence_for_case, compile_evidence,
-        estimate_evidence_item_tokens, generate_evidence_candidates, load_expected_compilation,
-        rank_suspected_causes_from_candidates, score_evidence_candidates,
+        estimate_evidence_item_tokens, generate_evidence_candidates, insert_evidence_compilation,
+        load_expected_compilation, rank_suspected_causes_from_candidates,
+        score_evidence_candidates,
     },
     fixture_simulator::{plan_fixture_replay, replay_plan_into_store},
     fixture_validation::{FixtureCorpus, FixtureSelector},
-    hot_context_store::{HotContextStore, SourceResolution},
+    hot_context_store::{
+        HotContextStore, HotStoreError, SourceQuery, SourceResolution, StoredRecordKind,
+    },
     query::{EvidenceQuery, EvidenceQueryBudget, EvidenceQueryIntent, FreshnessPreference},
 };
 use std::collections::BTreeSet;
@@ -528,6 +531,100 @@ fn compile_evidence_counter_requirement_errors_when_budget_cannot_fit_counter() 
             assert_eq!(requirement, "counter_evidence");
         }
         other => panic!("expected counter_evidence requirement error, got {other:?}"),
+    }
+}
+
+#[test]
+fn compile_evidence_generates_deterministic_next_checks() {
+    let case = fixture_case("missing-data-gap");
+    let query = query_for_case(&case);
+    let mut store = raw_fixture_store(&case);
+    let derived = derive_and_insert_context(&case, &mut store).unwrap();
+
+    let first = compile_evidence(&query, &store, &derived).unwrap();
+    let second = compile_evidence(&query, &store, &derived).unwrap();
+
+    assert_eq!(first.next_checks, second.next_checks);
+    assert!(!first.next_checks.is_empty());
+    assert!(first.next_checks.len() <= 3);
+    assert!(first.next_checks.iter().all(|check| {
+        !check.action.trim().is_empty()
+            && !check.rationale.trim().is_empty()
+            && !check.expected_signal.trim().is_empty()
+    }));
+    assert!(
+        first
+            .next_checks
+            .iter()
+            .any(|check| check.expected_signal == "metric_anomaly"
+                && check.action.starts_with("Backfill or query")),
+        "missing-data compilation should recommend a check to recover missing metric evidence: {:#?}",
+        first.next_checks
+    );
+}
+
+#[test]
+fn insert_evidence_compilation_writes_derived_records_without_raw_pollution() {
+    let case = fixture_case("deploy-bad-rollout");
+    let query = query_for_case(&case);
+    let mut store = raw_fixture_store(&case);
+    let derived = derive_and_insert_context(&case, &mut store).unwrap();
+    let raw_count = store.raw_source_records().count();
+    let compilation = compile_evidence(&query, &store, &derived).unwrap();
+
+    insert_evidence_compilation(&mut store, &compilation).unwrap();
+
+    assert_eq!(store.raw_source_records().count(), raw_count);
+
+    let evidence_records = store.select(SourceQuery {
+        kinds: vec![StoredRecordKind::EvidenceItem],
+        ..Default::default()
+    });
+    let suspected_cause_records = store.select(SourceQuery {
+        kinds: vec![StoredRecordKind::SuspectedCause],
+        ..Default::default()
+    });
+    let next_check_records = store.select(SourceQuery {
+        kinds: vec![StoredRecordKind::NextCheck],
+        ..Default::default()
+    });
+
+    assert_eq!(evidence_records.len(), compilation.bundle.items.len());
+    assert_eq!(
+        suspected_cause_records.len(),
+        compilation.suspected_causes.len()
+    );
+    assert_eq!(next_check_records.len(), compilation.next_checks.len());
+
+    for (record, item) in evidence_records.iter().zip(compilation.bundle.items.iter()) {
+        assert_eq!(record.key.as_str(), item.id);
+        assert_eq!(record.time_window.as_ref(), Some(&item.time_window));
+        let payload: janus::evidence::EvidenceItem =
+            serde_json::from_value(record.payload.clone()).unwrap();
+        assert_eq!(payload, *item);
+    }
+
+    assert_eq!(suspected_cause_records[0].key.as_str(), "suspected-cause:1");
+    assert_eq!(next_check_records[0].key.as_str(), "next-check:1");
+}
+
+#[test]
+fn insert_evidence_compilation_rejects_duplicate_compiled_record_keys() {
+    let case = fixture_case("deploy-bad-rollout");
+    let query = query_for_case(&case);
+    let mut store = raw_fixture_store(&case);
+    let derived = derive_and_insert_context(&case, &mut store).unwrap();
+    let compilation = compile_evidence(&query, &store, &derived).unwrap();
+
+    insert_evidence_compilation(&mut store, &compilation).unwrap();
+    let error = insert_evidence_compilation(&mut store, &compilation).unwrap_err();
+
+    match error {
+        HotStoreError::DuplicatePrimaryKey { kind, key, .. } => {
+            assert_eq!(kind, StoredRecordKind::EvidenceItem);
+            assert_eq!(key.as_str(), "ev-1");
+        }
+        other => panic!("expected duplicate compiled evidence key, got {other:?}"),
     }
 }
 

@@ -6,7 +6,9 @@ use crate::{
         EvidenceKind, SourceRef, SourceRefs, SourceSignal, TimeWindow, UnitInterval,
     },
     fixture_validation::FixtureCase,
-    hot_context_store::{HotContextStore, SourceResolution, StoredRecord, StoredRecordKind},
+    hot_context_store::{
+        HotContextStore, HotStoreError, SourceKey, SourceResolution, StoredRecord, StoredRecordKind,
+    },
     query::EvidenceQuery,
     references::metric_series_ref,
 };
@@ -237,8 +239,12 @@ pub fn compile_evidence(
     };
     let candidates = generate_evidence_candidates(input)?;
     let suspected_causes = rank_suspected_causes_from_candidates(input, &candidates);
+    let mut compilation = select_evidence_compilation(input, candidates, suspected_causes)?;
 
-    select_evidence_compilation(input, candidates, suspected_causes)
+    compilation.next_checks =
+        suggest_next_checks(input, &compilation.bundle, &compilation.suspected_causes);
+
+    Ok(compilation)
 }
 
 pub fn load_expected_compilation(
@@ -532,6 +538,310 @@ pub fn select_evidence_compilation(
     })
 }
 
+pub fn suggest_next_checks(
+    input: EvidenceCompilerInput<'_>,
+    bundle: &EvidenceBundle,
+    suspected_causes: &[SuspectedCause],
+) -> Vec<NextCheck> {
+    let mut drafts = Vec::<NextCheckDraft>::new();
+
+    if let Some(item) = bundle.items.iter().find(|item| is_missing_data_item(item)) {
+        push_next_check_draft(
+            &mut drafts,
+            0,
+            NextCheck {
+                action: format!(
+                    "Backfill or query {} for {} during {} to {}.",
+                    missing_data_label(item),
+                    entity_label(&item.entities),
+                    input.query.time_window.start,
+                    input.query.time_window.end
+                ),
+                rationale: "The selected evidence marks this signal as missing; recovering it can confirm or reject the current hypothesis.".to_string(),
+                expected_signal: missing_data_expected_signal(item).to_string(),
+            },
+        );
+    }
+
+    if let Some(cause) = suspected_causes
+        .iter()
+        .find(|cause| cause.trap_note.is_some() || !cause.counter.is_empty())
+        && let Some(item) = first_linked_item(bundle, &cause.counter)
+    {
+        push_next_check_draft(
+            &mut drafts,
+            1,
+            NextCheck {
+                action: format!(
+                    "Validate counter-evidence {} before mitigating {}.",
+                    item.id, cause.entity
+                ),
+                rationale: format!(
+                    "{} has selected counter-evidence; checking it first reduces false-causality risk.",
+                    cause.entity
+                ),
+                expected_signal: counter_check_expected_signal(item).to_string(),
+            },
+        );
+    }
+
+    if let Some(cause) = suspected_causes.first() {
+        if cause.score.0 < 0.45 {
+            push_next_check_draft(
+                &mut drafts,
+                2,
+                NextCheck {
+                    action: format!(
+                        "Gather an independent signal for {} before treating it as causal.",
+                        cause.entity
+                    ),
+                    rationale: format!(
+                        "The top suspected-cause score is {:.2}; another signal should discriminate between hypotheses.",
+                        cause.score.0
+                    ),
+                    expected_signal: "compare_windows".to_string(),
+                },
+            );
+        }
+
+        if let Some(item) =
+            first_linked_item(bundle, &cause.supporting).or_else(|| strongest_support_item(bundle))
+        {
+            push_next_check_draft(
+                &mut drafts,
+                3,
+                NextCheck {
+                    action: format!(
+                        "Confirm {} by re-checking {} evidence {}.",
+                        cause.entity,
+                        evidence_kind_label(item.kind),
+                        item.id
+                    ),
+                    rationale: format!(
+                        "The selected evidence is linked to the top suspected cause with score {:.2}.",
+                        cause.score.0
+                    ),
+                    expected_signal: next_check_expected_signal(item).to_string(),
+                },
+            );
+        }
+    }
+
+    if drafts.is_empty()
+        && let Some(item) = bundle.items.first()
+    {
+        push_next_check_draft(
+            &mut drafts,
+            4,
+            NextCheck {
+                action: format!(
+                    "Inspect the strongest selected evidence {} for {}.",
+                    item.id,
+                    entity_label(&item.entities)
+                ),
+                rationale:
+                    "The compiler selected this item as high-value evidence under the token budget."
+                        .to_string(),
+                expected_signal: next_check_expected_signal(item).to_string(),
+            },
+        );
+    }
+
+    drafts.sort_by(|left, right| {
+        left.priority
+            .cmp(&right.priority)
+            .then_with(|| left.check.expected_signal.cmp(&right.check.expected_signal))
+            .then_with(|| left.check.action.cmp(&right.check.action))
+    });
+
+    drafts
+        .into_iter()
+        .map(|draft| draft.check)
+        .take(3)
+        .collect()
+}
+
+pub fn insert_evidence_compilation(
+    store: &mut HotContextStore,
+    compilation: &EvidenceCompilation,
+) -> Result<(), HotStoreError> {
+    for item in &compilation.bundle.items {
+        store.insert_record(StoredRecord {
+            key: SourceKey::new(item.id.clone()),
+            kind: StoredRecordKind::EvidenceItem,
+            time_window: Some(item.time_window.clone()),
+            entities: item.entities.clone(),
+            payload: serde_json::to_value(item).expect("evidence item should serialize"),
+        })?;
+    }
+
+    for cause in &compilation.suspected_causes {
+        store.insert_record(StoredRecord {
+            key: SourceKey::new(format!("suspected-cause:{}", cause.rank)),
+            kind: StoredRecordKind::SuspectedCause,
+            time_window: Some(compilation.bundle.time_window.clone()),
+            entities: suspected_cause_record_entities(cause),
+            payload: serde_json::to_value(cause).expect("suspected cause should serialize"),
+        })?;
+    }
+
+    let next_check_entities = compilation_entities(compilation);
+    for (index, check) in compilation.next_checks.iter().enumerate() {
+        store.insert_record(StoredRecord {
+            key: SourceKey::new(format!("next-check:{}", index + 1)),
+            kind: StoredRecordKind::NextCheck,
+            time_window: Some(compilation.bundle.time_window.clone()),
+            entities: next_check_entities.clone(),
+            payload: serde_json::to_value(check).expect("next check should serialize"),
+        })?;
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct NextCheckDraft {
+    priority: u8,
+    check: NextCheck,
+}
+
+fn push_next_check_draft(drafts: &mut Vec<NextCheckDraft>, priority: u8, check: NextCheck) {
+    if drafts.iter().any(|draft| {
+        draft.check.expected_signal == check.expected_signal && draft.check.action == check.action
+    }) {
+        return;
+    }
+
+    drafts.push(NextCheckDraft { priority, check });
+}
+
+fn first_linked_item<'a>(bundle: &'a EvidenceBundle, ids: &[String]) -> Option<&'a EvidenceItem> {
+    ids.iter()
+        .find_map(|id| bundle.items.iter().find(|item| item.id == *id))
+}
+
+fn strongest_support_item(bundle: &EvidenceBundle) -> Option<&EvidenceItem> {
+    bundle
+        .items
+        .iter()
+        .filter(|item| item.direction == EvidenceDirection::Supports)
+        .max_by(|left, right| {
+            left.strength
+                .0
+                .total_cmp(&right.strength.0)
+                .then_with(|| right.id.cmp(&left.id))
+        })
+}
+
+fn is_missing_data_item(item: &EvidenceItem) -> bool {
+    item.kind == EvidenceKind::MissingData
+        || !item.missing_data.is_empty()
+        || has_source_signal(item, SourceSignal::TelemetryGap)
+}
+
+fn missing_data_label(item: &EvidenceItem) -> String {
+    item.missing_data
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "missing telemetry".to_string())
+}
+
+fn entity_label(entities: &[String]) -> String {
+    if entities.is_empty() {
+        "the selected entity".to_string()
+    } else {
+        entities.join(", ")
+    }
+}
+
+fn missing_data_expected_signal(item: &EvidenceItem) -> &'static str {
+    let text = item
+        .missing_data
+        .iter()
+        .chain(std::iter::once(&item.claim))
+        .map(|value| value.to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if text.contains("log") {
+        "log_cluster"
+    } else if text.contains("change") || text.contains("deploy") || text.contains("config") {
+        "change_event"
+    } else {
+        "metric_anomaly"
+    }
+}
+
+fn counter_check_expected_signal(item: &EvidenceItem) -> &'static str {
+    if has_source_signal(item, SourceSignal::Relationship) {
+        "relationship"
+    } else if has_source_signal(item, SourceSignal::Change)
+        || item.kind == EvidenceKind::ChangeEvent
+    {
+        "change_event"
+    } else if has_source_signal(item, SourceSignal::Metric) {
+        "compare_windows"
+    } else if has_source_signal(item, SourceSignal::Log) {
+        "log_cluster"
+    } else {
+        "compare_windows"
+    }
+}
+
+fn next_check_expected_signal(item: &EvidenceItem) -> &'static str {
+    match item.kind {
+        EvidenceKind::MetricAnomaly => "metric_anomaly",
+        EvidenceKind::TraceExemplar => "trace",
+        EvidenceKind::LogCluster => "log_cluster",
+        EvidenceKind::ChangeEvent => "change_event",
+        EvidenceKind::DependencyEdge => "relationship",
+        EvidenceKind::ProfileHotspot => "profile_hotspot",
+        EvidenceKind::PreviousIncident => "find_related_anomalies",
+        EvidenceKind::CounterEvidence => counter_check_expected_signal(item),
+        EvidenceKind::MissingData => missing_data_expected_signal(item),
+    }
+}
+
+fn evidence_kind_label(kind: EvidenceKind) -> &'static str {
+    match kind {
+        EvidenceKind::MetricAnomaly => "metric anomaly",
+        EvidenceKind::TraceExemplar => "trace exemplar",
+        EvidenceKind::LogCluster => "log cluster",
+        EvidenceKind::ChangeEvent => "change event",
+        EvidenceKind::DependencyEdge => "dependency",
+        EvidenceKind::ProfileHotspot => "profile hotspot",
+        EvidenceKind::PreviousIncident => "previous incident",
+        EvidenceKind::CounterEvidence => "counter-evidence",
+        EvidenceKind::MissingData => "missing-data",
+    }
+}
+
+fn suspected_cause_record_entities(cause: &SuspectedCause) -> Vec<String> {
+    if cause.entity == "under-determined" {
+        Vec::new()
+    } else {
+        vec![cause.entity.clone()]
+    }
+}
+
+fn compilation_entities(compilation: &EvidenceCompilation) -> Vec<String> {
+    dedupe_stable(
+        compilation
+            .bundle
+            .items
+            .iter()
+            .flat_map(|item| item.entities.iter().cloned())
+            .chain(
+                compilation
+                    .suspected_causes
+                    .iter()
+                    .filter(|cause| cause.entity != "under-determined")
+                    .map(|cause| cause.entity.clone()),
+            )
+            .collect(),
+    )
+}
+
 fn required_counter_evidence_count(query: &EvidenceQuery) -> u32 {
     if query.require_counter_evidence {
         query.budget.min_counter_evidence_items.unwrap_or(1).max(1)
@@ -562,7 +872,10 @@ fn sorted_candidates_for_cause<'a>(
 ) -> Vec<&'a EvidenceCandidate> {
     let mut matches = candidates
         .iter()
-        .filter(|candidate| candidate_mentions_cause(candidate, cause_entity))
+        .filter(|candidate| {
+            candidate.item.direction == EvidenceDirection::Supports
+                && candidate_mentions_cause(candidate, cause_entity)
+        })
         .collect::<Vec<_>>();
     matches.sort_by(|left, right| compare_candidate_selection_order(left, right));
     matches

@@ -539,6 +539,21 @@ Examples:
 - avoid rolling back an innocent service when flat metrics and timing contradict
   the deploy hypothesis.
 
+Slice 5 exposes `suggest_next_checks(input, bundle, suspected_causes)` through
+`compile_evidence`. The generator is deterministic and derives checks only from
+selected evidence, suspected-cause links, counter-evidence, and missing-data
+state. It emits at most three checks in priority order:
+
+1. recover or inspect selected missing-data evidence;
+2. validate selected counter-evidence for false-causality risks;
+3. confirm the top suspected cause, or gather another independent signal when
+   the top score is weak.
+
+`expected_signal` remains an exact category token. The V1 vocabulary includes
+tokens such as `metric_anomaly`, `log_cluster`, `change_event`,
+`compare_windows`, `relationship`, `find_related_anomalies`, `profile_hotspot`,
+and `trace`.
+
 ## Token Budget Selection
 
 Token budget is a query constraint, not a presentation detail.
@@ -708,6 +723,11 @@ Comparison mode must be explicit per field family:
   comparison shell treats text-structural equality as non-empty required text
   plus tracked non-blocking text differences.
 
+Before Slice 6 makes selected evidence items gold-gated, the project must
+confirm whether selected item ids and ordering remain exact comparison targets
+or move to a structural presence/order check. This decision should be explicit
+so final selection does not become fixture-tuned by accident.
+
 The comparison must fail if:
 
 - selected evidence uses missing or unresolved source refs;
@@ -738,6 +758,13 @@ Minimum expectations:
 - source refs inside evidence items continue to resolve through the store;
 - store insertion is optional only if a reviewer approves an equivalent
   inspectable compiler result path.
+
+Slice 5 exposes `insert_evidence_compilation(store, compilation)`. It inserts
+selected evidence items, suspected causes, and next checks through
+`HotContextStore::insert_record` using the store's derived-record kinds. These
+records are selectable and inspectable, but `StoredRecordKind::is_raw_source`
+continues to exclude them, so compiled output does not pollute raw source
+records.
 
 ## Implementation Slices After Design Approval
 
@@ -770,7 +797,8 @@ Recommended slices:
    next checks, insert compiled records, or route `get_evidence_bundle`.
 5. Next checks and store integration: generate deterministic next checks and
    insert evidence, suspected-cause, and next-check records without polluting
-   raw source records.
+   raw source records. This slice does not route `get_evidence_bundle` through
+   the compiler.
 6. `get_evidence_bundle` integration and full-corpus verification: route the
    public query path through compiled evidence while preserving the existing
    query validation, budget, raw-ref, counter-evidence, source-ref, and
