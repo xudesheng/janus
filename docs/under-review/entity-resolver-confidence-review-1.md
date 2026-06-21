@@ -106,3 +106,113 @@ serde, relationship key formatting, and raw-source isolation. Fixture validation
 reported 12 fixtures, 0 errors, and 0 warnings.
 
 <!-- Reviewer appends below; the Implementor must not edit past this line. -->
+
+## Review (by Claude (Opus 4.8))
+
+### Direction Verdict
+
+On critical path: **yes**. This is the approved Phase 1 slice (data model + store
+read boundary), and review 0 cleared exactly this.
+
+Milestone progress: **real and positive — judged before local defects.** I
+verified the work independently rather than trusting the summary:
+
+- All three blocking review-0 tightenings are now correctly pinned in
+  `docs/core/entity-resolver-confidence.md`: the `@canary/@stable/@unresolved`
+  variant-token rule (including the two-stable-resources merge), the
+  required-fixture set with no pre-approved exemptions, and bands-as-defaults
+  with values that must hit within tolerance of the concrete gold confidence.
+  The three recommended ones (structural raw-source boundary, set-wise
+  discriminator comparison, opaque relationship store key) are in too.
+- The Phase 1 model (`src/entity_context.rs`) is well-built: `UnitInterval`
+  enforces the `0.0–1.0` confidence bound structurally, `relationship_type`
+  renames to JSON `type`, empties are skipped, and `deny_unknown_fields` will
+  catch schema drift. The store boundary (`raw_source_records()` +
+  `is_raw_source()`) is exactly the structural protection review 0 asked for,
+  and `raw_source_records_exclude_expected_derived_records` genuinely proves it
+  (loads the full fixture case, confirms gold `Entity`/`AnomalyWindow` records
+  are present, then confirms the raw boundary excludes them).
+- Scope discipline holds: no resolver, relationship builder, comparison helper,
+  CLI, or out-of-scope subsystem was added.
+- Verification reproduced locally: `cargo test` (all suites pass, including the 5
+  new `tests/entity_context.rs` tests), `cargo clippy --all-targets
+  --all-features` clean, `cargo fmt --check` clean, `validate_fixtures` reports
+  12 fixtures with no errors.
+
+Process/baseline compliance is correct: baseline `ac77fec` is pushed, is an
+ancestor of HEAD, and is the pre-review-document tree (HEAD adds only this review
+doc); covered code and design-doc edits were pushed before the review document as
+their own commit.
+
+Verdict: **continue.** Phase 1 is substantially delivered and the direction is
+right. But there is one concrete defect that defeats the round's own "right
+stable shape for current fixtures" claim (review focus #2), and the passing serde
+tests gave false confidence because they exercise only the `service` kind. I
+approve proceeding to **Phase 2 (entity resolver)** on the condition that the
+model/vocabulary correction in finding 1 (and the design correction in finding 2)
+lands first or together with it — both are squarely Phase 1 "data model" scope and
+cheap. Phase 3 (relationship builder) remains cleared to follow once Phase 2
+lands, as review 0 set up.
+
+### Finding 1 — `EntityKind` cannot represent 7/12 fixtures' gold kinds (must fix before Phase 2)
+
+The gold `expected.json` `entities[].kind` vocabulary across the corpus is:
+`service, route, pod, host, tenant, cache, external-api, database, partition`.
+The Phase 1 `EntityKind` enum (`src/entity_context.rs:51`) instead has `Db`
+(serializes `"db"`) and `Shard` (`"shard"`) and has **no `Database` or
+`Partition` variant**. With `#[serde(rename_all = "kebab-case")]` and no alias/
+`other`, deserializing a gold entity with `"kind": "database"` or `"partition"`
+**fails** ("unknown variant"). This hits:
+
+- `database`: `coincidental-deploy-trap`, `dependency-db-degradation`,
+  `deploy-bad-rollout`, `missing-data-gap`, `recurring-incident-memory`,
+  `schema-migration-errors` (6 fixtures);
+- `partition`: `traffic-shift-hotspot`.
+
+Equally, the Phase 4 "exact kind match" rule fails the other direction: a
+resolver that emits `EntityKind::Db` serializes `"db"`, which never equals the
+gold `"database"`. The existing tests passed only because
+`ambiguous-entity-resolution` uses kind `service` exclusively.
+
+Fix: align the `EntityKind` serialization vocabulary with the gold **kind** words
+(`database`, `partition`, ...), not the id-prefix words. Then add a serde
+round-trip test that loads **every** fixture's gold `entities` and
+`relationships` into the model — this is also exactly the coverage the now-pinned
+Phase 4 required-fixture set will need, and it would have caught this.
+
+### Finding 2 — design's `{kind}:{name}` id rule is contradicted by the gold (design correction)
+
+`docs/core/entity-resolver-confidence.md` states entity ids follow
+`{kind}:{name}`, implying the id prefix equals the kind. The gold decouples them:
+
+- `kind: "database"` -> id `db:orders-pg` (prefix `db`, not `database`);
+- `kind: "partition"` -> id `shard:orders-shard-3` (prefix `shard`);
+- `kind: "cache"` -> id prefix `db:` (`resource-exhaustion-memory`) **and**
+  `infra:` (`coincidental-deploy-trap`).
+
+So id-prefix is a separate, shorter namespace token from kind, and one kind can
+take multiple prefixes. Because Phase 4 requires exact id **and** exact kind
+match, Phase 2 must emit both correctly. Document the id-prefix↔kind mapping
+explicitly in the identity-rules section (the current `db:<name>` / `shard:` /
+`cache:`-or-`infra:` prose already hints at it but never states that the id
+prefix is not the kind). This unblocks Phase 2 from guessing.
+
+### Finding 3 — `Owns` relationship variant is off-vocabulary (minor, non-blocking)
+
+`RelationshipType::Owns` (`src/entity_context.rs:76`) is not in the design's
+minimum relationship list, and the design explicitly defers ownership ("Do not
+infer ownership... Ownership and root-cause ranking belong later"). No current
+fixture uses `owns` (or `emits`). For a Phase 1 "stable shape," reconcile: either
+add `owns` to the design's relationship vocabulary or drop the variant. `emits`
+is fine — it is in the design's minimum list even though unused today.
+
+### Answers to the round's review-focus questions
+
+1. Review-0 tightenings captured in the design: **yes**, all six, correctly.
+2. Right stable shape for current fixtures: **not yet** — finding 1 (kind
+   vocabulary) and finding 2 (id convention) must land first.
+3. `raw_source_records()` / `is_raw_source()` enough structural protection:
+   **yes** — this is the strongest part of the round.
+4. Relationship store key acceptable as opaque key: **yes**.
+5. Proceed to Phase 2, Phase 3 after: **yes**, conditioned on findings 1–2
+   landing with Phase 2; Phase 3 stays cleared to follow.
