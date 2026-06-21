@@ -127,3 +127,123 @@ All checks passed on the baseline commit:
 Fixture validation reported `0 error(s), 0 warning(s)`.
 
 <!-- Reviewer appends below; the Implementor must not edit past this line. -->
+
+## Review (by Claude (Opus 4.8))
+
+### Direction Verdict
+
+Implementation round (Slice 5: next-check generation + store insertion).
+
+**On critical path: yes. Milestone progress: real and verified. Next action:
+continue to Slice 6 — but Slice 6 is now a hard gate: the D-OVERFIT structural
+ranking refactor and the selected-output comparison decision MUST land in or
+before it. D-OVERFIT has now been deferred across two consecutive rounds; a
+third deferral cannot be accepted under the review framework.**
+
+Slice 5 delivers the approved scope cleanly:
+
+- **`suggest_next_checks` is deterministic and source-derived.** It reads only
+  selected bundle items + suspected causes (never gold), emits ≤3 checks in a
+  sensible priority order (missing-data recovery → counter-evidence validation →
+  top-cause confirmation / weak-score discrimination), and — unlike the
+  suspected-cause reason tokens — derives `expected_signal` structurally from
+  `EvidenceKind` rather than from hardcoded fixture names. That is the right
+  pattern.
+- **Store insertion is correct and non-polluting.** `insert_evidence_compilation`
+  writes `ev-N` / `suspected-cause:<rank>` / `next-check:<n>` records via
+  `insert_record`, the test confirms `raw_source_records().count()` is unchanged,
+  evidence payloads round-trip back to `EvidenceItem`, and duplicate keys are
+  rejected with `DuplicatePrimaryKey`. Inspectability through the existing store
+  boundary is achieved as the design requires.
+- **The review-5 note is addressed:** `sorted_candidates_for_cause` now filters
+  to `Supports`, so the top-cause preservation step can no longer be satisfied by
+  an already-selected counter item.
+
+I ran the gate on baseline `040fff3`: `cargo fmt --check` clean, `cargo clippy
+--all-targets --all-features` clean, `cargo test` all green (`evidence_compiler`
+now 22 tests, +3), `cargo run --bin validate_fixtures` reports `0 error(s), 0
+warning(s)`.
+
+### Deferral tracking — D-OVERFIT is at its limit (this is the binding constraint)
+
+Per the framework, the same milestone-critical item cannot be deferred more than
+twice consecutively. The D-OVERFIT structural ranking refactor (replace
+`entity_causal_multiplier`'s entity-name multipliers with structural signals;
+derive reason tokens from structured source content) was deferred in round 5
+(#1) and remains undone in round 6 (#2). Both deferrals were reviewer-approved as
+orthogonal scope with a stated deadline of "before/with Slice 6." That deadline
+is now binding: **Slice 6 must perform the refactor — it cannot be pushed to a
+Slice 7.** I will not approve a round that routes `get_evidence_bundle` through
+the compiler while the causal layer is still entity-name-keyed.
+
+### The Slice 6 comparison decision now covers THREE artifacts, not one
+
+Review 5 flagged that selected `items` (ids + ordering) face the same
+exact-vs-structural tension as `reasons`. Slice 5 makes clear the decision spans
+all three gold-gated artifacts, and I now have data on each:
+
+- **Selected items:** Exact ids + ordering vs structural presence/order
+  (undecided; the selector's `candidate_selection_group` order is unverified
+  against gold).
+- **Suspected causes:** `reasons` already relaxed to subset, but `rank`,
+  `entity`, `supporting`, `counter`, and `score` are still exact/tolerance — and
+  the entity-name ranking that produces them is the D-OVERFIT overfit.
+- **Next checks:** compared positionally with **exact** `expected_signal`. The
+  compiler's `expected_signal` vocabulary does not cover gold: gold uses
+  `code_change` (1×) and `entity-resolution` (1×), which the compiler never
+  emits (it emits `change_event`), and the compiler's own 3 checks in its own
+  priority order will not positionally align with hand-authored gold checks.
+
+So Slice 6 must make one explicit comparison decision covering all three. My
+recommendation, consistent with the D-OVERFIT resolution: judge by **structural
+outcomes** — for items, the key support and counter items are present and ordered
+by the documented group rule; for suspected causes, the true cause ranks #1 with
+innocents low and trap-noted; for next checks, the right *category* of check is
+present (subset / structural `expected_signal`), not positional verbatim
+equality. Exact verbatim positional equality across hand-authored prose and
+vocabularies will force fixture tuning, which is the trap we already chose to
+avoid for `reasons`.
+
+### Answers to the implementor's reviewer-focus questions
+
+1. `suggest_next_checks` is the right V1 boundary; a single deterministic
+   generator over selected output is fine. No need to split into per-family
+   helpers now.
+2. The next-check priority order (missing-data → counter → top-cause
+   confirm/weak-score) is acceptable and matches the design's next-check
+   examples.
+3. Keep `insert_evidence_compilation` as a separate explicit step. Slice 6 may
+   add a thin compile-and-insert convenience for the `get_evidence_bundle` path,
+   but do not fuse compile+insert by default — callers may want compiled output
+   without store mutation.
+4. The derived-store keys and payloads are sufficient for inspectability:
+   per-kind selectable, full-payload round-trip, stable keys.
+5. **Slice 6 sequencing:** do the D-OVERFIT structural refactor and the
+   comparison decision **first** (a focused pre-routing step, or a diagnosis-only
+   sub-round), prove the corpus passes the chosen comparison, and only then flip
+   `get_evidence_bundle` to compiled output. Bundling them into one round is
+   acceptable only if the refactor and decision land before the routing flip.
+   Either way, no third deferral.
+
+**Approved next scope: Slice 6** — `get_evidence_bundle` integration and
+full-corpus verification, carrying (a) the D-OVERFIT structural ranking refactor
+and (b) the selected-items / suspected-causes / next-checks comparison decision.
+This is the final slice; after its review, if the Definition Of Done is met with
+no open feedback, the topic terminates rather than spawning an empty round.
+
+### Smaller note (low)
+
+- `insert_evidence_compilation` uses `.expect(...)` on `serde_json::to_value` for
+  the compiled structs. Safe in practice (plain `Serialize` structs, string
+  keys), but propagating a `HotStoreError`/serialization error would be tidier if
+  these types ever gain non-string-keyed maps. Non-blocking.
+
+### Verification
+
+Independently ran on baseline `040fff3`: `cargo fmt --check` (clean),
+`cargo clippy --all-targets --all-features` (clean), `cargo test` (all green,
+`evidence_compiler` 22 tests incl. the 3 new), `cargo run --bin validate_fixtures`
+(`0 error(s), 0 warning(s)`). Read the full Slice 5 diff and cross-checked the
+generated next-check `expected_signal` vocabulary against gold
+`next_checks[].expected_signal` across the corpus. Branch confirmed
+`evidence-compiler-ranking`.
