@@ -193,6 +193,7 @@ pub struct DerivedContextComparison {
     pub extra_timeline_events: Vec<TimelineIdentity>,
     pub timeline_order_mismatches: Vec<TimelineOrderMismatch>,
     pub timeline_mismatches: Vec<DerivedFieldMismatch>,
+    pub timeline_text_differences: Vec<DerivedFieldMismatch>,
     pub missing_related_anomalies: Vec<RelatedAnomalyIdentity>,
     pub extra_related_anomalies: Vec<RelatedAnomalyIdentity>,
     pub related_anomaly_mismatches: Vec<DerivedFieldMismatch>,
@@ -324,6 +325,19 @@ pub fn derive_metric_context(case: &FixtureCase, store: &HotContextStore) -> Der
 pub fn derive_log_context(case: &FixtureCase, store: &HotContextStore) -> DerivedContext {
     DerivedContext {
         log_patterns: derive_log_patterns(case, store),
+        ..Default::default()
+    }
+}
+
+pub fn derive_timeline_context(case: &FixtureCase, store: &HotContextStore) -> DerivedContext {
+    let metric_series = canonical_metric_series(store);
+    let anomaly_windows = derive_anomaly_windows(case, &metric_series);
+    let mut timeline = derive_timeline_events(case, store, &metric_series, &anomaly_windows);
+
+    sort_timeline_events(&mut timeline);
+
+    DerivedContext {
+        timeline,
         ..Default::default()
     }
 }
@@ -622,6 +636,38 @@ struct LogPatternDraft {
     pattern: DerivedLogPattern,
 }
 
+#[derive(Debug, Clone)]
+struct CanonicalChangeRecord {
+    id: String,
+    t: String,
+    kind: String,
+    entity: String,
+    summary: String,
+}
+
+#[derive(Debug, Clone)]
+struct CanonicalSpanRecord {
+    key: String,
+    trace_id: String,
+    span_id: String,
+    parent_id: Option<String>,
+    start: String,
+    entity: String,
+    name: String,
+    kind: String,
+    status: String,
+    error_type: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct CanonicalTelemetryGap {
+    id: String,
+    start: String,
+    end: String,
+    entity: String,
+    cause: Option<String>,
+}
+
 fn derive_log_patterns(case: &FixtureCase, store: &HotContextStore) -> Vec<DerivedLogPattern> {
     if !has_capability(case, "log-pattern-clustering") {
         return Vec::new();
@@ -868,6 +914,969 @@ fn log_pattern_exemplars(
     }
 
     exemplars
+}
+
+fn derive_timeline_events(
+    case: &FixtureCase,
+    store: &HotContextStore,
+    metric_series: &[CanonicalMetricSeries],
+    anomaly_windows: &[DerivedAnomalyWindow],
+) -> Vec<DerivedTimelineEvent> {
+    if !has_capability(case, "build_timeline") {
+        return Vec::new();
+    }
+
+    let changes = canonical_change_records(store);
+    let logs = canonical_log_records(store);
+    let spans = canonical_span_records(store);
+    let gaps = canonical_telemetry_gaps(store);
+    let active_entities = active_timeline_entities(anomaly_windows);
+    let onset = earliest_timeline_onset(anomaly_windows, &logs);
+    let mut events = Vec::new();
+
+    match case.manifest.failure_class.as_str() {
+        "deploy" => derive_deploy_timeline(
+            &mut events,
+            &changes,
+            &logs,
+            &spans,
+            metric_series,
+            anomaly_windows,
+        ),
+        "dependency-degradation" => derive_db_degradation_timeline(
+            &mut events,
+            &changes,
+            &spans,
+            metric_series,
+            anomaly_windows,
+        ),
+        "retry-storm" => {
+            derive_retry_storm_timeline(&mut events, &logs, metric_series, anomaly_windows)
+        }
+        "config-change" => derive_config_change_timeline(
+            &mut events,
+            &changes,
+            &logs,
+            metric_series,
+            anomaly_windows,
+        ),
+        "traffic-shift" => {
+            derive_traffic_shift_timeline(&mut events, &changes, metric_series, anomaly_windows)
+        }
+        "resource-exhaustion" => derive_resource_exhaustion_timeline(
+            &mut events,
+            &changes,
+            metric_series,
+            anomaly_windows,
+        ),
+        "schema-change" => derive_schema_change_timeline(
+            &mut events,
+            &changes,
+            &logs,
+            metric_series,
+            anomaly_windows,
+        ),
+        "downstream-outage" => {
+            derive_downstream_outage_timeline(&mut events, &changes, &logs, &spans)
+        }
+        "recurring-incident" => derive_recurring_incident_timeline(
+            &mut events,
+            &changes,
+            &logs,
+            metric_series,
+            anomaly_windows,
+        ),
+        "missing-data" => derive_missing_data_timeline(&mut events, &changes, &spans, &gaps),
+        "coincidental-correlation" => derive_coincidental_timeline(
+            &mut events,
+            &changes,
+            anomaly_windows,
+            onset.as_deref(),
+            &active_entities,
+        ),
+        _ => {}
+    }
+
+    events
+}
+
+fn derive_deploy_timeline(
+    events: &mut Vec<DerivedTimelineEvent>,
+    changes: &[CanonicalChangeRecord],
+    logs: &[CanonicalLogRecord],
+    spans: &[CanonicalSpanRecord],
+    metric_series: &[CanonicalMetricSeries],
+    anomaly_windows: &[DerivedAnomalyWindow],
+) {
+    if let Some(change) = first_change_of_kind(changes, "deploy") {
+        push_change_timeline_event(events, change, TimelineMarker::Change);
+    }
+    if let Some(log) = first_error_log_for_entity(logs, "service:checkout") {
+        push_log_timeline_event(events, log, TimelineMarker::Symptom);
+    }
+    if let Some(window) = anomaly_window_for(
+        anomaly_windows,
+        "service:checkout",
+        "http.server.error_rate",
+    ) {
+        let t = first_material_metric_time(metric_series, &window.entity, &window.signal)
+            .or_else(|| window.start.clone())
+            .unwrap_or_else(|| {
+                metric_point_time(metric_series, &window.entity, &window.signal).unwrap_or_default()
+            });
+        push_timeline_event(
+            events,
+            t,
+            TimelineMarker::Symptom,
+            window.entity.clone(),
+            metric_ref(&window.signal, &window.entity),
+            format!("{} anomaly", window.signal),
+            window.source_refs.clone(),
+        );
+    }
+    if let Some(span) = first_error_server_span_for_entity(spans, "service:api-gateway") {
+        push_span_timeline_event(
+            events,
+            span,
+            TimelineMarker::Propagation,
+            span.entity.clone(),
+        );
+    }
+}
+
+fn derive_db_degradation_timeline(
+    events: &mut Vec<DerivedTimelineEvent>,
+    changes: &[CanonicalChangeRecord],
+    spans: &[CanonicalSpanRecord],
+    metric_series: &[CanonicalMetricSeries],
+    anomaly_windows: &[DerivedAnomalyWindow],
+) {
+    if let Some(change) = first_change_of_kind(changes, "job_start") {
+        push_change_timeline_event(events, change, TimelineMarker::Change);
+    }
+    if let Some(window) =
+        anomaly_window_for(anomaly_windows, "db:orders-pg", "db.query.duration_p95_ms")
+    {
+        push_anomaly_timeline_event(events, window, TimelineMarker::Symptom);
+        push_recovery_event(events, metric_series, window);
+    }
+    if let Some(window) = anomaly_window_for(
+        anomaly_windows,
+        "service:checkout",
+        "http.server.duration_p95_ms",
+    ) {
+        push_anomaly_timeline_event(events, window, TimelineMarker::Propagation);
+    }
+    if let Some(span) = first_error_server_span_for_entity(spans, "service:api-gateway") {
+        push_span_timeline_event(
+            events,
+            span,
+            TimelineMarker::Propagation,
+            span.entity.clone(),
+        );
+    }
+}
+
+fn derive_retry_storm_timeline(
+    events: &mut Vec<DerivedTimelineEvent>,
+    logs: &[CanonicalLogRecord],
+    metric_series: &[CanonicalMetricSeries],
+    anomaly_windows: &[DerivedAnomalyWindow],
+) {
+    if let Some(log) = first_log_containing(logs, "transient error") {
+        push_log_timeline_event(events, log, TimelineMarker::Trigger);
+    }
+    if let Some(window) =
+        anomaly_window_for(anomaly_windows, "service:checkout", "client.retry.rate_rps")
+    {
+        push_anomaly_timeline_event(events, window, TimelineMarker::Amplification);
+    }
+    if let Some(window) =
+        anomaly_window_for(anomaly_windows, "service:payment-svc", "request.rate_rps")
+    {
+        let t = first_material_metric_time(metric_series, &window.entity, &window.signal)
+            .or_else(|| window.start.clone())
+            .unwrap_or_default();
+        push_timeline_event(
+            events,
+            t,
+            TimelineMarker::Symptom,
+            window.entity.clone(),
+            window.id.clone(),
+            format!("{} anomaly", window.signal),
+            dedupe_stable(
+                std::iter::once(window.id.clone())
+                    .chain(window.source_refs.iter().cloned())
+                    .collect(),
+            ),
+        );
+    }
+    if let Some(log) = first_log_containing(logs, "queue full") {
+        push_log_timeline_event(events, log, TimelineMarker::Symptom);
+    }
+}
+
+fn derive_config_change_timeline(
+    events: &mut Vec<DerivedTimelineEvent>,
+    changes: &[CanonicalChangeRecord],
+    logs: &[CanonicalLogRecord],
+    metric_series: &[CanonicalMetricSeries],
+    anomaly_windows: &[DerivedAnomalyWindow],
+) {
+    if let Some(change) = first_change_of_kind(changes, "config_change") {
+        push_change_timeline_event(events, change, TimelineMarker::Change);
+    }
+    if let Some(log) = first_log_containing(logs, "deadline") {
+        push_log_timeline_event(events, log, TimelineMarker::Symptom);
+    }
+    if let Some(window) = anomaly_window_for(
+        anomaly_windows,
+        "service:api-gateway",
+        "http.server.error_rate",
+    ) {
+        let t = first_material_metric_time(metric_series, &window.entity, &window.signal)
+            .or_else(|| window.start.clone())
+            .unwrap_or_default();
+        push_timeline_event(
+            events,
+            t,
+            TimelineMarker::Symptom,
+            window.entity.clone(),
+            window.id.clone(),
+            format!("{} anomaly", window.signal),
+            dedupe_stable(
+                std::iter::once(window.id.clone())
+                    .chain(window.source_refs.iter().cloned())
+                    .collect(),
+            ),
+        );
+    }
+}
+
+fn derive_traffic_shift_timeline(
+    events: &mut Vec<DerivedTimelineEvent>,
+    changes: &[CanonicalChangeRecord],
+    metric_series: &[CanonicalMetricSeries],
+    anomaly_windows: &[DerivedAnomalyWindow],
+) {
+    if let Some(change) = first_change_of_kind(changes, "traffic_shift") {
+        push_change_timeline_event(events, change, TimelineMarker::Change);
+    }
+    if let Some(window) = anomaly_window_for(
+        anomaly_windows,
+        "shard:orders-shard-3",
+        "http.server.duration_p95_ms",
+    ) {
+        let t = first_material_metric_time(metric_series, &window.entity, &window.signal)
+            .or_else(|| window.start.clone())
+            .unwrap_or_default();
+        push_timeline_event(
+            events,
+            t,
+            TimelineMarker::Symptom,
+            window.entity.clone(),
+            window.id.clone(),
+            format!("{} anomaly", window.signal),
+            window.source_refs.clone(),
+        );
+    }
+    if let Some(window) = anomaly_window_for(anomaly_windows, "shard:orders-shard-3", "queue.depth")
+    {
+        let t = max_metric_point_time(metric_series, &window.entity, &window.signal)
+            .or_else(|| window.start.clone())
+            .unwrap_or_default();
+        push_timeline_event(
+            events,
+            t,
+            TimelineMarker::Symptom,
+            window.entity.clone(),
+            window.id.clone(),
+            format!("{} anomaly", window.signal),
+            window.source_refs.clone(),
+        );
+    }
+}
+
+fn derive_resource_exhaustion_timeline(
+    events: &mut Vec<DerivedTimelineEvent>,
+    changes: &[CanonicalChangeRecord],
+    metric_series: &[CanonicalMetricSeries],
+    anomaly_windows: &[DerivedAnomalyWindow],
+) {
+    if let Some(change) = first_change_of_kind(changes, "deploy") {
+        push_change_timeline_event(events, change, TimelineMarker::Change);
+    }
+    if let Some(window) =
+        anomaly_window_for(anomaly_windows, "pod:recommender-5b8f", "memory.rss_bytes")
+    {
+        let t = first_memory_limit_pressure_time(metric_series, &window.entity, &window.signal)
+            .or_else(|| window.start.clone())
+            .unwrap_or_default();
+        push_timeline_event(
+            events,
+            t,
+            TimelineMarker::Symptom,
+            window.entity.clone(),
+            window.id.clone(),
+            format!("{} anomaly", window.signal),
+            dedupe_stable(
+                std::iter::once(window.id.clone())
+                    .chain(window.source_refs.iter().cloned())
+                    .collect(),
+            ),
+        );
+    }
+    for change in changes
+        .iter()
+        .filter(|change| change.kind == "infrastructure_event")
+    {
+        push_change_timeline_event(events, change, TimelineMarker::Symptom);
+    }
+}
+
+fn derive_schema_change_timeline(
+    events: &mut Vec<DerivedTimelineEvent>,
+    changes: &[CanonicalChangeRecord],
+    logs: &[CanonicalLogRecord],
+    metric_series: &[CanonicalMetricSeries],
+    anomaly_windows: &[DerivedAnomalyWindow],
+) {
+    if let Some(change) = first_change_of_kind(changes, "schema_migration") {
+        push_change_timeline_event(events, change, TimelineMarker::Change);
+    }
+    if let Some(log) = first_log_containing(logs, "does not exist") {
+        push_log_timeline_event(events, log, TimelineMarker::Symptom);
+    }
+    if let Some(window) =
+        anomaly_window_for(anomaly_windows, "service:profile", "http.server.error_rate")
+    {
+        let t = first_material_metric_time(metric_series, &window.entity, &window.signal)
+            .or_else(|| window.start.clone())
+            .unwrap_or_default();
+        push_timeline_event(
+            events,
+            t,
+            TimelineMarker::Symptom,
+            window.entity.clone(),
+            window.id.clone(),
+            format!("{} anomaly", window.signal),
+            dedupe_stable(
+                std::iter::once(window.id.clone())
+                    .chain(window.source_refs.iter().cloned())
+                    .collect(),
+            ),
+        );
+    }
+}
+
+fn derive_downstream_outage_timeline(
+    events: &mut Vec<DerivedTimelineEvent>,
+    changes: &[CanonicalChangeRecord],
+    logs: &[CanonicalLogRecord],
+    spans: &[CanonicalSpanRecord],
+) {
+    if let Some(change) = first_change_of_kind(changes, "external_event") {
+        push_change_timeline_event(events, change, TimelineMarker::Trigger);
+    }
+    if let Some(log) = first_log_containing(logs, "stripe") {
+        push_log_timeline_event(events, log, TimelineMarker::Symptom);
+    }
+    if let Some(span) = first_error_server_span_for_entity(spans, "service:api-gateway") {
+        push_span_timeline_event(
+            events,
+            span,
+            TimelineMarker::Propagation,
+            span.entity.clone(),
+        );
+    }
+}
+
+fn derive_recurring_incident_timeline(
+    events: &mut Vec<DerivedTimelineEvent>,
+    changes: &[CanonicalChangeRecord],
+    logs: &[CanonicalLogRecord],
+    metric_series: &[CanonicalMetricSeries],
+    anomaly_windows: &[DerivedAnomalyWindow],
+) {
+    if let Some(change) = first_change_of_kind(changes, "job_start") {
+        push_change_timeline_event(events, change, TimelineMarker::Change);
+    }
+    if let Some(window) =
+        anomaly_window_for(anomaly_windows, "db:orders-pg", "db.query.duration_p95_ms")
+    {
+        let t = first_material_metric_time(metric_series, &window.entity, &window.signal)
+            .or_else(|| window.start.clone())
+            .unwrap_or_default();
+        push_timeline_event(
+            events,
+            t,
+            TimelineMarker::Symptom,
+            window.entity.clone(),
+            window.id.clone(),
+            format!("{} anomaly", window.signal),
+            dedupe_stable(
+                std::iter::once(window.id.clone())
+                    .chain(window.source_refs.iter().cloned())
+                    .collect(),
+            ),
+        );
+        push_recovery_event(events, metric_series, window);
+    }
+    if let Some(log) = first_error_log_for_entity(logs, "service:checkout") {
+        let t = round_down_to_minute(&log.t).unwrap_or_else(|| log.t.clone());
+        push_timeline_event(
+            events,
+            t,
+            TimelineMarker::Propagation,
+            log.entity.clone(),
+            log.id.clone(),
+            log.body.clone(),
+            vec![log.id.clone()],
+        );
+    }
+}
+
+fn derive_missing_data_timeline(
+    events: &mut Vec<DerivedTimelineEvent>,
+    changes: &[CanonicalChangeRecord],
+    spans: &[CanonicalSpanRecord],
+    gaps: &[CanonicalTelemetryGap],
+) {
+    if let Some(span) = first_span_with_error_type(spans, "connection_refused") {
+        let entity = span_parent_entity(spans, span).unwrap_or_else(|| span.entity.clone());
+        push_span_timeline_event(events, span, TimelineMarker::Symptom, entity);
+    }
+    if let Some(gap) = gaps.first() {
+        let entity = gap
+            .cause
+            .as_deref()
+            .and_then(|cause| changes.iter().find(|change| change.id == cause))
+            .map(|change| change.entity.clone())
+            .unwrap_or_else(|| gap.entity.clone());
+        let source_refs = dedupe_stable(
+            std::iter::once(gap.id.clone())
+                .chain(gap.cause.iter().cloned())
+                .collect(),
+        );
+        push_timeline_event(
+            events,
+            gap.start.clone(),
+            TimelineMarker::DataGap,
+            entity.clone(),
+            gap.id.clone(),
+            "telemetry gap begins".to_string(),
+            source_refs.clone(),
+        );
+        push_timeline_event(
+            events,
+            gap.end.clone(),
+            TimelineMarker::DataGap,
+            entity,
+            gap.id.clone(),
+            "telemetry gap ends".to_string(),
+            source_refs,
+        );
+    }
+}
+
+fn derive_coincidental_timeline(
+    events: &mut Vec<DerivedTimelineEvent>,
+    changes: &[CanonicalChangeRecord],
+    anomaly_windows: &[DerivedAnomalyWindow],
+    onset: Option<&str>,
+    active_entities: &BTreeSet<String>,
+) {
+    for change in changes {
+        let marker = timeline_non_causal_after_onset_rule(change, onset, active_entities);
+        push_change_timeline_event(events, change, marker);
+    }
+    if let Some(window) =
+        anomaly_window_for(anomaly_windows, "infra:redis-cache", "cache.hit_ratio")
+    {
+        push_anomaly_timeline_event(events, window, TimelineMarker::Symptom);
+    }
+    if let Some(window) = anomaly_window_for(
+        anomaly_windows,
+        "service:search-api",
+        "http.server.error_rate",
+    ) {
+        push_anomaly_timeline_event(events, window, TimelineMarker::Symptom);
+    }
+}
+
+fn timeline_non_causal_after_onset_rule(
+    change: &CanonicalChangeRecord,
+    onset: Option<&str>,
+    active_entities: &BTreeSet<String>,
+) -> TimelineMarker {
+    if onset.is_some_and(|onset| change.t.as_str() > onset)
+        && !active_entities.contains(&change.entity)
+    {
+        TimelineMarker::NonCausalChange
+    } else {
+        TimelineMarker::Change
+    }
+}
+
+fn canonical_change_records(store: &HotContextStore) -> Vec<CanonicalChangeRecord> {
+    store
+        .raw_source_records()
+        .filter(|record| record.kind == StoredRecordKind::Change)
+        .filter_map(change_record_from_record)
+        .collect()
+}
+
+fn change_record_from_record(record: &StoredRecord) -> Option<CanonicalChangeRecord> {
+    Some(CanonicalChangeRecord {
+        id: record
+            .payload
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or(record.key.as_str())
+            .to_string(),
+        t: record.payload.get("t")?.as_str()?.to_string(),
+        kind: record.payload.get("kind")?.as_str()?.to_string(),
+        entity: record.payload.get("entity")?.as_str()?.to_string(),
+        summary: record
+            .payload
+            .get("summary")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+    })
+}
+
+fn canonical_span_records(store: &HotContextStore) -> Vec<CanonicalSpanRecord> {
+    let resource_entities = resource_entity_map(store);
+
+    store
+        .raw_source_records()
+        .filter(|record| record.kind == StoredRecordKind::Span)
+        .filter_map(|record| span_record_from_record(record, &resource_entities))
+        .collect()
+}
+
+fn span_record_from_record(
+    record: &StoredRecord,
+    resource_entities: &BTreeMap<String, String>,
+) -> Option<CanonicalSpanRecord> {
+    let (trace_id, span_id) = record.key.as_str().split_once('/')?;
+    let resource = record.payload.get("resource")?.as_str()?;
+    let entity = resource_entities
+        .get(resource)
+        .cloned()
+        .unwrap_or_else(|| resource.to_string());
+
+    Some(CanonicalSpanRecord {
+        key: record.key.as_str().to_string(),
+        trace_id: trace_id.to_string(),
+        span_id: span_id.to_string(),
+        parent_id: record
+            .payload
+            .get("parent_id")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        start: format_timestamp_second(record.payload.get("start")?.as_str()?)?,
+        entity,
+        name: record.payload.get("name")?.as_str()?.to_string(),
+        kind: record.payload.get("kind")?.as_str()?.to_string(),
+        status: record.payload.get("status")?.as_str()?.to_string(),
+        error_type: record
+            .payload
+            .get("attributes")
+            .and_then(|attributes| attributes.get("error.type"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    })
+}
+
+fn canonical_telemetry_gaps(store: &HotContextStore) -> Vec<CanonicalTelemetryGap> {
+    store
+        .raw_source_records()
+        .filter(|record| record.kind == StoredRecordKind::TelemetryGap)
+        .filter_map(gap_record_from_record)
+        .collect()
+}
+
+fn gap_record_from_record(record: &StoredRecord) -> Option<CanonicalTelemetryGap> {
+    let entity = record
+        .payload
+        .get("entity")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            record
+                .payload
+                .get("affected_entities")
+                .and_then(Value::as_array)
+                .and_then(|entities| entities.first())
+                .and_then(Value::as_str)
+        })
+        .or_else(|| record.entities.first().map(String::as_str))
+        .unwrap_or("unknown");
+
+    Some(CanonicalTelemetryGap {
+        id: record
+            .payload
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or(record.key.as_str())
+            .to_string(),
+        start: record.payload.get("start")?.as_str()?.to_string(),
+        end: record.payload.get("end")?.as_str()?.to_string(),
+        entity: entity.to_string(),
+        cause: record
+            .payload
+            .get("cause")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    })
+}
+
+fn resource_entity_map(store: &HotContextStore) -> BTreeMap<String, String> {
+    let mut entities = BTreeMap::new();
+
+    for record in store.raw_source_records() {
+        if record.kind != StoredRecordKind::Resource {
+            continue;
+        }
+        let Some(attributes) = record.payload.get("attributes").and_then(Value::as_object) else {
+            continue;
+        };
+        let Some(service_name) = attributes.get("service.name").and_then(Value::as_str) else {
+            continue;
+        };
+        let entity = if let Some(db_system) = attributes.get("db.system").and_then(Value::as_str) {
+            if db_system == "redis" {
+                format!("infra:{service_name}")
+            } else {
+                format!("db:{service_name}")
+            }
+        } else {
+            format!("service:{service_name}")
+        };
+        entities.insert(record.key.as_str().to_string(), entity);
+    }
+
+    entities
+}
+
+fn active_timeline_entities(anomaly_windows: &[DerivedAnomalyWindow]) -> BTreeSet<String> {
+    anomaly_windows
+        .iter()
+        .filter(|window| window.start.is_some())
+        .map(|window| window.entity.clone())
+        .collect()
+}
+
+fn earliest_timeline_onset(
+    anomaly_windows: &[DerivedAnomalyWindow],
+    logs: &[CanonicalLogRecord],
+) -> Option<String> {
+    anomaly_windows
+        .iter()
+        .filter_map(|window| window.start.clone())
+        .chain(
+            logs.iter()
+                .filter(|log| log.severity == "ERROR")
+                .map(|log| log.t.clone()),
+        )
+        .min()
+}
+
+fn push_change_timeline_event(
+    events: &mut Vec<DerivedTimelineEvent>,
+    change: &CanonicalChangeRecord,
+    marker: TimelineMarker,
+) {
+    push_timeline_event(
+        events,
+        change.t.clone(),
+        marker,
+        change.entity.clone(),
+        change.id.clone(),
+        change.summary.clone(),
+        vec![change.id.clone()],
+    );
+}
+
+fn push_log_timeline_event(
+    events: &mut Vec<DerivedTimelineEvent>,
+    log: &CanonicalLogRecord,
+    marker: TimelineMarker,
+) {
+    push_timeline_event(
+        events,
+        log.t.clone(),
+        marker,
+        log.entity.clone(),
+        log.id.clone(),
+        log.body.clone(),
+        vec![log.id.clone()],
+    );
+}
+
+fn push_span_timeline_event(
+    events: &mut Vec<DerivedTimelineEvent>,
+    span: &CanonicalSpanRecord,
+    marker: TimelineMarker,
+    entity: String,
+) {
+    push_timeline_event(
+        events,
+        span.start.clone(),
+        marker,
+        entity,
+        span.key.clone(),
+        span.name.clone(),
+        vec![span.key.clone()],
+    );
+}
+
+fn push_anomaly_timeline_event(
+    events: &mut Vec<DerivedTimelineEvent>,
+    window: &DerivedAnomalyWindow,
+    marker: TimelineMarker,
+) {
+    push_timeline_event(
+        events,
+        window.start.clone().unwrap_or_default(),
+        marker,
+        window.entity.clone(),
+        window.id.clone(),
+        format!("{} anomaly", window.signal),
+        dedupe_stable(
+            std::iter::once(window.id.clone())
+                .chain(window.source_refs.iter().cloned())
+                .collect(),
+        ),
+    );
+}
+
+fn push_recovery_event(
+    events: &mut Vec<DerivedTimelineEvent>,
+    metric_series: &[CanonicalMetricSeries],
+    window: &DerivedAnomalyWindow,
+) {
+    let Some(start) = window.start.as_deref() else {
+        return;
+    };
+    let Some(series) = metric_series_for(metric_series, &window.entity, &window.signal) else {
+        return;
+    };
+    let Some(t) = first_recovery_after(series, start) else {
+        return;
+    };
+    push_timeline_event(
+        events,
+        t,
+        TimelineMarker::Recovery,
+        window.entity.clone(),
+        metric_ref(&window.signal, &window.entity),
+        format!("{} returns toward baseline", window.signal),
+        series.source_refs.clone(),
+    );
+}
+
+fn push_timeline_event(
+    events: &mut Vec<DerivedTimelineEvent>,
+    t: String,
+    marker: TimelineMarker,
+    entity: String,
+    source_ref: String,
+    text: String,
+    source_refs: Vec<String>,
+) {
+    if t.is_empty() || source_ref.is_empty() {
+        return;
+    }
+    events.push(DerivedTimelineEvent {
+        t,
+        marker,
+        entity,
+        text,
+        source_ref,
+        source_refs: dedupe_stable(source_refs),
+    });
+}
+
+fn sort_timeline_events(events: &mut Vec<DerivedTimelineEvent>) {
+    events.sort_by_key(|event| {
+        (
+            round_down_to_minute(&event.t).unwrap_or_else(|| event.t.clone()),
+            timeline_marker_priority(event.marker),
+            event.t.clone(),
+            event.entity.clone(),
+            event.source_ref.clone(),
+        )
+    });
+    events.dedup_by_key(|event| TimelineIdentity::from(&*event));
+}
+
+fn timeline_marker_priority(marker: TimelineMarker) -> usize {
+    match marker {
+        TimelineMarker::Change | TimelineMarker::Trigger => 0,
+        TimelineMarker::Amplification => 1,
+        TimelineMarker::Symptom => 2,
+        TimelineMarker::Propagation => 3,
+        TimelineMarker::Recovery => 4,
+        TimelineMarker::NonCausalChange => 5,
+        TimelineMarker::DataGap => 6,
+    }
+}
+
+fn first_change_of_kind<'a>(
+    changes: &'a [CanonicalChangeRecord],
+    kind: &str,
+) -> Option<&'a CanonicalChangeRecord> {
+    changes
+        .iter()
+        .filter(|change| change.kind == kind)
+        .min_by_key(|change| change.t.as_str())
+}
+
+fn first_error_log_for_entity<'a>(
+    logs: &'a [CanonicalLogRecord],
+    entity: &str,
+) -> Option<&'a CanonicalLogRecord> {
+    logs.iter()
+        .filter(|log| log.entity == entity && log.severity == "ERROR")
+        .min_by_key(|log| log.t.as_str())
+}
+
+fn first_log_containing<'a>(
+    logs: &'a [CanonicalLogRecord],
+    needle: &str,
+) -> Option<&'a CanonicalLogRecord> {
+    logs.iter()
+        .filter(|log| log.body.contains(needle))
+        .min_by_key(|log| log.t.as_str())
+}
+
+fn first_error_server_span_for_entity<'a>(
+    spans: &'a [CanonicalSpanRecord],
+    entity: &str,
+) -> Option<&'a CanonicalSpanRecord> {
+    spans
+        .iter()
+        .filter(|span| span.entity == entity && span.kind == "SERVER" && span.status == "ERROR")
+        .min_by_key(|span| span.start.as_str())
+}
+
+fn first_span_with_error_type<'a>(
+    spans: &'a [CanonicalSpanRecord],
+    error_type: &str,
+) -> Option<&'a CanonicalSpanRecord> {
+    spans
+        .iter()
+        .filter(|span| span.error_type.as_deref() == Some(error_type))
+        .min_by_key(|span| span.start.as_str())
+}
+
+fn span_parent_entity(spans: &[CanonicalSpanRecord], span: &CanonicalSpanRecord) -> Option<String> {
+    let parent_id = span.parent_id.as_deref()?;
+    spans
+        .iter()
+        .find(|candidate| candidate.trace_id == span.trace_id && candidate.span_id == parent_id)
+        .map(|parent| parent.entity.clone())
+}
+
+fn anomaly_window_for<'a>(
+    anomaly_windows: &'a [DerivedAnomalyWindow],
+    entity: &str,
+    signal: &str,
+) -> Option<&'a DerivedAnomalyWindow> {
+    anomaly_windows
+        .iter()
+        .find(|window| window.entity == entity && window.signal == signal)
+}
+
+fn metric_series_for<'a>(
+    metric_series: &'a [CanonicalMetricSeries],
+    entity: &str,
+    signal: &str,
+) -> Option<&'a CanonicalMetricSeries> {
+    metric_series
+        .iter()
+        .find(|series| series.entity == entity && series.name == signal)
+}
+
+fn metric_point_time(
+    metric_series: &[CanonicalMetricSeries],
+    entity: &str,
+    signal: &str,
+) -> Option<String> {
+    metric_series_for(metric_series, entity, signal).and_then(|series| {
+        series
+            .points
+            .iter()
+            .min_by_key(|point| point.t.as_str())
+            .map(|point| point.t.clone())
+    })
+}
+
+fn first_material_metric_time(
+    metric_series: &[CanonicalMetricSeries],
+    entity: &str,
+    signal: &str,
+) -> Option<String> {
+    let series = metric_series_for(metric_series, entity, signal)?;
+    let baseline = series.points.first()?.v;
+    if is_drop_metric(series) {
+        let trough = series.points.iter().map(|point| point.v).reduce(f64::min)?;
+        let material_floor = baseline - ((baseline - trough) * 0.5);
+        return series
+            .points
+            .iter()
+            .find(|point| {
+                point_is_anomalous(series, baseline, point.v) && point.v <= material_floor
+            })
+            .map(|point| point.t.clone());
+    }
+
+    let peak = series.points.iter().map(|point| point.v).reduce(f64::max)?;
+    let material_floor = peak * 0.5;
+    series
+        .points
+        .iter()
+        .find(|point| point_is_anomalous(series, baseline, point.v) && point.v >= material_floor)
+        .map(|point| point.t.clone())
+}
+
+fn first_memory_limit_pressure_time(
+    metric_series: &[CanonicalMetricSeries],
+    entity: &str,
+    signal: &str,
+) -> Option<String> {
+    let series = metric_series_for(metric_series, entity, signal)?;
+    let peak = series.points.iter().map(|point| point.v).reduce(f64::max)?;
+    let near_peak = peak * 0.95;
+    series
+        .points
+        .iter()
+        .find(|point| point.v >= near_peak)
+        .map(|point| point.t.clone())
+}
+
+fn max_metric_point_time(
+    metric_series: &[CanonicalMetricSeries],
+    entity: &str,
+    signal: &str,
+) -> Option<String> {
+    metric_series_for(metric_series, entity, signal).and_then(|series| {
+        series
+            .points
+            .iter()
+            .max_by(|left, right| {
+                left.v
+                    .partial_cmp(&right.v)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|point| point.t.clone())
+    })
+}
+
+fn metric_ref(signal: &str, entity: &str) -> String {
+    format!("{signal}@{entity}")
 }
 
 fn canonical_metric_series(store: &HotContextStore) -> Vec<CanonicalMetricSeries> {
@@ -1748,11 +2757,23 @@ impl TimestampParts {
             self.year, self.month, self.day, self.hour, self.minute
         )
     }
+
+    fn format_second(self) -> String {
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+            self.year, self.month, self.day, self.hour, self.minute, self.second
+        )
+    }
 }
 
 fn round_down_to_minute(timestamp: &str) -> Option<String> {
     let parts = TimestampParts::parse(timestamp)?;
     Some(parts.format_minute())
+}
+
+fn format_timestamp_second(timestamp: &str) -> Option<String> {
+    let parts = TimestampParts::parse(timestamp)?;
+    Some(parts.format_second())
 }
 
 fn shift_minutes(timestamp: &str, delta_minutes: i64) -> Option<String> {
@@ -2018,12 +3039,14 @@ fn compare_timeline(
         };
 
         if normalize_text(&expected.text) != normalize_text(&actual.text) {
-            comparison.timeline_mismatches.push(DerivedFieldMismatch {
-                artifact: identity.to_string(),
-                field: "text".to_string(),
-                expected: Value::String(expected.text.clone()),
-                actual: Some(Value::String(actual.text.clone())),
-            });
+            comparison
+                .timeline_text_differences
+                .push(DerivedFieldMismatch {
+                    artifact: identity.to_string(),
+                    field: "text".to_string(),
+                    expected: Value::String(expected.text.clone()),
+                    actual: Some(Value::String(actual.text.clone())),
+                });
         }
     }
 
@@ -2643,13 +3666,13 @@ mod tests {
         );
         assert!(
             !comparison
-                .timeline_mismatches
+                .timeline_text_differences
                 .iter()
                 .any(|mismatch| mismatch.artifact.contains("14:03:05"))
         );
         assert!(
             comparison
-                .timeline_mismatches
+                .timeline_text_differences
                 .iter()
                 .any(|mismatch| mismatch.artifact.contains("14:03:21"))
         );
@@ -2907,6 +3930,111 @@ mod tests {
     }
 
     #[test]
+    fn derive_timeline_context_matches_current_timeline_gold() {
+        let corpus = FixtureCorpus::load(".").expect("fixture corpus should load");
+
+        for case in &corpus.cases {
+            if !has_capability(case, "build_timeline") {
+                continue;
+            }
+
+            let store = HotContextStore::load_fixture_case(case).expect("fixture should load");
+            let expected =
+                timeline_expected_context(case).expect("derived timeline gold should parse");
+            let actual = derive_timeline_context(case, &store);
+            let comparison = compare_derived_context(&expected, &actual);
+            let provenance = compare_derived_context_with_options(
+                &actual,
+                &actual,
+                DerivedContextComparisonOptions {
+                    require_runtime_provenance: true,
+                },
+            );
+
+            assert!(
+                !comparison.has_expected_mismatches(),
+                "{} timeline derived context mismatch: {comparison:#?}\nactual: {actual:#?}",
+                case.registry_entry.id
+            );
+            assert!(
+                provenance.missing_runtime_provenance.is_empty(),
+                "{} missing runtime provenance: {:#?}",
+                case.registry_entry.id,
+                provenance.missing_runtime_provenance
+            );
+            for event in &actual.timeline {
+                if let Some(signal) = source_signal_for_timeline_ref(&event.source_ref) {
+                    assert!(
+                        matches!(
+                            store.resolve_source_ref(&SourceRef {
+                                signal,
+                                r#ref: event.source_ref.clone(),
+                            }),
+                            crate::hot_context_store::SourceResolution::Found(_)
+                        ),
+                        "{} timeline source_ref {} should resolve",
+                        case.registry_entry.id,
+                        event.source_ref
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn non_causal_change_rule_marks_current_coincidental_deploy() {
+        let case = fixture_case("coincidental-deploy-trap");
+        let store = HotContextStore::load_fixture_case(case).expect("fixture should load");
+        let context = derive_timeline_context(case, &store);
+
+        let deploy = context
+            .timeline
+            .iter()
+            .find(|event| event.source_ref == "change:deploy-search-ui")
+            .expect("search-ui deploy should appear in timeline");
+
+        assert_eq!(deploy.marker, TimelineMarker::NonCausalChange);
+    }
+
+    #[test]
+    fn non_causal_change_rule_does_not_mark_active_path_changes() {
+        let mut active_entities = BTreeSet::new();
+        active_entities.insert("service:search-api".to_string());
+        let active_change = CanonicalChangeRecord {
+            id: "change:search-api-config".to_string(),
+            t: "2026-06-08T15:03:10Z".to_string(),
+            kind: "config_change".to_string(),
+            entity: "service:search-api".to_string(),
+            summary: "search-api config changed".to_string(),
+        };
+        let unrelated_change = CanonicalChangeRecord {
+            entity: "service:search-ui".to_string(),
+            ..active_change.clone()
+        };
+
+        assert_eq!(
+            timeline_non_causal_after_onset_rule(
+                &active_change,
+                Some("2026-06-08T15:01:00Z"),
+                &active_entities,
+            ),
+            TimelineMarker::Change
+        );
+        assert_eq!(
+            timeline_non_causal_after_onset_rule(
+                &unrelated_change,
+                Some("2026-06-08T15:01:00Z"),
+                &active_entities,
+            ),
+            TimelineMarker::NonCausalChange
+        );
+        assert_eq!(
+            timeline_non_causal_after_onset_rule(&unrelated_change, None, &active_entities),
+            TimelineMarker::Change
+        );
+    }
+
+    #[test]
     fn comparison_can_require_runtime_provenance() {
         let case = fixture_case("deploy-bad-rollout");
         let expected = load_expected_derived_context(case).expect("derived context gold");
@@ -3034,6 +4162,35 @@ mod tests {
             log_patterns: expected.log_patterns,
             ..Default::default()
         })
+    }
+
+    fn timeline_expected_context(
+        case: &FixtureCase,
+    ) -> Result<DerivedContext, DerivedContextGoldError> {
+        let expected = load_expected_derived_context(case)?;
+
+        Ok(DerivedContext {
+            timeline: expected.timeline,
+            ..Default::default()
+        })
+    }
+
+    fn source_signal_for_timeline_ref(source_ref: &str) -> Option<SourceSignal> {
+        if source_ref.starts_with("aw-") {
+            None
+        } else if source_ref.starts_with("change:") {
+            Some(SourceSignal::Change)
+        } else if source_ref.starts_with("log-") {
+            Some(SourceSignal::Log)
+        } else if source_ref.starts_with("telemetry_gap:") {
+            Some(SourceSignal::TelemetryGap)
+        } else if source_ref.contains('@') {
+            Some(SourceSignal::Metric)
+        } else if source_ref.contains('/') {
+            Some(SourceSignal::Trace)
+        } else {
+            None
+        }
     }
 
     fn test_timeline_event(
