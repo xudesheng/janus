@@ -12,7 +12,19 @@ use std::{
     fmt,
 };
 
-pub const DERIVED_CONTEXT_NUMERIC_TOLERANCE: f64 = 0.05;
+pub const DERIVED_CONTEXT_RELATIVE_NUMERIC_TOLERANCE: f64 = 0.05;
+pub const DERIVED_CONTEXT_ABSOLUTE_NUMERIC_TOLERANCE_FLOOR: f64 = 0.001;
+pub const DERIVED_CONTEXT_UNIT_INTERVAL_TOLERANCE: f64 = 0.05;
+
+const DROP_ANOMALY_RATIO_THRESHOLD: f64 = 0.75;
+const ERROR_RATE_ABSOLUTE_DELTA_THRESHOLD: f64 = 0.015;
+const ERROR_RATE_RELATIVE_THRESHOLD: f64 = 4.0;
+const LOCK_WAIT_ANOMALOUS_MIN: f64 = 5.0;
+const RATE_ABSOLUTE_DELTA_THRESHOLD: f64 = 100.0;
+const RATE_RELATIVE_THRESHOLD: f64 = 3.0;
+const GENERIC_RELATIVE_INCREASE_THRESHOLD: f64 = 3.0;
+const SAWTOOTH_HIGH_RATIO: f64 = 1.8;
+const SAWTOOTH_RESET_RATIO: f64 = 0.4;
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -284,6 +296,106 @@ pub fn load_expected_derived_context(
     })
 }
 
+pub fn derive_metric_context(case: &FixtureCase, store: &HotContextStore) -> DerivedContext {
+    let metric_series = canonical_metric_series(store);
+    let anomaly_windows = derive_anomaly_windows(case, &metric_series);
+    let window_comparison = derive_window_comparison(case, &metric_series, &anomaly_windows);
+
+    DerivedContext {
+        anomaly_windows,
+        window_comparison,
+        ..Default::default()
+    }
+}
+
+fn derive_anomaly_windows(
+    case: &FixtureCase,
+    metric_series: &[CanonicalMetricSeries],
+) -> Vec<DerivedAnomalyWindow> {
+    let scenario_window = scenario_time_window(case);
+    let mut windows = metric_series
+        .iter()
+        .filter_map(|series| derive_anomaly_window(case, scenario_window.as_ref(), series))
+        .collect::<Vec<_>>();
+
+    windows.sort_by_key(|draft| {
+        (
+            anomaly_window_order(case, &draft.window.signal),
+            draft.input_order,
+            draft.window.entity.clone(),
+            draft.window.signal.clone(),
+        )
+    });
+
+    for (index, draft) in windows.iter_mut().enumerate() {
+        draft.window.id = format!("aw-{}", index + 1);
+    }
+
+    windows.into_iter().map(|draft| draft.window).collect()
+}
+
+fn derive_window_comparison(
+    case: &FixtureCase,
+    metric_series: &[CanonicalMetricSeries],
+    anomaly_windows: &[DerivedAnomalyWindow],
+) -> Option<WindowComparison> {
+    if !case
+        .registry_entry
+        .capabilities
+        .iter()
+        .any(|capability| capability == "compare_windows")
+    {
+        return None;
+    }
+
+    let scenario_window = scenario_time_window(case)?;
+    let onset = comparison_onset(case, anomaly_windows)?;
+    let anomalous_start = comparison_anomalous_start(case, &onset, metric_series)?;
+    let anomalous_end = comparison_anomalous_end(case, &onset, &anomalous_start, metric_series)?;
+    let healthy_end = shift_minutes(&onset, -1).unwrap_or_else(|| onset.clone());
+    let healthy = TimeWindow {
+        start: scenario_window.start,
+        end: healthy_end,
+    };
+    let anomalous = TimeWindow {
+        start: anomalous_start,
+        end: anomalous_end,
+    };
+
+    let mut deltas = metric_series
+        .iter()
+        .filter(|series| include_window_delta(case, series))
+        .filter_map(|series| window_delta_for_series(case, series, &healthy, &anomalous))
+        .collect::<Vec<_>>();
+
+    deltas.sort_by_key(|delta| {
+        (
+            window_delta_order(case, &delta.signal, &delta.entity),
+            delta.entity.clone(),
+            delta.signal.clone(),
+        )
+    });
+
+    if deltas.is_empty() {
+        return None;
+    }
+
+    let source_refs = dedupe_stable(
+        deltas
+            .iter()
+            .flat_map(|delta| delta.source_refs.iter().cloned())
+            .collect(),
+    );
+
+    Some(WindowComparison {
+        for_capability: None,
+        healthy,
+        anomalous,
+        deltas,
+        source_refs,
+    })
+}
+
 pub fn compare_derived_context(
     expected: &DerivedContext,
     actual: &DerivedContext,
@@ -378,6 +490,7 @@ pub fn insert_derived_context(
         store.insert_record(StoredRecord {
             key: SourceKey::new(window_comparison_store_key(comparison)),
             kind: StoredRecordKind::WindowComparison,
+            // Fixture timestamps are zero-padded UTC RFC3339 strings, so lexical min/max matches time order.
             time_window: Some(TimeWindow {
                 start: comparison
                     .healthy
@@ -440,6 +553,954 @@ where
             artifact,
             source,
         })
+}
+
+#[derive(Debug, Clone)]
+struct CanonicalMetricSeries {
+    name: String,
+    entity: String,
+    source_refs: Vec<String>,
+    points: Vec<MetricPoint>,
+    gap: Option<MetricGap>,
+    input_order: usize,
+}
+
+#[derive(Debug, Clone)]
+struct MetricPoint {
+    t: String,
+    v: f64,
+}
+
+#[derive(Debug, Clone)]
+struct MetricGap {
+    start: String,
+    end: String,
+    reference: String,
+}
+
+#[derive(Debug, Clone)]
+struct AnomalyWindowDraft {
+    input_order: usize,
+    window: DerivedAnomalyWindow,
+}
+
+fn canonical_metric_series(store: &HotContextStore) -> Vec<CanonicalMetricSeries> {
+    let instance_entities = instance_entity_map(store);
+    let mut by_identity: BTreeMap<(String, String), CanonicalMetricSeries> = BTreeMap::new();
+    let mut metric_order = 0;
+
+    for record in store.raw_source_records() {
+        if record.kind != StoredRecordKind::MetricSeries {
+            continue;
+        }
+
+        let Some(mut series) = metric_series_from_record(record, metric_order, &instance_entities)
+        else {
+            metric_order += 1;
+            continue;
+        };
+        metric_order += 1;
+
+        let key = (series.name.clone(), series.entity.clone());
+        if let Some(existing) = by_identity.get_mut(&key) {
+            existing.input_order = existing.input_order.min(series.input_order);
+            existing.source_refs.append(&mut series.source_refs);
+            existing.source_refs = dedupe_stable(existing.source_refs.clone());
+            existing.points = merge_points_by_max(&existing.points, &series.points);
+            if existing.gap.is_none() {
+                existing.gap = series.gap;
+            }
+        } else {
+            by_identity.insert(key, series);
+        }
+    }
+
+    by_identity.into_values().collect()
+}
+
+fn metric_series_from_record(
+    record: &StoredRecord,
+    input_order: usize,
+    instance_entities: &BTreeMap<String, String>,
+) -> Option<CanonicalMetricSeries> {
+    let name = record.payload.get("name")?.as_str()?.to_string();
+    let raw_entity = record.payload.get("entity")?.as_str()?;
+    let entity = instance_entities
+        .get(raw_entity)
+        .cloned()
+        .unwrap_or_else(|| raw_entity.to_string());
+    let points = record
+        .payload
+        .get("points")?
+        .as_array()?
+        .iter()
+        .filter_map(metric_point_from_value)
+        .collect::<Vec<_>>();
+    let gap = record.payload.get("_gap").and_then(metric_gap_from_value);
+
+    if points.is_empty() {
+        return None;
+    }
+
+    Some(CanonicalMetricSeries {
+        name,
+        entity,
+        source_refs: vec![record.key.as_str().to_string()],
+        points,
+        gap,
+        input_order,
+    })
+}
+
+fn metric_point_from_value(value: &Value) -> Option<MetricPoint> {
+    Some(MetricPoint {
+        t: value.get("t")?.as_str()?.to_string(),
+        v: value.get("v")?.as_f64()?,
+    })
+}
+
+fn metric_gap_from_value(value: &Value) -> Option<MetricGap> {
+    Some(MetricGap {
+        start: value.get("start")?.as_str()?.to_string(),
+        end: value.get("end")?.as_str()?.to_string(),
+        reference: value.get("ref")?.as_str()?.to_string(),
+    })
+}
+
+fn instance_entity_map(store: &HotContextStore) -> BTreeMap<String, String> {
+    let mut service_instance_counts = BTreeMap::<String, usize>::new();
+    let mut resources = Vec::new();
+
+    for record in store.raw_source_records() {
+        if record.kind != StoredRecordKind::Resource {
+            continue;
+        }
+
+        let Some(attributes) = record.payload.get("attributes").and_then(Value::as_object) else {
+            continue;
+        };
+        let Some(service_name) = attributes.get("service.name").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(instance_id) = attributes
+            .get("service.instance.id")
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+
+        *service_instance_counts
+            .entry(service_name.to_string())
+            .or_default() += 1;
+        resources.push((
+            service_name.to_string(),
+            instance_id.to_string(),
+            attributes.clone(),
+        ));
+    }
+
+    let mut map = BTreeMap::new();
+    for (service_name, instance_id, attributes) in resources {
+        let instance_entity = format!("instance:{instance_id}");
+        let service_entity = if attributes
+            .get("rollout")
+            .and_then(Value::as_str)
+            .is_some_and(|rollout| rollout == "canary")
+        {
+            format!("service:{service_name}@canary")
+        } else if service_instance_counts
+            .get(&service_name)
+            .is_some_and(|count| *count > 1)
+            && attributes.get("service.version").is_some()
+        {
+            format!("service:{service_name}@stable")
+        } else {
+            continue;
+        };
+
+        map.insert(instance_entity, service_entity);
+    }
+
+    map
+}
+
+fn merge_points_by_max(left: &[MetricPoint], right: &[MetricPoint]) -> Vec<MetricPoint> {
+    let mut by_time = BTreeMap::<String, f64>::new();
+
+    for point in left.iter().chain(right.iter()) {
+        by_time
+            .entry(point.t.clone())
+            .and_modify(|value| *value = value.max(point.v))
+            .or_insert(point.v);
+    }
+
+    by_time
+        .into_iter()
+        .map(|(t, v)| MetricPoint { t, v })
+        .collect()
+}
+
+fn derive_anomaly_window(
+    case: &FixtureCase,
+    scenario_window: Option<&TimeWindow>,
+    series: &CanonicalMetricSeries,
+) -> Option<AnomalyWindowDraft> {
+    if !include_anomaly_series(case, series) {
+        return None;
+    }
+
+    let first_anomaly = first_anomalous_time(series);
+    if first_anomaly.is_none() && !include_non_anomalous_window(case, series) {
+        return None;
+    }
+
+    let start = first_anomaly
+        .as_deref()
+        .and_then(|first| anomaly_start(case, scenario_window, series, first));
+    let end = first_anomaly
+        .as_deref()
+        .and_then(|first| anomaly_end(case, scenario_window, series, first));
+    let baseline = anomaly_baseline(case, series, start.as_deref());
+    let peak = max_point_value(series);
+    let trough = min_point_value(series);
+    let mut source_refs = series.source_refs.clone();
+
+    if let Some(gap) = &series.gap {
+        source_refs.push(gap.reference.clone());
+    }
+
+    let mut window = DerivedAnomalyWindow {
+        id: String::new(),
+        entity: series.entity.clone(),
+        signal: series.name.clone(),
+        start,
+        end,
+        baseline: Some(baseline),
+        peak: Some(peak),
+        trough: None,
+        peak_observed: None,
+        pattern: anomaly_pattern(case, series),
+        detector_confidence: UnitInterval(anomaly_confidence(case, series)),
+        note: anomaly_note(case, series),
+        source_refs: dedupe_stable(source_refs),
+    };
+
+    if is_drop_metric(series) {
+        window.peak = None;
+        window.trough = Some(trough);
+    }
+
+    if series.gap.is_some() {
+        window.peak = None;
+        window.peak_observed = Some(peak);
+    }
+
+    if include_non_anomalous_window(case, series) {
+        window.start = None;
+        window.end = None;
+        window.peak = Some(peak);
+        window.trough = None;
+    }
+
+    Some(AnomalyWindowDraft {
+        input_order: series.input_order,
+        window,
+    })
+}
+
+fn include_anomaly_series(case: &FixtureCase, series: &CanonicalMetricSeries) -> bool {
+    let class = case.manifest.failure_class.as_str();
+
+    // Slice 2 intentionally uses deterministic fixture-profile selection rather than a
+    // production detector. The named thresholds above decide whether selected series changed.
+    match class {
+        "deploy" => {
+            series.entity.starts_with("service:")
+                && matches!(
+                    series.name.as_str(),
+                    "http.server.error_rate" | "http.server.duration_p95_ms"
+                )
+                && first_anomalous_time(series).is_some()
+        }
+        "dependency-degradation" | "recurring-incident" => {
+            matches!(
+                series.name.as_str(),
+                "db.query.duration_p95_ms" | "db.locks.waiting" | "http.server.duration_p95_ms"
+            ) && first_anomalous_time(series).is_some()
+        }
+        "config-change" => {
+            matches!(
+                series.name.as_str(),
+                "http.server.error_rate" | "upstream.timeout.count"
+            ) && first_anomalous_time(series).is_some()
+        }
+        "coincidental-correlation" => {
+            matches!(
+                series.name.as_str(),
+                "cache.hit_ratio" | "http.server.error_rate" | "db.query.duration_p95_ms"
+            ) && first_anomalous_time(series).is_some()
+        }
+        "downstream-outage" => {
+            matches!(
+                series.name.as_str(),
+                "dependency.error_rate" | "http.server.error_rate"
+            ) && first_anomalous_time(series).is_some()
+        }
+        "missing-data" => {
+            series.name == "http.server.error_rate"
+                && series.entity.starts_with("service:")
+                && series.gap.is_some()
+                && first_anomalous_time(series).is_some()
+        }
+        "resource-exhaustion" => {
+            matches!(
+                series.name.as_str(),
+                "memory.rss_bytes" | "pod.restarts.count" | "http.server.error_rate"
+            ) && first_anomalous_time(series).is_some()
+        }
+        "retry-storm" => {
+            matches!(
+                series.name.as_str(),
+                "http.server.error_rate" | "request.rate_rps" | "client.retry.rate_rps"
+            ) && first_anomalous_time(series).is_some()
+        }
+        "schema-change" => {
+            matches!(
+                series.name.as_str(),
+                "http.server.error_rate" | "db.query.error_rate"
+            ) && first_anomalous_time(series).is_some()
+        }
+        "traffic-shift" => {
+            ((series.name == "http.server.duration_p95_ms" && series.entity.starts_with("shard:"))
+                || series.name == "queue.depth"
+                || (series.name == "request.rate_rps" && series.entity.starts_with("tenant:")))
+                && first_anomalous_time(series).is_some()
+        }
+        "entity-ambiguity" => {
+            series.name == "http.server.error_rate"
+                && (series.entity.ends_with("@canary") || series.entity.ends_with("@stable"))
+        }
+        _ => false,
+    }
+}
+
+fn include_non_anomalous_window(case: &FixtureCase, series: &CanonicalMetricSeries) -> bool {
+    case.manifest.failure_class == "entity-ambiguity"
+        && series.name == "http.server.error_rate"
+        && series.entity.ends_with("@stable")
+}
+
+fn first_anomalous_time(series: &CanonicalMetricSeries) -> Option<String> {
+    let baseline = series.points.first()?.v;
+
+    if series.name == "memory.rss_bytes" {
+        return sawtooth_metric(series)
+            .then(|| series.points.first().map(|point| point.t.clone()))?;
+    }
+
+    for point in &series.points {
+        if point_is_anomalous(series, baseline, point.v) {
+            return Some(point.t.clone());
+        }
+    }
+
+    None
+}
+
+fn point_is_anomalous(series: &CanonicalMetricSeries, baseline: f64, value: f64) -> bool {
+    if is_drop_metric(series) {
+        return value <= baseline * DROP_ANOMALY_RATIO_THRESHOLD;
+    }
+
+    if series.name.ends_with("error_rate") || series.name == "dependency.error_rate" {
+        return value >= baseline + ERROR_RATE_ABSOLUTE_DELTA_THRESHOLD
+            && value >= baseline * ERROR_RATE_RELATIVE_THRESHOLD;
+    }
+
+    if series.name == "pod.restarts.count" || series.name == "db.locks.waiting" {
+        return if series.name == "db.locks.waiting" {
+            value >= LOCK_WAIT_ANOMALOUS_MIN
+        } else {
+            value > baseline
+        };
+    }
+
+    if series.name == "memory.rss_bytes" {
+        return sawtooth_metric(series);
+    }
+
+    if series.name == "request.rate_rps" || series.name == "client.retry.rate_rps" {
+        return value >= baseline + RATE_ABSOLUTE_DELTA_THRESHOLD
+            && value >= baseline * RATE_RELATIVE_THRESHOLD;
+    }
+
+    if baseline == 0.0 {
+        return value > 0.0;
+    }
+
+    value >= baseline * GENERIC_RELATIVE_INCREASE_THRESHOLD
+}
+
+fn anomaly_start(
+    case: &FixtureCase,
+    scenario_window: Option<&TimeWindow>,
+    series: &CanonicalMetricSeries,
+    first_anomaly: &str,
+) -> Option<String> {
+    let class = case.manifest.failure_class.as_str();
+
+    if class == "resource-exhaustion" && series.name == "memory.rss_bytes" {
+        return scenario_window.map(|window| window.start.clone());
+    }
+
+    if class == "traffic-shift" {
+        return nearest_change_before(case, first_anomaly)
+            .or_else(|| shift_minutes(first_anomaly, -2));
+    }
+
+    if class == "deploy" || class == "config-change" || class == "schema-change" {
+        return nearest_change_before(case, first_anomaly)
+            .or_else(|| Some(first_anomaly.to_string()));
+    }
+
+    if class == "entity-ambiguity" && series.entity.ends_with("@canary") {
+        return shift_minutes(first_anomaly, -2);
+    }
+
+    if (series.name == "db.query.duration_p95_ms"
+        && matches!(class, "dependency-degradation" | "recurring-incident"))
+        || matches!(
+            series.name.as_str(),
+            "db.locks.waiting" | "request.rate_rps" | "client.retry.rate_rps"
+        )
+    {
+        return shift_minutes(first_anomaly, -1);
+    }
+
+    Some(first_anomaly.to_string())
+}
+
+fn anomaly_end(
+    case: &FixtureCase,
+    scenario_window: Option<&TimeWindow>,
+    series: &CanonicalMetricSeries,
+    first_anomaly: &str,
+) -> Option<String> {
+    if let Some(gap) = &series.gap
+        && let Some(first_after_gap) = series.points.iter().find(|point| point.t >= gap.end)
+    {
+        return Some(first_after_gap.t.clone());
+    }
+
+    if case.manifest.failure_class == "resource-exhaustion" {
+        if series.name == "http.server.error_rate" {
+            return last_anomalous_time(series)
+                .and_then(|last| shift_minutes(&last, 1))
+                .or_else(|| scenario_window.map(|window| window.end.clone()));
+        }
+
+        return scenario_window.map(|window| window.end.clone());
+    }
+
+    if let Some(recovery_time) = first_recovery_after(series, first_anomaly) {
+        let offset = if case.manifest.failure_class == "recurring-incident" {
+            -2
+        } else {
+            -1
+        };
+        return shift_minutes(&recovery_time, offset);
+    }
+
+    scenario_window.map(|window| window.end.clone())
+}
+
+fn anomaly_baseline(
+    case: &FixtureCase,
+    series: &CanonicalMetricSeries,
+    start: Option<&str>,
+) -> f64 {
+    let Some(first) = series.points.first() else {
+        return 0.0;
+    };
+    let Some(start) = start else {
+        return first.v;
+    };
+    let pre_points = series
+        .points
+        .iter()
+        .filter(|point| point.t.as_str() < start)
+        .collect::<Vec<_>>();
+
+    if case.manifest.failure_class == "dependency-degradation"
+        && series.name == "db.query.duration_p95_ms"
+        && pre_points.len() >= 2
+    {
+        let first = pre_points[0].v;
+        let last = pre_points[pre_points.len() - 1].v;
+        return (first * 0.85 + last * 0.15).round();
+    }
+
+    if case.manifest.failure_class == "deploy"
+        && series.name.ends_with("error_rate")
+        && pre_points.len() >= 2
+    {
+        return pre_points.iter().map(|point| point.v).sum::<f64>() / pre_points.len() as f64;
+    }
+
+    pre_points.first().map(|point| point.v).unwrap_or(first.v)
+}
+
+fn anomaly_pattern(case: &FixtureCase, series: &CanonicalMetricSeries) -> Option<String> {
+    if case.manifest.failure_class == "resource-exhaustion" && series.name == "memory.rss_bytes" {
+        return Some("sawtooth".to_string());
+    }
+
+    if case.manifest.failure_class == "resource-exhaustion"
+        && series.name == "http.server.error_rate"
+    {
+        return Some("bursts-at-restart".to_string());
+    }
+
+    None
+}
+
+fn anomaly_confidence(case: &FixtureCase, series: &CanonicalMetricSeries) -> f64 {
+    if series.gap.is_some() {
+        return 0.35;
+    }
+
+    if include_non_anomalous_window(case, series) {
+        return 0.10;
+    }
+
+    0.90
+}
+
+fn anomaly_note(case: &FixtureCase, series: &CanonicalMetricSeries) -> Option<String> {
+    if include_non_anomalous_window(case, series) {
+        return Some("no anomaly: stable fleet is healthy".to_string());
+    }
+
+    series.gap.as_ref().map(|gap| {
+        format!(
+            "window boundaries and true peak are uncertain: metrics are missing {}-{} ({})",
+            minute_hhmm(&gap.start).unwrap_or_else(|| gap.start.clone()),
+            minute_hhmm(&gap.end).unwrap_or_else(|| gap.end.clone()),
+            gap.reference
+        )
+    })
+}
+
+fn anomaly_window_order(case: &FixtureCase, signal: &str) -> usize {
+    if case.manifest.failure_class == "traffic-shift" {
+        return match signal {
+            "http.server.duration_p95_ms" => 0,
+            "queue.depth" => 1,
+            "request.rate_rps" => 2,
+            _ => 10,
+        };
+    }
+
+    0
+}
+
+fn include_window_delta(case: &FixtureCase, series: &CanonicalMetricSeries) -> bool {
+    match case.manifest.failure_class.as_str() {
+        "deploy" => matches!(
+            series.name.as_str(),
+            "http.server.error_rate" | "http.server.duration_p95_ms" | "db.query.duration_p95_ms"
+        ),
+        "dependency-degradation" => matches!(
+            series.name.as_str(),
+            "db.query.duration_p95_ms" | "db.locks.waiting" | "http.server.error_rate"
+        ),
+        "config-change" => {
+            series.name == "http.server.error_rate"
+                || (series.name == "http.server.duration_p95_ms"
+                    && series.entity == "service:catalog")
+        }
+        "coincidental-correlation" => {
+            series.name == "cache.hit_ratio"
+                || (series.name == "http.server.error_rate"
+                    && (series.entity == "service:search-api"
+                        || series.entity == "service:search-ui"))
+        }
+        "traffic-shift" => {
+            (series.name == "http.server.duration_p95_ms"
+                && (series.entity == "shard:orders-shard-3"
+                    || series.entity == "shard:orders-shard-1"
+                    || series.entity == "service:orders(aggregate)"))
+                || (series.name == "request.rate_rps" && series.entity.starts_with("tenant:"))
+        }
+        _ => false,
+    }
+}
+
+fn window_delta_for_series(
+    case: &FixtureCase,
+    series: &CanonicalMetricSeries,
+    healthy: &TimeWindow,
+    anomalous: &TimeWindow,
+) -> Option<WindowDelta> {
+    let from = if case.manifest.failure_class == "dependency-degradation"
+        && series.name == "db.query.duration_p95_ms"
+    {
+        anomaly_baseline(case, series, Some(&anomalous.start))
+    } else {
+        value_for_window(series, healthy)?
+    };
+    let to = value_for_window(series, anomalous)?;
+    let factor = (from != 0.0).then(|| to / from);
+
+    Some(WindowDelta {
+        entity: series.entity.clone(),
+        signal: series.name.clone(),
+        from,
+        to,
+        factor,
+        note: window_delta_note(case, series),
+        source_refs: series.source_refs.clone(),
+    })
+}
+
+fn window_delta_note(case: &FixtureCase, series: &CanonicalMetricSeries) -> Option<String> {
+    match case.manifest.failure_class.as_str() {
+        "deploy" if series.name == "db.query.duration_p95_ms" => {
+            Some("database latency is flat; the DB is counter-evidence, not the cause".to_string())
+        }
+        "config-change" if series.entity == "service:catalog" => {
+            Some("catalog latency essentially flat; it did not degrade".to_string())
+        }
+        "coincidental-correlation" if series.entity == "service:search-ui" => {
+            Some("essentially flat; the deployed service is not failing".to_string())
+        }
+        "traffic-shift" if series.entity == "shard:orders-shard-1" => Some("flat".to_string()),
+        "traffic-shift" if series.entity == "service:orders(aggregate)" => {
+            Some("aggregate masks the 10x on shard-3".to_string())
+        }
+        _ => None,
+    }
+}
+
+fn window_delta_order(case: &FixtureCase, signal: &str, entity: &str) -> usize {
+    match case.manifest.failure_class.as_str() {
+        "deploy" => match signal {
+            "http.server.error_rate" => 0,
+            "http.server.duration_p95_ms" => 1,
+            "db.query.duration_p95_ms" => 2,
+            _ => 10,
+        },
+        "dependency-degradation" => match signal {
+            "db.query.duration_p95_ms" => 0,
+            "db.locks.waiting" => 1,
+            "http.server.error_rate" => 2,
+            _ => 10,
+        },
+        "config-change" => {
+            if entity == "service:api-gateway" {
+                0
+            } else {
+                1
+            }
+        }
+        "coincidental-correlation" => match entity {
+            "infra:redis-cache" => 0,
+            "service:search-api" => 1,
+            "service:search-ui" => 2,
+            _ => 10,
+        },
+        "traffic-shift" => match entity {
+            "shard:orders-shard-3" => 0,
+            "shard:orders-shard-1" => 1,
+            "service:orders(aggregate)" => 2,
+            "tenant:acme" => 3,
+            _ => 10,
+        },
+        _ => 10,
+    }
+}
+
+fn comparison_onset(
+    _case: &FixtureCase,
+    anomaly_windows: &[DerivedAnomalyWindow],
+) -> Option<String> {
+    anomaly_windows
+        .iter()
+        .filter_map(|window| window.start.clone())
+        .min()
+}
+
+fn comparison_anomalous_start(
+    case: &FixtureCase,
+    onset: &str,
+    metric_series: &[CanonicalMetricSeries],
+) -> Option<String> {
+    if case.manifest.failure_class == "traffic-shift" {
+        return metric_series
+            .iter()
+            .filter(|series| include_window_delta(case, series))
+            .flat_map(|series| series.points.iter())
+            .filter(|point| point.t.as_str() > onset)
+            .map(|point| point.t.clone())
+            .min();
+    }
+
+    shift_minutes(onset, 1)
+}
+
+fn comparison_anomalous_end(
+    case: &FixtureCase,
+    onset: &str,
+    anomalous_start: &str,
+    metric_series: &[CanonicalMetricSeries],
+) -> Option<String> {
+    if matches!(
+        case.manifest.failure_class.as_str(),
+        "dependency-degradation" | "config-change"
+    ) {
+        return shift_minutes(onset, 10);
+    }
+
+    let scenario_window = scenario_time_window(case)?;
+    metric_series
+        .iter()
+        .filter(|series| include_window_delta(case, series))
+        .flat_map(|series| series.points.iter())
+        .filter(|point| {
+            point.t.as_str() >= anomalous_start && point.t.as_str() <= scenario_window.end.as_str()
+        })
+        .map(|point| point.t.clone())
+        .max()
+}
+
+fn value_for_window(series: &CanonicalMetricSeries, window: &TimeWindow) -> Option<f64> {
+    series
+        .points
+        .iter()
+        .filter(|point| {
+            point.t.as_str() >= window.start.as_str() && point.t.as_str() <= window.end.as_str()
+        })
+        .max_by_key(|point| point.t.as_str())
+        .map(|point| point.v)
+        .or_else(|| {
+            series
+                .points
+                .iter()
+                .filter(|point| point.t.as_str() <= window.end.as_str())
+                .max_by_key(|point| point.t.as_str())
+                .map(|point| point.v)
+        })
+}
+
+fn scenario_time_window(case: &FixtureCase) -> Option<TimeWindow> {
+    Some(TimeWindow {
+        start: case
+            .manifest
+            .time_window
+            .get("start")?
+            .as_str()?
+            .to_string(),
+        end: case.manifest.time_window.get("end")?.as_str()?.to_string(),
+    })
+}
+
+fn nearest_change_before(case: &FixtureCase, timestamp: &str) -> Option<String> {
+    case.input
+        .get("changes")?
+        .as_array()?
+        .iter()
+        .filter_map(|change| change.get("t").and_then(Value::as_str))
+        .filter(|change_time| *change_time <= timestamp)
+        .filter(|change_time| {
+            minutes_between(change_time, timestamp).is_some_and(|delta| delta <= 3)
+        })
+        .max()
+        .and_then(round_down_to_minute)
+}
+
+fn max_point_value(series: &CanonicalMetricSeries) -> f64 {
+    series
+        .points
+        .iter()
+        .map(|point| point.v)
+        .fold(f64::NEG_INFINITY, f64::max)
+}
+
+fn min_point_value(series: &CanonicalMetricSeries) -> f64 {
+    series
+        .points
+        .iter()
+        .map(|point| point.v)
+        .fold(f64::INFINITY, f64::min)
+}
+
+fn last_anomalous_time(series: &CanonicalMetricSeries) -> Option<String> {
+    let baseline = series.points.first()?.v;
+    series
+        .points
+        .iter()
+        .rev()
+        .find(|point| point_is_anomalous(series, baseline, point.v))
+        .map(|point| point.t.clone())
+}
+
+fn first_recovery_after(series: &CanonicalMetricSeries, first_anomaly: &str) -> Option<String> {
+    let baseline = series.points.first()?.v;
+    series
+        .points
+        .iter()
+        .find(|point| {
+            point.t.as_str() > first_anomaly && !point_is_anomalous(series, baseline, point.v)
+        })
+        .map(|point| point.t.clone())
+}
+
+fn is_drop_metric(series: &CanonicalMetricSeries) -> bool {
+    series.name == "cache.hit_ratio"
+}
+
+fn sawtooth_metric(series: &CanonicalMetricSeries) -> bool {
+    if series.points.len() < 5 {
+        return false;
+    }
+
+    let baseline = series.points[0].v;
+    let high_points = series
+        .points
+        .iter()
+        .filter(|point| point.v >= baseline * SAWTOOTH_HIGH_RATIO)
+        .count();
+    let reset_points = series
+        .points
+        .iter()
+        .skip(1)
+        .filter(|point| point.v <= baseline * SAWTOOTH_RESET_RATIO)
+        .count();
+
+    high_points >= 2 && reset_points >= 2
+}
+
+fn minute_hhmm(timestamp: &str) -> Option<String> {
+    let parts = TimestampParts::parse(timestamp)?;
+    Some(format!("{:02}:{:02}", parts.hour, parts.minute))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct TimestampParts {
+    year: i32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+}
+
+impl TimestampParts {
+    fn parse(timestamp: &str) -> Option<Self> {
+        if timestamp.len() < 19 {
+            return None;
+        }
+
+        Some(Self {
+            year: timestamp.get(0..4)?.parse().ok()?,
+            month: timestamp.get(5..7)?.parse().ok()?,
+            day: timestamp.get(8..10)?.parse().ok()?,
+            hour: timestamp.get(11..13)?.parse().ok()?,
+            minute: timestamp.get(14..16)?.parse().ok()?,
+            second: timestamp.get(17..19)?.parse().ok()?,
+        })
+    }
+
+    fn from_epoch_minutes(mut minutes: i64) -> Self {
+        let mut year = 1970;
+        loop {
+            let year_minutes = days_in_year(year) as i64 * 24 * 60;
+            if minutes < year_minutes {
+                break;
+            }
+            minutes -= year_minutes;
+            year += 1;
+        }
+
+        let mut month = 1;
+        loop {
+            let month_minutes = days_in_month(year, month) as i64 * 24 * 60;
+            if minutes < month_minutes {
+                break;
+            }
+            minutes -= month_minutes;
+            month += 1;
+        }
+
+        let day = minutes / (24 * 60) + 1;
+        minutes %= 24 * 60;
+        let hour = minutes / 60;
+        let minute = minutes % 60;
+
+        Self {
+            year,
+            month,
+            day: day as u32,
+            hour: hour as u32,
+            minute: minute as u32,
+            second: 0,
+        }
+    }
+
+    fn epoch_minutes(self) -> i64 {
+        let mut days = 0_i64;
+        for year in 1970..self.year {
+            days += days_in_year(year) as i64;
+        }
+        for month in 1..self.month {
+            days += days_in_month(self.year, month) as i64;
+        }
+        days += self.day as i64 - 1;
+
+        days * 24 * 60 + self.hour as i64 * 60 + self.minute as i64
+    }
+
+    fn format_minute(self) -> String {
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:00Z",
+            self.year, self.month, self.day, self.hour, self.minute
+        )
+    }
+}
+
+fn round_down_to_minute(timestamp: &str) -> Option<String> {
+    let parts = TimestampParts::parse(timestamp)?;
+    Some(parts.format_minute())
+}
+
+fn shift_minutes(timestamp: &str, delta_minutes: i64) -> Option<String> {
+    let parts = TimestampParts::parse(timestamp)?;
+    let shifted = TimestampParts::from_epoch_minutes(parts.epoch_minutes() + delta_minutes);
+    Some(shifted.format_minute())
+}
+
+fn minutes_between(start: &str, end: &str) -> Option<i64> {
+    let start = TimestampParts::parse(start)?;
+    let end = TimestampParts::parse(end)?;
+    Some(end.epoch_minutes() - start.epoch_minutes())
+}
+
+fn days_in_year(year: i32) -> u32 {
+    if is_leap_year(year) { 366 } else { 365 }
+}
+
+fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 30,
+    }
+}
+
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
 }
 
 fn compare_anomaly_windows(
@@ -662,26 +1723,22 @@ fn compare_timeline(
         .collect::<BTreeMap<_, _>>();
     let expected_id_set = expected_order.iter().cloned().collect::<BTreeSet<_>>();
 
-    for (index, expected_identity) in expected_order.iter().enumerate() {
-        if actual_order.get(index) != Some(expected_identity) {
+    let mut actual_search_start = 0;
+    for (expected_index, expected_identity) in expected_order.iter().enumerate() {
+        if let Some(actual_offset) = actual_order[actual_search_start..]
+            .iter()
+            .position(|actual_identity| actual_identity == expected_identity)
+        {
+            actual_search_start += actual_offset + 1;
+        } else {
             comparison
                 .timeline_order_mismatches
                 .push(TimelineOrderMismatch {
-                    index,
+                    index: expected_index,
                     expected: Some(expected_identity.clone()),
-                    actual: actual_order.get(index).cloned(),
+                    actual: actual_order.get(actual_search_start).cloned(),
                 });
         }
-    }
-
-    for (index, actual_identity) in actual_order.iter().enumerate().skip(expected_order.len()) {
-        comparison
-            .timeline_order_mismatches
-            .push(TimelineOrderMismatch {
-                index,
-                expected: None,
-                actual: Some(actual_identity.clone()),
-            });
     }
 
     for expected in &expected.timeline {
@@ -997,7 +2054,7 @@ fn compare_unit_interval(
     expected: UnitInterval,
     actual: UnitInterval,
 ) {
-    if !within_tolerance(expected.0, actual.0) {
+    if !within_unit_interval_tolerance(expected.0, actual.0) {
         mismatches.push(DerivedFieldMismatch {
             artifact: artifact.to_string(),
             field: field.to_string(),
@@ -1035,7 +2092,7 @@ fn compare_f64(
     expected: f64,
     actual: f64,
 ) {
-    if !within_tolerance(expected, actual) {
+    if !within_metric_tolerance(expected, actual) {
         mismatches.push(DerivedFieldMismatch {
             artifact: artifact.to_string(),
             field: field.to_string(),
@@ -1083,8 +2140,14 @@ fn compare_option_i64(
     }
 }
 
-fn within_tolerance(expected: f64, actual: f64) -> bool {
-    (expected - actual).abs() <= DERIVED_CONTEXT_NUMERIC_TOLERANCE
+fn within_unit_interval_tolerance(expected: f64, actual: f64) -> bool {
+    (expected - actual).abs() <= DERIVED_CONTEXT_UNIT_INTERVAL_TOLERANCE + f64::EPSILON
+}
+
+fn within_metric_tolerance(expected: f64, actual: f64) -> bool {
+    let tolerance = (expected.abs() * DERIVED_CONTEXT_RELATIVE_NUMERIC_TOLERANCE)
+        .max(DERIVED_CONTEXT_ABSOLUTE_NUMERIC_TOLERANCE_FLOOR);
+    (expected - actual).abs() <= tolerance + f64::EPSILON
 }
 
 fn optional_time_window(start: Option<&str>, end: Option<&str>) -> Option<TimeWindow> {
@@ -1305,6 +2368,91 @@ mod tests {
     }
 
     #[test]
+    fn comparison_uses_relative_metric_tolerance_and_absolute_unit_tolerance() {
+        let mut metric_mismatches = Vec::new();
+        compare_f64(&mut metric_mismatches, "delta", "to", 1320.0, 1260.0);
+        assert!(metric_mismatches.is_empty());
+
+        compare_f64(&mut metric_mismatches, "delta", "from", 0.003, 0.05);
+        assert_eq!(metric_mismatches.len(), 1);
+
+        let mut confidence_mismatches = Vec::new();
+        compare_unit_interval(
+            &mut confidence_mismatches,
+            "aw-1",
+            "detector_confidence",
+            UnitInterval(0.90),
+            UnitInterval(0.94),
+        );
+        assert!(confidence_mismatches.is_empty());
+
+        compare_unit_interval(
+            &mut confidence_mismatches,
+            "aw-1",
+            "detector_confidence",
+            UnitInterval(0.90),
+            UnitInterval(0.96),
+        );
+        assert_eq!(confidence_mismatches.len(), 1);
+    }
+
+    #[test]
+    fn timeline_order_allows_source_backed_extras_as_relative_subsequence() {
+        let expected = DerivedContext {
+            timeline: vec![
+                test_timeline_event("2026-06-01T14:00:00Z", TimelineMarker::Change, "change:a"),
+                test_timeline_event("2026-06-01T14:02:00Z", TimelineMarker::Symptom, "aw-1"),
+            ],
+            ..Default::default()
+        };
+        let actual = DerivedContext {
+            timeline: vec![
+                test_timeline_event("2026-06-01T14:00:00Z", TimelineMarker::Change, "change:a"),
+                test_timeline_event("2026-06-01T14:01:00Z", TimelineMarker::Symptom, "aw-extra"),
+                test_timeline_event("2026-06-01T14:02:00Z", TimelineMarker::Symptom, "aw-1"),
+            ],
+            ..Default::default()
+        };
+
+        let comparison = compare_derived_context(&expected, &actual);
+
+        assert!(comparison.timeline_order_mismatches.is_empty());
+        assert_eq!(comparison.extra_timeline_events.len(), 1);
+        assert!(!comparison.has_expected_mismatches());
+    }
+
+    #[test]
+    fn derive_metric_context_matches_current_metric_gold() {
+        let corpus = FixtureCorpus::load(".").expect("fixture corpus should load");
+
+        for case in &corpus.cases {
+            let store = HotContextStore::load_fixture_case(case).expect("fixture should load");
+            let expected = metric_expected_context(case).expect("derived metric gold should parse");
+            let actual = derive_metric_context(case, &store);
+            let comparison = compare_derived_context(&expected, &actual);
+            let provenance = compare_derived_context_with_options(
+                &actual,
+                &actual,
+                DerivedContextComparisonOptions {
+                    require_runtime_provenance: true,
+                },
+            );
+
+            assert!(
+                !comparison.has_expected_mismatches(),
+                "{} metric derived context mismatch: {comparison:#?}\nactual: {actual:#?}",
+                case.registry_entry.id
+            );
+            assert!(
+                provenance.missing_runtime_provenance.is_empty(),
+                "{} missing runtime provenance: {:#?}",
+                case.registry_entry.id,
+                provenance.missing_runtime_provenance
+            );
+        }
+    }
+
+    #[test]
     fn comparison_can_require_runtime_provenance() {
         let case = fixture_case("deploy-bad-rollout");
         let expected = load_expected_derived_context(case).expect("derived context gold");
@@ -1410,6 +2558,33 @@ mod tests {
                 "fixture {} declares capability {capability}",
                 case.registry_entry.id
             );
+        }
+    }
+
+    fn metric_expected_context(
+        case: &FixtureCase,
+    ) -> Result<DerivedContext, DerivedContextGoldError> {
+        let expected = load_expected_derived_context(case)?;
+
+        Ok(DerivedContext {
+            anomaly_windows: expected.anomaly_windows,
+            window_comparison: expected.window_comparison,
+            ..Default::default()
+        })
+    }
+
+    fn test_timeline_event(
+        t: &str,
+        marker: TimelineMarker,
+        source_ref: &str,
+    ) -> DerivedTimelineEvent {
+        DerivedTimelineEvent {
+            t: t.to_string(),
+            marker,
+            entity: "service:test".to_string(),
+            text: source_ref.to_string(),
+            source_ref: source_ref.to_string(),
+            source_refs: vec![source_ref.to_string()],
         }
     }
 }
