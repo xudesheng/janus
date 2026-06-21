@@ -3,5 +3,6 @@ pub mod fixture_simulator;
 pub mod fixture_validation;
 pub mod fixtures;
 pub mod hot_context_store;
+pub mod otlp_ingest;
 pub mod query;
 pub mod references;
