@@ -122,6 +122,13 @@ load a full fixture store for convenience, but the resolver must filter its
 input to raw source kinds or use a raw-input-only store construction path so it
 cannot copy `expected.json`.
 
+Phase 1 must make this a structural API boundary, not only an implementor
+discipline rule. The store should expose a raw-source read path or equivalent
+kind predicate that excludes all derived record kinds, including gold entities,
+relationships, anomaly windows, log patterns, evidence items, timeline events,
+suspected causes, next checks, entity context, related anomalies, and window
+comparisons.
+
 Store `entities` metadata is a selector hint, not the entity-resolution source
 of truth. For example, resource records may need to be resolved from
 `payload.attributes["service.name"]`, `service.version`,
@@ -225,6 +232,18 @@ investigation unit, the resolver should produce variant identities:
 - explicit version or deployment attributes may be used as discriminators, but
   should not create noisy variants when there is no ambiguity.
 
+For the `ambiguous-entity-resolution` fixture, the variant token rule is pinned:
+
+- records with `rollout=canary` map to `service:payments@canary`;
+- non-canary records with the same `service.name`, a concrete
+  `service.version`, and concrete `service.instance.id` values merge into
+  `service:payments@stable`;
+- records with the same `service.name` but missing both `service.version` and
+  `service.instance.id` map to `service:payments@unresolved`;
+- the stable resources `res:payments-stable-a` and
+  `res:payments-stable-b` merge into one stable service identity, with separate
+  `deployed-as` relationships to their instance identities.
+
 The `ambiguous-entity-resolution` fixture is the required test case. The
 resolver must keep `service:payments@canary`,
 `service:payments@stable`, and `service:payments@unresolved` separate. A
@@ -293,6 +312,14 @@ Suggested bands:
 - `0.30` to `0.59`: unresolved or ambiguous identity with plausible
   alternatives;
 - below `0.30`: too weak to promote unless needed as explicit missing data.
+
+The bands are explanatory defaults, not the fixture comparison oracle. When a
+fixture provides a concrete confidence value, the deterministic resolver value
+must fall within the comparison tolerance for that concrete value. For the
+ambiguous payments fixture, this means the resolver should target approximately
+`0.96` for `service:payments@canary`, `0.95` for
+`service:payments@stable`, and `0.40` for
+`service:payments@unresolved`, not merely any value inside the unresolved band.
 
 Confidence must not be reused as causal confidence. It answers "how sure are we
 that this record maps to this entity or relationship?", not "is this the root
@@ -398,12 +425,23 @@ For the first implementation, gold fixture records are the required subset. The
 resolver may produce extra lower-level entities, such as instances, as long as
 they are deterministic, source-backed, and do not contradict the gold output.
 
+The required fixture set for Phase 4 is all currently registered fixtures that
+declare `entity-resolution` or `relationship-building`; today that is the full
+current fixture corpus. There are no pre-approved unsupported fixtures. If an
+implementation cannot derive a fixture's expected entity or relationship, the
+next review round must name the fixture, the exact missing relationship or
+entity class, and why it cannot land in that round. Silent omission is a
+failure.
+
 Recommended tolerances:
 
 - exact id and kind match for expected entities;
 - exact `src`, `type`, and `dst` match for expected relationships;
 - confidence may differ by a small tolerance, such as `0.05`;
 - alternatives and missing attributes should match by id/name, not array order;
+- discriminator values should match by JSON value, with JSON arrays compared as
+  order-independent sets when the fixture uses an array to represent multiple
+  equivalent observed values;
 - relationship evidence should include at least one resolvable supporting ref
   when the gold relationship has evidence.
 
