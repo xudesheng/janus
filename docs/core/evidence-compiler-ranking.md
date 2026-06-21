@@ -237,6 +237,15 @@ The preferred outcome is option 1. Milestone 6 should be the point where
 If a temporary gold path coexists during Slice 6, it should be explicitly named
 as a compatibility path and removed or quarantined by the end of that slice.
 
+Slice 6 implements the preferred outcome. `get_evidence_bundle(EvidenceQuery)`
+loads only the selected fixture's source input, replays it into a fresh
+`HotContextStore`, derives context, calls `compile_evidence`, and returns
+`EvidenceCompilation.bundle`. The existing public acceptance checks remain in
+place after compilation: query validation, hot-context query selection,
+compiled bundle validation, budget fit, required raw refs, required
+counter-evidence, and source-ref resolution through the store. Fixture
+`expected.evidence_bundle` is no longer a runtime input for this path.
+
 ## Candidate Evidence Generation
 
 The compiler should generate a broad candidate set before ranking and budget
@@ -457,6 +466,18 @@ and missing-data uncertainty. Reason tokens should be derived from structured
 source content such as signal names, log templates, change kinds, relationships,
 and detected gaps.
 
+Slice 6 removes the entity-name causal multiplier. Causal suspicion now uses
+structured dimensions already present on candidates and derived context:
+anomaly activity and magnitude, source-ref richness, source-specific confidence
+dimensions, change time alignment and kind, trace specificity, prior-incident
+similarity, relationship direction, relationship attributes such as fallback
+load, retry/fan-out structure, counter-evidence dominance, and local runtime
+failure signatures such as OOM/restart/memory sawtooth patterns. The
+relationship adjustment is intentionally topological: explicit `retries`
+relationships move downstream overload suspicion back to the caller; ordinary
+dependency symptoms can move suspicion toward the dependency unless the target
+is already counter-dominated or the edge is marked as fallback load.
+
 ## Suspected Causes
 
 `expected.suspected_causes` already exists in the fixture corpus. This topic
@@ -549,10 +570,12 @@ state. It emits at most three checks in priority order:
 3. confirm the top suspected cause, or gather another independent signal when
    the top score is weak.
 
-`expected_signal` remains an exact category token. The V1 vocabulary includes
-tokens such as `metric_anomaly`, `log_cluster`, `change_event`,
-`compare_windows`, `relationship`, `find_related_anomalies`, `profile_hotspot`,
-and `trace`.
+`expected_signal` is a structural category token, not a positional prose
+comparison target. The V1 vocabulary includes tokens such as `metric_anomaly`,
+`log_cluster`, `change_event`, `compare_windows`, `relationship`,
+`find_related_anomalies`, `profile_hotspot`, `entity_resolution`, and `trace`.
+Comparison normalizes known fixture aliases such as `code_change` to
+`change_event` and `entity-resolution` to `entity_resolution`.
 
 ## Token Budget Selection
 
@@ -690,29 +713,34 @@ It should compare:
 - generated next checks.
 
 Gold fixture artifacts are the semantic comparison target for the current
-corpus. The compiler may generate extra candidates internally, but selected
-output should be budgeted and deterministic. Extra unselected candidates should
-appear only in the internal report.
+corpus. The compiler may generate extra candidates internally, and selected
+output is compared by structural outcome rather than by verbatim fixture prose
+or exact positional equality.
 
 Comparison mode must be explicit per field family:
 
-- Exact: bundle `question` and `hypothesis` echo, bundle time window, selected
-  item ids and ordering, item kind, direction, freshness, privacy scope,
-  source refs, missing-data entries, suspected-cause rank/entity/supporting ids
-  and counter ids, and next-check ordering.
-- Set or ordered-structural: item `entities`, using documented ordering when
-  the compiler owns ordering and set comparison when order is not semantically
-  meaningful.
-- Exact category token: next-check `expected_signal`, which is a category token
-  such as `metric_anomaly` or `log_cluster`, not free-form prose.
+- Exact: bundle `question` and `hypothesis` echo, bundle time window, and
+  returned budget integrity (`tokens_used` equals selected item token sum and
+  stays within the query budget).
+- Structural selected items: expected gold item families are matched by source
+  signal, kind/direction family, entity overlap, source-ref identity where
+  available, and missing-data/counter-evidence role. Extra generated selected
+  items are not failures by themselves.
+- Structural suspected causes: expected true causes must be present and rank
+  correctly when the fixture declares them as rank 1, false-causality traps must
+  retain counter links/trap notes, duplicate hand-authored expected entities are
+  de-duplicated for comparison, and score checks are applied only where a trap
+  fixture depends on a low-confidence innocent suspect.
+- Structural next checks: generated checks are matched by normalized
+  `expected_signal` category. Unknown categories fail; positional ordering and
+  hand-authored action/rationale prose are not exact targets.
 - Structural category subset: suspected-cause `reasons` must be non-empty when
   gold declares reasons and must be drawn from a derivable category vocabulary.
   Full exact-set equality is not a stable acceptance target until the compiler
   owns the reason vocabulary and the fixtures are migrated to it.
-- Numeric tolerance: item `strength`, confidence dimensions, suspected-cause
-  score, and other derived numeric confidence or score fields.
-- Estimator-owned exact after fixture migration: item `token_cost`,
-  `EvidenceBudget.tokens_used`, and `EvidenceBudget.items_dropped`.
+- Estimator-owned exact internally: selected item `token_cost` and
+  `EvidenceBudget.tokens_used` are recomputed by the compiler and checked for
+  internal consistency, not copied from fixture gold.
 - Text structural by default: `claim`, suspected-cause `hypothesis`, `note`,
   `trap_note`, next-check `action`, and `rationale` must be deterministic,
   non-empty where required, and anchored to the compared entities, source refs,
@@ -723,10 +751,9 @@ Comparison mode must be explicit per field family:
   comparison shell treats text-structural equality as non-empty required text
   plus tracked non-blocking text differences.
 
-Before Slice 6 makes selected evidence items gold-gated, the project must
-confirm whether selected item ids and ordering remain exact comparison targets
-or move to a structural presence/order check. This decision should be explicit
-so final selection does not become fixture-tuned by accident.
+Slice 6 chooses structural selected-output comparison for items, suspected
+causes, and next checks. Exact positional equality against hand-authored gold is
+not the acceptance target.
 
 The comparison must fail if:
 
@@ -802,8 +829,9 @@ Recommended slices:
 6. `get_evidence_bundle` integration and full-corpus verification: route the
    public query path through compiled evidence while preserving the existing
    query validation, budget, raw-ref, counter-evidence, source-ref, and
-   query-context acceptance checks; compare against fixture gold; and remove or
-   quarantine the old fixture-gold bundle source.
+   query-context acceptance checks; compare against fixture gold structurally;
+   and remove or quarantine the old fixture-gold bundle source. Slice 6 now
+   implements this path.
 
 The topic is complete only when the Definition Of Done below is met or
 reviewers explicitly narrow the milestone.

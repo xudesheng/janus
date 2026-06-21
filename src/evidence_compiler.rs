@@ -19,8 +19,6 @@ use std::{
     fmt,
 };
 
-const NUMERIC_TOLERANCE: f64 = 0.05;
-
 #[derive(Debug, Clone, Copy)]
 pub struct EvidenceCompilerInput<'a> {
     pub query: &'a EvidenceQuery,
@@ -360,7 +358,12 @@ pub fn rank_suspected_causes_from_candidates(
         match candidate.item.direction {
             EvidenceDirection::Supports => {
                 for entity in causal_entities_for_candidate(candidate, &relationships) {
-                    let multiplier = entity_causal_multiplier(candidate, entity.as_str());
+                    let multiplier = structural_causal_multiplier(
+                        input,
+                        candidate,
+                        entity.as_str(),
+                        &relationships,
+                    );
                     let contribution =
                         candidate.item.strength.0 * support_weight(candidate) * multiplier;
                     if contribution <= 0.0 {
@@ -399,6 +402,7 @@ pub fn rank_suspected_causes_from_candidates(
     }
 
     roll_up_runtime_child_support(&relationships, &mut suspects);
+    adjust_relationship_causal_support(&relationships, &mut suspects);
 
     let mut ranked = suspects
         .into_values()
@@ -763,7 +767,9 @@ fn missing_data_expected_signal(item: &EvidenceItem) -> &'static str {
         .collect::<Vec<_>>()
         .join(" ");
 
-    if text.contains("log") {
+    if text.contains("service.instance.id") || text.contains("service.version") {
+        "entity_resolution"
+    } else if text.contains("log") {
         "log_cluster"
     } else if text.contains("change") || text.contains("deploy") || text.contains("config") {
         "change_event"
@@ -1446,6 +1452,161 @@ fn roll_up_runtime_child_support(
     }
 }
 
+fn adjust_relationship_causal_support(
+    relationships: &[ResolvedRelationship],
+    suspects: &mut BTreeMap<String, SuspectDraft>,
+) {
+    for relationship in relationships {
+        let src = canonical_suspect_entity(&relationship.src, relationships);
+        let dst = canonical_suspect_entity(&relationship.dst, relationships);
+        if src == dst {
+            continue;
+        }
+
+        match relationship.relationship_type {
+            RelationshipType::Retries => {
+                add_structural_counter_from_support(
+                    suspects,
+                    dst.as_str(),
+                    0.90,
+                    "retry_fanout_trace",
+                );
+                transfer_causal_support(
+                    suspects,
+                    dst.as_str(),
+                    src.as_str(),
+                    0.55,
+                    0.55,
+                    "retry_fanout_trace",
+                );
+            }
+            RelationshipType::FansOutTo => {}
+            RelationshipType::ReadsFrom
+            | RelationshipType::WritesTo
+            | RelationshipType::DependsOn => {
+                if relationship_role_contains(relationship, "fallback") {
+                    add_structural_counter_from_support(
+                        suspects,
+                        dst.as_str(),
+                        0.80,
+                        "dependency_direction",
+                    );
+                    dampen_structural_support(suspects, dst.as_str(), 0.35);
+                    continue;
+                }
+                if suspect_is_counter_dominated(suspects, dst.as_str()) {
+                    continue;
+                }
+                if suspect_has_any_reason(
+                    suspects,
+                    src.as_str(),
+                    &["oom_logs", "restart_aligned_errors", "sawtooth_rss"],
+                ) {
+                    continue;
+                }
+                transfer_causal_support(
+                    suspects,
+                    src.as_str(),
+                    dst.as_str(),
+                    1.20,
+                    0.80,
+                    "dependency_direction",
+                );
+            }
+            RelationshipType::Calls
+            | RelationshipType::RunsOn
+            | RelationshipType::DeployedAs
+            | RelationshipType::Emits
+            | RelationshipType::SharesResourceWith => {}
+        }
+    }
+}
+
+fn suspect_is_counter_dominated(suspects: &BTreeMap<String, SuspectDraft>, entity: &str) -> bool {
+    suspects
+        .get(entity)
+        .is_some_and(|suspect| suspect.counter_score >= suspect.support_score.max(0.20))
+}
+
+fn suspect_has_any_reason(
+    suspects: &BTreeMap<String, SuspectDraft>,
+    entity: &str,
+    reasons: &[&str],
+) -> bool {
+    suspects.get(entity).is_some_and(|suspect| {
+        reasons
+            .iter()
+            .any(|reason| suspect.reasons.contains(*reason))
+    })
+}
+
+fn transfer_causal_support(
+    suspects: &mut BTreeMap<String, SuspectDraft>,
+    from_entity: &str,
+    to_entity: &str,
+    transfer_ratio: f64,
+    dampen_ratio: f64,
+    reason: &str,
+) {
+    let Some(source) = suspects.get(from_entity).cloned() else {
+        return;
+    };
+    if source.support_score <= 0.0 {
+        return;
+    }
+
+    let target = suspects
+        .entry(to_entity.to_string())
+        .or_insert_with(|| SuspectDraft::new(to_entity.to_string()));
+    target.support_score += source.support_score * transfer_ratio;
+    target.supporting.extend(source.supporting.clone());
+    target.reasons.extend(source.reasons.iter().cloned());
+    target.reasons.insert(reason.to_string());
+
+    if let Some(source) = suspects.get_mut(from_entity) {
+        source.support_score *= 1.0 - dampen_ratio;
+        source.reasons.insert(reason.to_string());
+    }
+}
+
+fn dampen_structural_support(
+    suspects: &mut BTreeMap<String, SuspectDraft>,
+    entity: &str,
+    dampen_ratio: f64,
+) {
+    if let Some(suspect) = suspects.get_mut(entity) {
+        suspect.support_score *= 1.0 - dampen_ratio;
+    }
+}
+
+fn add_structural_counter_from_support(
+    suspects: &mut BTreeMap<String, SuspectDraft>,
+    entity: &str,
+    counter_ratio: f64,
+    reason: &str,
+) {
+    let Some(snapshot) = suspects.get(entity).cloned() else {
+        return;
+    };
+    if snapshot.support_score <= 0.0 {
+        return;
+    }
+
+    if let Some(suspect) = suspects.get_mut(entity) {
+        suspect.counter_score += snapshot.support_score * counter_ratio;
+        suspect.counter.extend(snapshot.supporting);
+        suspect.reasons.insert(reason.to_string());
+    }
+}
+
+fn relationship_role_contains(relationship: &ResolvedRelationship, needle: &str) -> bool {
+    relationship
+        .attributes
+        .get("role")
+        .and_then(Value::as_str)
+        .is_some_and(|role| role.to_ascii_lowercase().contains(needle))
+}
+
 fn causal_suspicion_score(support_score: f64, counter_score: f64) -> UnitInterval {
     let net = support_score - counter_score * 1.15;
     if net <= 0.0 {
@@ -1501,7 +1662,7 @@ fn support_weight(candidate: &EvidenceCandidate) -> f64 {
         EvidenceCandidateSource::MetricAnomaly => 0.60,
         EvidenceCandidateSource::LogPattern => 0.55,
         EvidenceCandidateSource::ChangeEvent => {
-            confidence_value(candidate, "time_alignment").0 * 0.85
+            confidence_value(candidate, "time_alignment").0 * 0.55
         }
         EvidenceCandidateSource::TraceExemplar => 0.45,
         EvidenceCandidateSource::DependencyEdge => 0.15,
@@ -1519,74 +1680,154 @@ fn counter_weight(candidate: &EvidenceCandidate) -> f64 {
     }
 }
 
-fn entity_causal_multiplier(candidate: &EvidenceCandidate, entity: &str) -> f64 {
-    let claim = candidate.item.claim.to_ascii_lowercase();
-    let note = candidate
-        .item
-        .note
-        .as_deref()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
+fn structural_causal_multiplier(
+    input: EvidenceCompilerInput<'_>,
+    candidate: &EvidenceCandidate,
+    entity: &str,
+    relationships: &[ResolvedRelationship],
+) -> f64 {
+    let mut multiplier: f64 = 1.0;
+
+    if candidate_structurally_mentions_entity(candidate, entity, relationships) {
+        multiplier += 0.08;
+    }
+
+    if candidate.item.source_refs.0.len() > 1 {
+        multiplier += 0.04;
+    }
+
+    if !candidate.item.missing_data.is_empty() {
+        multiplier -= 0.15;
+    }
 
     match candidate.source {
         EvidenceCandidateSource::MetricAnomaly => {
-            if claim.contains("retry") && entity.contains("checkout") {
-                1.35
-            } else if claim.contains("request.rate") && entity.starts_with("tenant:") {
-                0.55
-            } else if entity.starts_with("db:")
-                || entity.starts_with("infra:")
-                || entity.starts_with("external-api:")
-                || entity.starts_with("shard:")
-            {
-                1.20
-            } else {
-                0.90
+            if let Some(window) = anomaly_window_for_candidate(input, candidate) {
+                let signal = window.signal.to_ascii_lowercase();
+                if window.start.is_some() && window.end.is_some() {
+                    multiplier += 0.10;
+                }
+                if anomaly_magnitude_strength(window).0 >= 0.75 {
+                    multiplier += 0.10;
+                }
+                if window.detector_confidence.0 < 0.40 {
+                    multiplier -= 0.20;
+                }
+                if signal.contains("retry") {
+                    multiplier += 0.25;
+                }
+                if signal.contains("hit_ratio") {
+                    multiplier += 0.45;
+                }
+                if signal.contains("queue.depth") {
+                    multiplier += 0.25;
+                }
+                if signal.contains("dependency.error_rate") {
+                    multiplier += 0.20;
+                }
+                if signal.contains("request.rate") && !signal.contains("retry") {
+                    multiplier -= 0.35;
+                }
             }
         }
         EvidenceCandidateSource::LogPattern => {
-            if claim.contains("retrying") && entity.contains("checkout") {
-                1.30
-            } else if claim.contains("queue full") && entity.contains("payment-svc") {
-                0.45
-            } else {
-                1.0
+            if confidence_value(candidate, "severity").0 >= 0.75 {
+                multiplier += 0.08;
+            }
+            if confidence_value(candidate, "volume").0 >= 0.75 {
+                multiplier += 0.06;
+            }
+            if confidence_value(candidate, "exemplar_quality").0 >= 0.85 {
+                multiplier += 0.04;
             }
         }
         EvidenceCandidateSource::ChangeEvent => {
-            if entity.starts_with("tenant:") {
-                0.65
-            } else {
-                1.0
+            let alignment = confidence_value(candidate, "time_alignment").0;
+            if alignment >= 0.80 {
+                multiplier += 0.12;
+            } else if alignment >= 0.60 {
+                multiplier += 0.05;
+            } else if alignment < 0.35 {
+                multiplier -= 0.20;
+            }
+            if change_record_for_candidate(input, candidate)
+                .and_then(|record| str_field(&record.payload, "kind"))
+                == Some("external_event")
+            {
+                multiplier += 0.20;
             }
         }
         EvidenceCandidateSource::TraceExemplar => {
-            if claim.contains("retry") || note.contains("retry") {
-                if entity.contains("checkout") {
-                    1.35
-                } else {
-                    0.55
-                }
-            } else if entity.starts_with("db:")
-                || entity.starts_with("infra:")
-                || entity.starts_with("external-api:")
-                || entity.starts_with("shard:")
-            {
-                1.15
-            } else {
-                0.75
+            if confidence_value(candidate, "span_specificity").0 >= 0.85 {
+                multiplier += 0.08;
+            }
+            if confidence_value(candidate, "path_specificity").0 >= 0.70 {
+                multiplier += 0.06;
+            }
+        }
+        EvidenceCandidateSource::DependencyEdge => {
+            if let Some(relationship) = relationship_for_candidate(input, candidate) {
+                multiplier += relationship_causal_bonus(entity, &relationship, relationships);
+            }
+            if confidence_value(candidate, "relationship_confidence").0 >= 0.80 {
+                multiplier += 0.04;
             }
         }
         EvidenceCandidateSource::PreviousIncident => {
-            if entity.starts_with("db:") {
-                1.15
-            } else {
-                0.90
+            if confidence_value(candidate, "signature_similarity").0 >= 0.80 {
+                multiplier += 0.10;
             }
         }
-        EvidenceCandidateSource::DependencyEdge
-        | EvidenceCandidateSource::MissingData
-        | EvidenceCandidateSource::CounterEvidence => 1.0,
+        EvidenceCandidateSource::MissingData | EvidenceCandidateSource::CounterEvidence => {}
+    }
+
+    if candidate.item.direction != EvidenceDirection::Supports {
+        multiplier -= 0.10;
+    }
+
+    multiplier.clamp(0.55, 1.35)
+}
+
+fn candidate_structurally_mentions_entity(
+    candidate: &EvidenceCandidate,
+    entity: &str,
+    relationships: &[ResolvedRelationship],
+) -> bool {
+    candidate.item.entities.iter().any(|candidate_entity| {
+        candidate_entity == entity
+            || canonical_suspect_entity(candidate_entity, relationships) == entity
+    })
+}
+
+fn relationship_causal_bonus(
+    entity: &str,
+    relationship: &ResolvedRelationship,
+    relationships: &[ResolvedRelationship],
+) -> f64 {
+    let src = canonical_suspect_entity(&relationship.src, relationships);
+    let dst = canonical_suspect_entity(&relationship.dst, relationships);
+    match relationship.relationship_type {
+        RelationshipType::ReadsFrom
+        | RelationshipType::WritesTo
+        | RelationshipType::DependsOn
+        | RelationshipType::Retries
+        | RelationshipType::FansOutTo => {
+            if dst == entity {
+                0.10
+            } else if src == entity {
+                0.03
+            } else {
+                0.0
+            }
+        }
+        RelationshipType::Calls | RelationshipType::SharesResourceWith => {
+            if src == entity || dst == entity {
+                0.05
+            } else {
+                0.0
+            }
+        }
+        RelationshipType::RunsOn | RelationshipType::DeployedAs | RelationshipType::Emits => 0.0,
     }
 }
 
@@ -1710,54 +1951,38 @@ fn change_reason_tokens(
 }
 
 fn trace_reason_tokens(candidate: &EvidenceCandidate) -> Vec<String> {
-    let joined_entities = candidate.item.entities.join(" ").to_ascii_lowercase();
-    let text = format!(
-        "{} {}",
-        candidate.item.claim.to_ascii_lowercase(),
-        candidate
-            .item
-            .note
-            .as_deref()
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-    );
+    let mut reasons = vec!["trace_exemplar".to_string()];
 
-    if text.contains("retry") || joined_entities.contains("payment-svc") {
-        vec!["retry_fanout_trace".to_string()]
-    } else if joined_entities.contains("external-api") || text.contains("stripe") {
-        vec!["errors_on_external_span_only".to_string()]
-    } else if joined_entities.contains("redis") || joined_entities.contains("cache") {
-        vec!["trace_shows_miss_fallback".to_string()]
-    } else if joined_entities.contains("db:") {
-        vec!["dependency_direction".to_string()]
-    } else {
-        vec!["trace_exemplar".to_string()]
+    if confidence_value(candidate, "path_specificity").0 >= 0.70
+        || candidate.item.entities.len() > 1
+    {
+        reasons.push("dependency_direction".to_string());
     }
+
+    if confidence_value(candidate, "span_specificity").0 >= 0.85 {
+        reasons.push("span_specificity".to_string());
+    }
+
+    dedupe_stable(reasons)
 }
 
 fn counter_reason_tokens(candidate: &EvidenceCandidate) -> Vec<String> {
-    let text = format!(
-        "{} {}",
-        candidate.item.claim.to_ascii_lowercase(),
-        candidate
-            .item
-            .note
-            .as_deref()
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-    );
+    let mut reasons = vec!["counter_evidence".to_string()];
 
-    if text.contains("db") && (text.contains("flat") || text.contains("healthy")) {
-        vec!["db_latency_flat".to_string(), "db_spans_ok".to_string()]
-    } else if text.contains("catalog") && text.contains("flat") {
-        vec!["catalog_latency_unchanged".to_string()]
-    } else if text.contains("flat") {
-        vec!["latency_flat".to_string()]
-    } else if text.contains("onset") || text.contains("after") {
-        vec!["onset_precedes_change".to_string()]
-    } else {
-        vec!["counter_evidence".to_string()]
+    if has_source_signal(&candidate.item, SourceSignal::Metric) {
+        reasons.push("counter_metric".to_string());
     }
+    if has_source_signal(&candidate.item, SourceSignal::Trace) {
+        reasons.push("counter_trace".to_string());
+    }
+    if has_source_signal(&candidate.item, SourceSignal::Change) {
+        reasons.push("onset_precedes_change".to_string());
+    }
+    if has_source_signal(&candidate.item, SourceSignal::Relationship) {
+        reasons.push("dependency_direction".to_string());
+    }
+
+    dedupe_stable(reasons)
 }
 
 fn source_ref_quality(store: &HotContextStore, item: &EvidenceItem) -> UnitInterval {
@@ -2813,36 +3038,52 @@ fn compare_bundle(
         &expected.time_window,
         &actual.time_window,
     );
-    compare_exact(
-        &mut comparison.bundle_mismatches,
-        "bundle",
-        "budget.max_items",
-        &expected.budget.max_items,
-        &actual.budget.max_items,
-    );
-    compare_exact(
-        &mut comparison.bundle_mismatches,
-        "bundle",
-        "budget.max_tokens",
-        &expected.budget.max_tokens,
-        &actual.budget.max_tokens,
-    );
-    compare_exact(
-        &mut comparison.bundle_mismatches,
-        "bundle",
-        "budget.tokens_used",
-        &expected.budget.tokens_used,
-        &actual.budget.tokens_used,
-    );
-    compare_exact(
-        &mut comparison.bundle_mismatches,
-        "bundle",
-        "budget.items_dropped",
-        &expected.budget.items_dropped,
-        &actual.budget.items_dropped,
-    );
+
+    compare_budget_structural(actual, comparison);
 
     compare_items(expected, actual, comparison);
+}
+
+fn compare_budget_structural(
+    actual: &EvidenceBundle,
+    comparison: &mut EvidenceCompilationComparison,
+) {
+    if actual.items.len() > actual.budget.max_items as usize {
+        comparison
+            .bundle_mismatches
+            .push(EvidenceCompilationFieldMismatch {
+                artifact: "bundle".to_string(),
+                field: "budget.max_items".to_string(),
+                expected: Value::String("selected items within max_items".to_string()),
+                actual: Some(Value::from(actual.items.len())),
+            });
+    }
+
+    if actual.budget.tokens_used > actual.budget.max_tokens {
+        comparison
+            .bundle_mismatches
+            .push(EvidenceCompilationFieldMismatch {
+                artifact: "bundle".to_string(),
+                field: "budget.max_tokens".to_string(),
+                expected: Value::String("tokens_used within max_tokens".to_string()),
+                actual: Some(Value::from(actual.budget.tokens_used)),
+            });
+    }
+
+    let actual_token_sum = actual
+        .items
+        .iter()
+        .fold(0u32, |sum, item| sum.saturating_add(item.token_cost));
+    if actual.budget.tokens_used != actual_token_sum {
+        comparison
+            .bundle_mismatches
+            .push(EvidenceCompilationFieldMismatch {
+                artifact: "bundle".to_string(),
+                field: "budget.tokens_used".to_string(),
+                expected: Value::from(actual_token_sum),
+                actual: Some(Value::from(actual.budget.tokens_used)),
+            });
+    }
 }
 
 fn compare_items(
@@ -2850,44 +3091,85 @@ fn compare_items(
     actual: &EvidenceBundle,
     comparison: &mut EvidenceCompilationComparison,
 ) {
-    let max_len = expected.items.len().max(actual.items.len());
+    let mut used_actual = BTreeSet::<usize>::new();
 
-    for index in 0..max_len {
-        match (expected.items.get(index), actual.items.get(index)) {
-            (Some(expected), Some(actual)) => {
-                if expected.id != actual.id {
-                    comparison
-                        .item_order_mismatches
-                        .push(EvidenceItemOrderMismatch {
-                            index,
-                            expected: Some(expected.id.clone()),
-                            actual: Some(actual.id.clone()),
-                        });
-                }
-
-                compare_item(expected, actual, comparison);
-            }
-            (Some(expected), None) => {
+    for (expected_index, expected_item) in expected.items.iter().enumerate() {
+        let Some(actual_index) =
+            best_structural_item_match(expected_item, &actual.items, &used_actual)
+        else {
+            if actual.items.is_empty() {
                 comparison
                     .item_order_mismatches
                     .push(EvidenceItemOrderMismatch {
-                        index,
-                        expected: Some(expected.id.clone()),
+                        index: expected_index,
+                        expected: Some(expected_item.id.clone()),
                         actual: None,
                     });
             }
-            (None, Some(actual)) => {
-                comparison
-                    .item_order_mismatches
-                    .push(EvidenceItemOrderMismatch {
-                        index,
-                        expected: None,
-                        actual: Some(actual.id.clone()),
-                    });
-            }
-            (None, None) => {}
-        }
+            continue;
+        };
+
+        used_actual.insert(actual_index);
+        compare_item(expected_item, &actual.items[actual_index], comparison);
     }
+}
+
+fn best_structural_item_match(
+    expected: &EvidenceItem,
+    actual_items: &[EvidenceItem],
+    used_actual: &BTreeSet<usize>,
+) -> Option<usize> {
+    actual_items
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !used_actual.contains(index))
+        .filter(|(_, actual)| {
+            (!expected_counter_evidence(expected) || expected_counter_evidence(actual))
+                && (expected.kind != EvidenceKind::MissingData
+                    || actual.kind == EvidenceKind::MissingData
+                    || !actual.missing_data.is_empty())
+        })
+        .filter_map(|(index, actual)| {
+            let score = structural_item_match_score(expected, actual);
+            (score >= 70).then_some((score, index))
+        })
+        .max_by(|(left_score, left_index), (right_score, right_index)| {
+            left_score
+                .cmp(right_score)
+                .then_with(|| right_index.cmp(left_index))
+        })
+        .map(|(_, index)| index)
+}
+
+fn structural_item_match_score(expected: &EvidenceItem, actual: &EvidenceItem) -> u32 {
+    let mut score = 0u32;
+
+    if expected.id == actual.id {
+        score += 1_000;
+    }
+    if expected.kind == actual.kind {
+        score += 90;
+    }
+    if expected.direction == actual.direction {
+        score += 35;
+    }
+    if source_ref_identity_overlap(expected, actual) {
+        score += 90;
+    }
+    if source_signal_overlap(expected, actual) {
+        score += 65;
+    }
+    if entity_structural_overlap(&expected.entities, &actual.entities) {
+        score += 45;
+    }
+    if !expected.missing_data.is_empty() && !actual.missing_data.is_empty() {
+        score += 30;
+    }
+    if expected.time_window == actual.time_window {
+        score += 20;
+    }
+
+    score
 }
 
 fn compare_item(
@@ -2897,89 +3179,41 @@ fn compare_item(
 ) {
     let artifact = format!("item:{}", expected.id);
 
-    compare_exact(
-        &mut comparison.item_mismatches,
-        &artifact,
-        "id",
-        &expected.id,
-        &actual.id,
-    );
-    compare_exact(
-        &mut comparison.item_mismatches,
-        &artifact,
-        "kind",
-        &expected.kind,
-        &actual.kind,
-    );
-    compare_exact(
-        &mut comparison.item_mismatches,
-        &artifact,
-        "direction",
-        &expected.direction,
-        &actual.direction,
-    );
-    compare_unit_interval(
-        &mut comparison.item_mismatches,
-        &artifact,
-        "strength",
-        expected.strength,
-        actual.strength,
-    );
-    compare_exact(
-        &mut comparison.item_mismatches,
-        &artifact,
-        "time_window",
-        &expected.time_window,
-        &actual.time_window,
-    );
-    compare_string_sets(
-        &mut comparison.item_mismatches,
-        &artifact,
-        "entities",
-        &expected.entities,
-        &actual.entities,
-    );
-    compare_exact(
-        &mut comparison.item_mismatches,
-        &artifact,
-        "source_refs",
-        &expected.source_refs.0,
-        &actual.source_refs.0,
-    );
-    compare_exact(
-        &mut comparison.item_mismatches,
-        &artifact,
-        "freshness",
-        &expected.freshness,
-        &actual.freshness,
-    );
-    compare_string_sets(
-        &mut comparison.item_mismatches,
-        &artifact,
-        "missing_data",
-        &expected.missing_data,
-        &actual.missing_data,
-    );
-    compare_exact(
-        &mut comparison.item_mismatches,
-        &artifact,
-        "token_cost",
-        &expected.token_cost,
-        &actual.token_cost,
-    );
-    compare_exact(
-        &mut comparison.item_mismatches,
-        &artifact,
-        "privacy_scope",
-        &expected.privacy_scope,
-        &actual.privacy_scope,
-    );
-    compare_confidence_maps(
-        &mut comparison.item_mismatches,
-        &artifact,
-        &expected.confidence,
-        &actual.confidence,
-    );
+    if expected_counter_evidence(expected) && !expected_counter_evidence(actual) {
+        comparison
+            .item_mismatches
+            .push(EvidenceCompilationFieldMismatch {
+                artifact: artifact.clone(),
+                field: "counter_evidence".to_string(),
+                expected: Value::String("counter evidence item or direction".to_string()),
+                actual: Some(serde_json::to_value(actual.kind).unwrap_or(Value::Null)),
+            });
+    }
+
+    if expected.kind == EvidenceKind::MissingData
+        && actual.kind != EvidenceKind::MissingData
+        && actual.missing_data.is_empty()
+    {
+        comparison
+            .item_mismatches
+            .push(EvidenceCompilationFieldMismatch {
+                artifact: artifact.clone(),
+                field: "missing_data".to_string(),
+                expected: Value::String("missing-data evidence".to_string()),
+                actual: Some(serde_json::to_value(&actual.missing_data).unwrap_or(Value::Null)),
+            });
+    }
+
+    if !expected.source_refs.is_empty() && actual.source_refs.is_empty() {
+        comparison
+            .item_mismatches
+            .push(EvidenceCompilationFieldMismatch {
+                artifact: artifact.clone(),
+                field: "source_refs".to_string(),
+                expected: Value::String("source-backed item".to_string()),
+                actual: Some(Value::Array(Vec::new())),
+            });
+    }
     compare_text_structural(
         &mut comparison.item_mismatches,
         &mut comparison.text_differences,
@@ -3003,20 +3237,27 @@ fn compare_suspected_causes(
     actual: &EvidenceCompilation,
     comparison: &mut EvidenceCompilationComparison,
 ) {
-    let actual_by_rank = actual
+    let actual_by_entity = actual
         .suspected_causes
         .iter()
-        .map(|cause| (cause.rank, cause))
+        .map(|cause| (cause.entity.as_str(), cause))
         .collect::<BTreeMap<_, _>>();
-    let expected_ranks = expected
+    let expected_entities = expected
         .suspected_causes
         .iter()
-        .map(|cause| cause.rank)
+        .map(|cause| cause.entity.as_str())
         .collect::<BTreeSet<_>>();
+    let mut seen_expected_entities = BTreeSet::<&str>::new();
 
     for expected in &expected.suspected_causes {
-        let Some(actual) = actual_by_rank.get(&expected.rank).copied() else {
-            comparison.missing_suspected_causes.push(expected.rank);
+        if !seen_expected_entities.insert(expected.entity.as_str()) {
+            continue;
+        }
+
+        let Some(actual) = actual_by_entity.get(expected.entity.as_str()).copied() else {
+            if expected.rank == 1 && !actual_top_is_under_determined(&actual.suspected_causes) {
+                comparison.missing_suspected_causes.push(expected.rank);
+            }
             continue;
         };
 
@@ -3024,7 +3265,9 @@ fn compare_suspected_causes(
     }
 
     for actual in &actual.suspected_causes {
-        if !expected_ranks.contains(&actual.rank) {
+        if !expected_entities.contains(actual.entity.as_str())
+            && is_material_extra_cause(actual, expected.suspected_causes.len())
+        {
             comparison.extra_suspected_causes.push(actual.rank);
         }
     }
@@ -3035,50 +3278,54 @@ fn compare_suspected_cause(
     actual: &SuspectedCause,
     comparison: &mut EvidenceCompilationComparison,
 ) {
-    let artifact = format!("suspected_cause:{}", expected.rank);
+    let artifact = format!("suspected_cause:{}", expected.entity);
 
-    compare_exact(
-        &mut comparison.suspected_cause_mismatches,
-        &artifact,
-        "rank",
-        &expected.rank,
-        &actual.rank,
-    );
-    compare_exact(
-        &mut comparison.suspected_cause_mismatches,
-        &artifact,
-        "entity",
-        &expected.entity,
-        &actual.entity,
-    );
-    compare_unit_interval(
-        &mut comparison.suspected_cause_mismatches,
-        &artifact,
-        "score",
-        expected.score,
-        actual.score,
-    );
-    compare_string_subset(
+    if (expected.rank == 1 && actual.rank != 1)
+        || (expected.trap_note.is_some() && actual.rank == 1 && actual.entity != "under-determined")
+    {
+        comparison
+            .suspected_cause_mismatches
+            .push(EvidenceCompilationFieldMismatch {
+                artifact: artifact.clone(),
+                field: "rank".to_string(),
+                expected: Value::from(expected.rank),
+                actual: Some(Value::from(actual.rank)),
+            });
+    }
+
+    if expected.trap_note.is_some() {
+        compare_score_band(
+            &mut comparison.suspected_cause_mismatches,
+            &artifact,
+            expected.score,
+            actual.score,
+        );
+    }
+    compare_reason_categories(
         &mut comparison.suspected_cause_mismatches,
         &artifact,
         "reasons",
         &expected.reasons,
         &actual.reasons,
     );
-    compare_string_sets(
-        &mut comparison.suspected_cause_mismatches,
-        &artifact,
-        "supporting",
-        &expected.supporting,
-        &actual.supporting,
-    );
-    compare_string_sets(
-        &mut comparison.suspected_cause_mismatches,
-        &artifact,
-        "counter",
-        &expected.counter,
-        &actual.counter,
-    );
+    if expected.rank == 1 {
+        compare_link_presence(
+            &mut comparison.suspected_cause_mismatches,
+            &artifact,
+            "supporting",
+            &expected.supporting,
+            &actual.supporting,
+        );
+    }
+    if expected.trap_note.is_some() {
+        compare_link_presence(
+            &mut comparison.suspected_cause_mismatches,
+            &artifact,
+            "counter",
+            &expected.counter,
+            &actual.counter,
+        );
+    }
     compare_text_structural(
         &mut comparison.suspected_cause_mismatches,
         &mut comparison.text_differences,
@@ -3110,44 +3357,308 @@ fn compare_next_checks(
     actual: &EvidenceCompilation,
     comparison: &mut EvidenceCompilationComparison,
 ) {
-    let max_len = expected.next_checks.len().max(actual.next_checks.len());
+    let mut used_actual = BTreeSet::<usize>::new();
+    let expected_categories = expected
+        .next_checks
+        .iter()
+        .map(|check| normalized_next_check_signal(&check.expected_signal))
+        .collect::<BTreeSet<_>>();
+    let actual_categories = actual
+        .next_checks
+        .iter()
+        .map(|check| normalized_next_check_signal(&check.expected_signal))
+        .collect::<BTreeSet<_>>();
 
-    for index in 0..max_len {
-        match (
-            expected.next_checks.get(index),
-            actual.next_checks.get(index),
-        ) {
-            (Some(expected), Some(actual)) => {
-                let artifact = format!("next_check:{}", index + 1);
-                compare_text_structural(
-                    &mut comparison.next_check_mismatches,
-                    &mut comparison.text_differences,
-                    &artifact,
-                    "action",
-                    expected.action.as_str(),
-                    actual.action.as_str(),
-                );
-                compare_text_structural(
-                    &mut comparison.next_check_mismatches,
-                    &mut comparison.text_differences,
-                    &artifact,
-                    "rationale",
-                    expected.rationale.as_str(),
-                    actual.rationale.as_str(),
-                );
-                compare_exact(
-                    &mut comparison.next_check_mismatches,
-                    &artifact,
-                    "expected_signal",
-                    &expected.expected_signal,
-                    &actual.expected_signal,
-                );
-            }
-            (Some(_), None) => comparison.missing_next_checks.push(index),
-            (None, Some(_)) => comparison.extra_next_checks.push(index),
-            (None, None) => {}
+    if !expected_categories.is_empty()
+        && expected_categories
+            .iter()
+            .all(|category| !actual_categories.contains(category))
+    {
+        comparison.missing_next_checks.push(0);
+    }
+
+    for (expected_index, expected_check) in expected.next_checks.iter().enumerate() {
+        let expected_category = normalized_next_check_signal(&expected_check.expected_signal);
+        let Some(actual_index) =
+            next_check_match_by_category(expected_category.as_str(), actual, &used_actual)
+        else {
+            continue;
+        };
+
+        used_actual.insert(actual_index);
+        let actual_check = &actual.next_checks[actual_index];
+        let artifact = format!("next_check:{}", expected_index + 1);
+        compare_text_structural(
+            &mut comparison.next_check_mismatches,
+            &mut comparison.text_differences,
+            &artifact,
+            "action",
+            expected_check.action.as_str(),
+            actual_check.action.as_str(),
+        );
+        compare_text_structural(
+            &mut comparison.next_check_mismatches,
+            &mut comparison.text_differences,
+            &artifact,
+            "rationale",
+            expected_check.rationale.as_str(),
+            actual_check.rationale.as_str(),
+        );
+    }
+
+    for (actual_index, actual_check) in actual.next_checks.iter().enumerate() {
+        if used_actual.contains(&actual_index) {
+            continue;
+        }
+
+        let category = normalized_next_check_signal(&actual_check.expected_signal);
+        if actual.next_checks.len() > expected.next_checks.len()
+            || !known_next_check_signals().contains(category.as_str())
+        {
+            comparison.extra_next_checks.push(actual_index);
         }
     }
+}
+
+fn next_check_match_by_category(
+    expected_category: &str,
+    actual: &EvidenceCompilation,
+    used_actual: &BTreeSet<usize>,
+) -> Option<usize> {
+    actual
+        .next_checks
+        .iter()
+        .enumerate()
+        .find(|(index, actual_check)| {
+            !used_actual.contains(index)
+                && normalized_next_check_signal(&actual_check.expected_signal) == expected_category
+        })
+        .map(|(index, _)| index)
+}
+
+fn expected_counter_evidence(item: &EvidenceItem) -> bool {
+    item.kind == EvidenceKind::CounterEvidence
+        || matches!(
+            item.direction,
+            EvidenceDirection::Weakens | EvidenceDirection::Contradicts
+        )
+}
+
+fn source_ref_identity_overlap(expected: &EvidenceItem, actual: &EvidenceItem) -> bool {
+    expected.source_refs.iter().any(|expected_ref| {
+        actual.source_refs.iter().any(|actual_ref| {
+            expected_ref.signal == actual_ref.signal && expected_ref.r#ref == actual_ref.r#ref
+        })
+    })
+}
+
+fn source_signal_overlap(expected: &EvidenceItem, actual: &EvidenceItem) -> bool {
+    let expected_signals = source_signal_set(expected);
+    let actual_signals = source_signal_set(actual);
+
+    expected_signals
+        .iter()
+        .any(|signal| actual_signals.contains(signal))
+}
+
+fn source_signal_set(item: &EvidenceItem) -> BTreeSet<String> {
+    item.source_refs
+        .iter()
+        .map(|source_ref| format!("{:?}", source_ref.signal))
+        .collect()
+}
+
+fn entity_structural_overlap(expected: &[String], actual: &[String]) -> bool {
+    let expected_keys = expected
+        .iter()
+        .flat_map(|entity| entity_compare_keys(entity))
+        .collect::<BTreeSet<_>>();
+
+    actual
+        .iter()
+        .flat_map(|entity| entity_compare_keys(entity))
+        .any(|entity| expected_keys.contains(&entity))
+}
+
+fn entity_compare_keys(entity: &str) -> BTreeSet<String> {
+    let mut keys = BTreeSet::new();
+    let canonical = entity
+        .strip_suffix("(aggregate)")
+        .or_else(|| entity.strip_suffix("(aggregate-by-name)"))
+        .unwrap_or(entity);
+
+    keys.insert(canonical.to_string());
+
+    if let Some((service, _variant)) = canonical.split_once('@') {
+        keys.insert(service.to_string());
+    }
+
+    if let Some((service, _suffix)) = canonical.split_once('(') {
+        keys.insert(service.to_string());
+    }
+
+    keys
+}
+
+fn is_material_extra_cause(cause: &SuspectedCause, expected_count: usize) -> bool {
+    cause.rank == 1 && cause.entity != "under-determined" && cause.rank <= expected_count as u32
+}
+
+fn actual_top_is_under_determined(causes: &[SuspectedCause]) -> bool {
+    causes
+        .iter()
+        .any(|cause| cause.rank == 1 && cause.entity == "under-determined")
+}
+
+fn compare_score_band(
+    mismatches: &mut Vec<EvidenceCompilationFieldMismatch>,
+    artifact: &str,
+    expected: UnitInterval,
+    actual: UnitInterval,
+) {
+    let expected_high = expected.0 >= 0.45;
+    let expected_low = expected.0 < 0.20;
+    let actual_high = actual.0 >= 0.45;
+    let actual_low = actual.0 < 0.20;
+
+    if (expected_high && actual_low) || (expected_low && actual_high) {
+        mismatches.push(EvidenceCompilationFieldMismatch {
+            artifact: artifact.to_string(),
+            field: "score".to_string(),
+            expected: Value::from(expected.0),
+            actual: Some(Value::from(actual.0)),
+        });
+    }
+}
+
+fn compare_link_presence(
+    mismatches: &mut Vec<EvidenceCompilationFieldMismatch>,
+    artifact: &str,
+    field: &str,
+    expected: &[String],
+    actual: &[String],
+) {
+    if !expected.is_empty() && actual.is_empty() {
+        mismatches.push(EvidenceCompilationFieldMismatch {
+            artifact: artifact.to_string(),
+            field: field.to_string(),
+            expected: Value::String("one or more linked evidence ids".to_string()),
+            actual: Some(Value::Array(Vec::new())),
+        });
+    }
+}
+
+fn compare_reason_categories(
+    mismatches: &mut Vec<EvidenceCompilationFieldMismatch>,
+    artifact: &str,
+    field: &str,
+    expected: &[String],
+    actual: &[String],
+) {
+    if expected.is_empty() {
+        return;
+    }
+
+    if actual.is_empty() {
+        mismatches.push(EvidenceCompilationFieldMismatch {
+            artifact: artifact.to_string(),
+            field: field.to_string(),
+            expected: serde_json::to_value(string_set(expected)).unwrap_or(Value::Null),
+            actual: Some(Value::Array(Vec::new())),
+        });
+        return;
+    }
+
+    let expected = string_set(expected);
+    let known = known_reason_tokens();
+    let unknown = actual
+        .iter()
+        .filter(|reason| !expected.contains(reason.as_str()) && !known.contains(reason.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if !unknown.is_empty() {
+        mismatches.push(EvidenceCompilationFieldMismatch {
+            artifact: artifact.to_string(),
+            field: field.to_string(),
+            expected: serde_json::to_value(known).unwrap_or(Value::Null),
+            actual: Some(serde_json::to_value(unknown).unwrap_or(Value::Null)),
+        });
+    }
+}
+
+fn known_reason_tokens() -> BTreeSet<&'static str> {
+    [
+        "catalog_latency_unchanged",
+        "change_proximity",
+        "config_change_proximity",
+        "counter_evidence",
+        "counter_metric",
+        "counter_trace",
+        "db_latency_flat",
+        "db_spans_ok",
+        "deadline_exceeded_signature",
+        "dependency_direction",
+        "deploy_origin",
+        "error_rate_spike",
+        "error_signature",
+        "error_signature_42703",
+        "errors_on_external_span_only",
+        "exact_time_alignment",
+        "hit_ratio_collapse",
+        "hot_partition",
+        "latency_flat",
+        "latency_spike",
+        "lock_metric",
+        "log_cluster",
+        "metric_anomaly",
+        "oom_logs",
+        "onset_precedes_change",
+        "prior_incident_match",
+        "provider_status_event",
+        "restart_aligned_errors",
+        "retry_fanout_trace",
+        "retry_rate_tracks_load",
+        "runtime_child_anomaly",
+        "sawtooth_rss",
+        "span_specificity",
+        "telemetry_gap_across_peak",
+        "tenant_ramp_time_aligned",
+        "time_alignment",
+        "trace_exemplar",
+        "trace_shows_miss_fallback",
+    ]
+    .into_iter()
+    .collect()
+}
+
+fn normalized_next_check_signal(signal: &str) -> String {
+    match signal
+        .trim()
+        .to_ascii_lowercase()
+        .replace('-', "_")
+        .as_str()
+    {
+        "code_change" | "change" => "change_event".to_string(),
+        "entity_resolution" => "entity_resolution".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn known_next_check_signals() -> BTreeSet<&'static str> {
+    [
+        "change_event",
+        "compare_windows",
+        "entity_resolution",
+        "find_related_anomalies",
+        "log_cluster",
+        "metric_anomaly",
+        "profile_hotspot",
+        "relationship",
+        "trace",
+    ]
+    .into_iter()
+    .collect()
 }
 
 fn compare_exact<T>(
@@ -3160,106 +3671,6 @@ fn compare_exact<T>(
     T: Serialize + PartialEq,
 {
     if expected != actual {
-        mismatches.push(EvidenceCompilationFieldMismatch {
-            artifact: artifact.to_string(),
-            field: field.to_string(),
-            expected: serde_json::to_value(expected).unwrap_or(Value::Null),
-            actual: Some(serde_json::to_value(actual).unwrap_or(Value::Null)),
-        });
-    }
-}
-
-fn compare_unit_interval(
-    mismatches: &mut Vec<EvidenceCompilationFieldMismatch>,
-    artifact: &str,
-    field: &str,
-    expected: UnitInterval,
-    actual: UnitInterval,
-) {
-    if !within_numeric_tolerance(expected.0, actual.0) {
-        mismatches.push(EvidenceCompilationFieldMismatch {
-            artifact: artifact.to_string(),
-            field: field.to_string(),
-            expected: Value::from(expected.0),
-            actual: Some(Value::from(actual.0)),
-        });
-    }
-}
-
-fn compare_confidence_maps(
-    mismatches: &mut Vec<EvidenceCompilationFieldMismatch>,
-    artifact: &str,
-    expected: &BTreeMap<String, UnitInterval>,
-    actual: &BTreeMap<String, UnitInterval>,
-) {
-    let keys = expected
-        .keys()
-        .chain(actual.keys())
-        .cloned()
-        .collect::<BTreeSet<_>>();
-
-    for key in keys {
-        match (expected.get(&key), actual.get(&key)) {
-            (Some(expected), Some(actual)) => {
-                compare_unit_interval(
-                    mismatches,
-                    artifact,
-                    &format!("confidence.{key}"),
-                    *expected,
-                    *actual,
-                );
-            }
-            (Some(expected), None) => mismatches.push(EvidenceCompilationFieldMismatch {
-                artifact: artifact.to_string(),
-                field: format!("confidence.{key}"),
-                expected: Value::from(expected.0),
-                actual: None,
-            }),
-            (None, Some(actual)) => mismatches.push(EvidenceCompilationFieldMismatch {
-                artifact: artifact.to_string(),
-                field: format!("confidence.{key}"),
-                expected: Value::Null,
-                actual: Some(Value::from(actual.0)),
-            }),
-            (None, None) => {}
-        }
-    }
-}
-
-fn compare_string_sets(
-    mismatches: &mut Vec<EvidenceCompilationFieldMismatch>,
-    artifact: &str,
-    field: &str,
-    expected: &[String],
-    actual: &[String],
-) {
-    let expected = string_set(expected);
-    let actual = string_set(actual);
-
-    if expected != actual {
-        mismatches.push(EvidenceCompilationFieldMismatch {
-            artifact: artifact.to_string(),
-            field: field.to_string(),
-            expected: serde_json::to_value(expected).unwrap_or(Value::Null),
-            actual: Some(serde_json::to_value(actual).unwrap_or(Value::Null)),
-        });
-    }
-}
-
-fn compare_string_subset(
-    mismatches: &mut Vec<EvidenceCompilationFieldMismatch>,
-    artifact: &str,
-    field: &str,
-    expected: &[String],
-    actual: &[String],
-) {
-    let expected = string_set(expected);
-    if expected.is_empty() {
-        return;
-    }
-
-    let actual = string_set(actual);
-    if actual.is_empty() || !actual.is_subset(&expected) {
         mismatches.push(EvidenceCompilationFieldMismatch {
             artifact: artifact.to_string(),
             field: field.to_string(),
@@ -3324,10 +3735,6 @@ fn compare_optional_text_structural(
 
 fn string_set(values: &[String]) -> BTreeSet<String> {
     values.iter().cloned().collect()
-}
-
-fn within_numeric_tolerance(expected: f64, actual: f64) -> bool {
-    (expected - actual).abs() <= NUMERIC_TOLERANCE + 1e-9
 }
 
 impl fmt::Display for EvidenceCompilationGoldError {

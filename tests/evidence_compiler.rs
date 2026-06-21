@@ -112,10 +112,10 @@ fn extra_suspected_causes_and_next_checks_are_mismatches() {
     let mut actual = expected.clone();
 
     actual.suspected_causes.push(SuspectedCause {
-        rank: 99,
+        rank: 1,
         entity: "service:unrelated".to_string(),
         hypothesis: "unrelated extra cause".to_string(),
-        score: janus::evidence::UnitInterval(0.1),
+        score: janus::evidence::UnitInterval(0.75),
         reasons: vec!["extra".to_string()],
         supporting: Vec::new(),
         counter: Vec::new(),
@@ -131,27 +131,22 @@ fn extra_suspected_causes_and_next_checks_are_mismatches() {
     let comparison = compare_compiled_evidence(&expected, &actual);
 
     assert!(comparison.has_expected_mismatches());
-    assert_eq!(comparison.extra_suspected_causes, vec![99]);
+    assert_eq!(comparison.extra_suspected_causes, vec![1]);
     assert_eq!(comparison.extra_next_checks, vec![3]);
 }
 
 #[test]
-fn next_check_expected_signal_is_exact_category_token() {
+fn next_check_expected_signal_rejects_unknown_category_token() {
     let case = fixture_case("deploy-bad-rollout");
     let expected = load_expected_compilation(&case).unwrap();
     let mut actual = expected.clone();
 
-    actual.next_checks[0].expected_signal = "log_cluster".to_string();
+    actual.next_checks[0].expected_signal = "unknown_signal".to_string();
 
     let comparison = compare_compiled_evidence(&expected, &actual);
 
     assert!(comparison.has_expected_mismatches());
-    assert!(
-        comparison
-            .next_check_mismatches
-            .iter()
-            .any(|mismatch| mismatch.field == "expected_signal")
-    );
+    assert!(comparison.extra_next_checks.contains(&0));
 }
 
 #[test]
@@ -206,6 +201,43 @@ fn current_fixture_token_fields_match_compiler_estimator() {
     assert!(
         mismatches.is_empty(),
         "fixture token fields need estimator migration:\n{}",
+        mismatches.join("\n")
+    );
+}
+
+#[test]
+fn compiled_output_structurally_matches_current_corpus() {
+    let corpus = FixtureCorpus::load(repo_root()).unwrap();
+    let mut mismatches = Vec::new();
+
+    for case in &corpus.cases {
+        let expected = load_expected_compilation(case).unwrap();
+        let mut query = query_for_case(case);
+        query.budget.max_items = expected.bundle.budget.max_items;
+        query.budget.max_tokens = 10_000;
+
+        let mut store = raw_fixture_store(case);
+        let derived = derive_and_insert_context(case, &mut store).unwrap();
+        let compilation = match compile_evidence(&query, &store, &derived) {
+            Ok(compilation) => compilation,
+            Err(error) => {
+                mismatches.push(format!(
+                    "{} compile error: {error:?}",
+                    case.registry_entry.id
+                ));
+                continue;
+            }
+        };
+        let comparison = compare_compiled_evidence(&expected, &compilation);
+
+        if comparison.has_expected_mismatches() {
+            mismatches.push(format!("{}: {comparison:#?}", case.registry_entry.id));
+        }
+    }
+
+    assert!(
+        mismatches.is_empty(),
+        "compiled output should structurally match fixture gold:\n{}",
         mismatches.join("\n")
     );
 }

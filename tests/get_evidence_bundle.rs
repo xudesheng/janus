@@ -1,7 +1,6 @@
 use janus::{
     evidence::{EvidenceBundle, EvidenceDirection, EvidenceKind, TimeWindow},
     fixture_validation::{FixtureCase, FixtureCorpus},
-    fixtures::load_bundle_by_scenario_id,
     query::{
         EvidenceQuery, EvidenceQueryBudget, EvidenceQueryIntent, FreshnessPreference,
         GetEvidenceBundleError, evidence_query_schema, get_evidence_bundle,
@@ -10,12 +9,18 @@ use janus::{
 use serde_json::Value;
 
 #[test]
-fn returns_deploy_bad_rollout_gold_bundle() {
+fn returns_compiled_deploy_bad_rollout_bundle() {
     let query = deploy_bad_rollout_query();
-    let bundle = get_evidence_bundle(query).unwrap();
-    let expected = load_bundle_by_scenario_id("deploy-bad-rollout").unwrap();
+    let bundle = get_evidence_bundle(query.clone()).unwrap();
 
-    assert_eq!(bundle, expected);
+    assert_compiled_bundle_contract(&query, &bundle);
+    assert!(
+        bundle
+            .items
+            .iter()
+            .any(|item| item.kind == EvidenceKind::ChangeEvent),
+        "deploy scenario should include source-backed change evidence: {bundle:#?}"
+    );
 }
 
 #[test]
@@ -23,9 +28,11 @@ fn preserves_counter_evidence_for_coincidental_deploy_trap() {
     let mut query = coincidental_deploy_trap_query();
     query.require_counter_evidence = true;
     query.budget.min_counter_evidence_items = Some(2);
+    query.budget.max_items = 6;
+    query.budget.max_tokens = 10_000;
 
     let bundle = get_evidence_bundle(query).unwrap();
-    let counter_ids: Vec<&str> = bundle
+    let counter_items: Vec<&janus::evidence::EvidenceItem> = bundle
         .items
         .iter()
         .filter(|item| {
@@ -35,10 +42,17 @@ fn preserves_counter_evidence_for_coincidental_deploy_trap() {
                     EvidenceDirection::Weakens | EvidenceDirection::Contradicts
                 )
         })
-        .map(|item| item.id.as_str())
         .collect();
 
-    assert_eq!(counter_ids, vec!["ev-3", "ev-4"]);
+    assert!(
+        counter_items.len() >= 2,
+        "required counter evidence should be preserved structurally: {bundle:#?}"
+    );
+    assert!(
+        counter_items
+            .iter()
+            .all(|item| !item.source_refs.is_empty())
+    );
 }
 
 #[test]
@@ -87,39 +101,23 @@ fn rejects_missing_or_unsafe_scenario_id() {
 }
 
 #[test]
-fn rejects_budget_that_cannot_fit_gold_bundle() {
-    let mut token_query = deploy_bad_rollout_query();
-    token_query.budget.max_tokens = 585;
+fn respects_small_budget_by_dropping_whole_items() {
+    let mut query = deploy_bad_rollout_query();
+    query.budget.max_items = 2;
+    query.budget.max_tokens = 10_000;
 
-    let error = get_evidence_bundle(token_query).unwrap_err();
-    assert!(matches!(
-        error,
-        GetEvidenceBundleError::UnsupportedBudget {
-            requested_max_tokens: 585,
-            required_tokens: 586,
-            ..
-        }
-    ));
+    let bundle = get_evidence_bundle(query.clone()).unwrap();
 
-    let mut item_query = deploy_bad_rollout_query();
-    item_query.budget.max_items = 4;
-
-    let error = get_evidence_bundle(item_query).unwrap_err();
-    assert!(matches!(
-        error,
-        GetEvidenceBundleError::UnsupportedBudget {
-            requested_max_items: 4,
-            required_items: 5,
-            ..
-        }
-    ));
+    assert_compiled_bundle_contract(&query, &bundle);
+    assert!(bundle.items.len() <= 2);
+    assert!(bundle.budget.items_dropped > 0);
 }
 
 #[test]
 fn rejects_unsatisfied_counter_evidence_requirement() {
     let mut query = coincidental_deploy_trap_query();
     query.require_counter_evidence = true;
-    query.budget.min_counter_evidence_items = Some(3);
+    query.budget.min_counter_evidence_items = Some(99);
 
     let error = get_evidence_bundle(query).unwrap_err();
     assert!(matches!(
@@ -133,11 +131,18 @@ fn rejects_unsatisfied_counter_evidence_requirement() {
 
 #[test]
 fn serializes_returned_bundle_to_json() {
-    let bundle = get_evidence_bundle(deploy_bad_rollout_query()).unwrap();
+    let query = deploy_bad_rollout_query();
+    let bundle = get_evidence_bundle(query.clone()).unwrap();
     let json = serde_json::to_value(&bundle).unwrap();
 
-    assert_eq!(json["items"][0]["source_refs"][0]["signal"], "change");
-    assert_eq!(json["budget"]["tokens_used"], 586);
+    assert_compiled_bundle_contract(&query, &bundle);
+    assert!(
+        json["items"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty())
+    );
+    assert!(json["items"][0]["source_refs"][0]["signal"].is_string());
+    assert!(json["budget"]["tokens_used"].as_u64().unwrap() <= 586);
 }
 
 #[test]
@@ -151,10 +156,8 @@ fn store_aware_path_resolves_source_refs_for_all_current_fixtures() {
                 case.registry_entry.id
             )
         });
-        let expected: EvidenceBundle =
-            serde_json::from_value(case.expected["evidence_bundle"].clone()).unwrap();
 
-        assert_eq!(bundle, expected);
+        assert_compiled_bundle_contract(&query_for_case(case), &bundle);
     }
 }
 
@@ -163,10 +166,9 @@ fn entity_selector_is_checked_without_rewriting_gold_bundle() {
     let mut query = deploy_bad_rollout_query();
     query.entities = vec!["service:checkout".to_string()];
 
-    let bundle = get_evidence_bundle(query).unwrap();
-    let expected = load_bundle_by_scenario_id("deploy-bad-rollout").unwrap();
+    let bundle = get_evidence_bundle(query.clone()).unwrap();
 
-    assert_eq!(bundle, expected);
+    assert_compiled_bundle_contract(&query, &bundle);
 }
 
 #[test]
@@ -221,6 +223,31 @@ fn query_schema_requires_core_fields_not_fixture_selector() {
 
 fn repo_root() -> &'static std::path::Path {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn assert_compiled_bundle_contract(query: &EvidenceQuery, bundle: &EvidenceBundle) {
+    bundle.validate().unwrap();
+    assert_eq!(bundle.question, query.intent.question);
+    assert_eq!(bundle.hypothesis, query.intent.hypothesis);
+    assert_eq!(bundle.time_window, query.time_window);
+    assert!(bundle.items.len() <= query.budget.max_items as usize);
+    assert!(bundle.budget.tokens_used <= query.budget.max_tokens);
+    assert!(!bundle.items.is_empty());
+
+    let token_sum = bundle
+        .items
+        .iter()
+        .fold(0u32, |sum, item| sum + item.token_cost);
+    assert_eq!(bundle.budget.tokens_used, token_sum);
+
+    for (index, item) in bundle.items.iter().enumerate() {
+        assert_eq!(item.id, format!("ev-{}", index + 1));
+        assert!(
+            !item.source_refs.is_empty(),
+            "{} should retain source refs",
+            item.id
+        );
+    }
 }
 
 fn query_for_case(case: &FixtureCase) -> EvidenceQuery {
