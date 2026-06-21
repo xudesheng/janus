@@ -447,6 +447,16 @@ source-family causal weights, runtime-child rollups such as `pod:` to owning
 `service:`, and material missing-data uncertainty. It is deliberately separate
 from any individual evidence item's `strength`.
 
+Direction decision after Slice 3: suspected-cause ranking should be judged by
+structural outcomes, not by reproducing every hand-authored reason token. Before
+suspected causes become a gold-gated final comparison in Slice 6, ranking
+heuristics must move away from fixture-specific entity-name multipliers and
+toward structural signals such as the suspect's own anomaly state, dependency
+direction, onset ordering, blast radius, change proximity, counter-evidence,
+and missing-data uncertainty. Reason tokens should be derived from structured
+source content such as signal names, log templates, change kinds, relationships,
+and detected gaps.
+
 ## Suspected Causes
 
 `expected.suspected_causes` already exists in the fixture corpus. This topic
@@ -606,6 +616,23 @@ Ordering should be deterministic after selection:
 If this ordering conflicts with a stronger reviewed local rule, document the
 rule in code and tests.
 
+Slice 4 exposes `compile_evidence(query, store, derived)` and
+`select_evidence_compilation(input, candidates, suspected_causes)` as internal
+compiler paths. The selector:
+
+- starts from scored `cand-*` candidates;
+- enforces `max_items`, `max_tokens`, and `reserve_tokens_for_raw_refs`;
+- selects whole evidence items only;
+- forces the requested number of counter-evidence items or returns a compiler
+  requirement error;
+- assigns final selected `ev-N` ids in deterministic selected-output order;
+- recomputes token costs after final id assignment;
+- remaps selected suspected-cause evidence links from `cand-*` to `ev-*`;
+- reports unselected candidates as dropped with a stable reason.
+
+This remains internal compiler output. Store insertion, next-check generation,
+and `get_evidence_bundle` routing are still later slices.
+
 ## False-Causality Guard
 
 False causality is the core failure mode for this milestone.
@@ -661,10 +688,12 @@ Comparison mode must be explicit per field family:
 - Set or ordered-structural: item `entities`, using documented ordering when
   the compiler owns ordering and set comparison when order is not semantically
   meaningful.
-- Exact category token or set: suspected-cause `reasons` and next-check
-  `expected_signal`, which are category tokens such as `time_alignment`,
-  `downstream_db_healthy`, `metric_anomaly`, and `log_cluster`, not free-form
-  prose.
+- Exact category token: next-check `expected_signal`, which is a category token
+  such as `metric_anomaly` or `log_cluster`, not free-form prose.
+- Structural category subset: suspected-cause `reasons` must be non-empty when
+  gold declares reasons and must be drawn from a derivable category vocabulary.
+  Full exact-set equality is not a stable acceptance target until the compiler
+  owns the reason vocabulary and the fixtures are migrated to it.
 - Numeric tolerance: item `strength`, confidence dimensions, suspected-cause
   score, and other derived numeric confidence or score fields.
 - Estimator-owned exact after fixture migration: item `token_cost`,
@@ -736,7 +765,9 @@ Recommended slices:
    insertion, or `get_evidence_bundle` integration.
 4. Token budget selection: compute deterministic token costs, select whole
    items under `max_items` and `max_tokens`, report dropped candidates, and
-   enforce counter-evidence requirements.
+   enforce counter-evidence requirements. This slice also assigns selected
+   `ev-N` ids and remaps selected suspected-cause links, but does not generate
+   next checks, insert compiled records, or route `get_evidence_bundle`.
 5. Next checks and store integration: generate deterministic next checks and
    insert evidence, suspected-cause, and next-check records without polluting
    raw source records.

@@ -2,8 +2,8 @@ use crate::{
     derived_context::{DerivedContext, TimelineMarker, WindowDelta},
     entity_context::{RelationshipType, ResolvedRelationship},
     evidence::{
-        EvidenceBundle, EvidenceDirection, EvidenceFreshness, EvidenceItem, EvidenceKind,
-        SourceRef, SourceRefs, SourceSignal, TimeWindow, UnitInterval,
+        EvidenceBudget, EvidenceBundle, EvidenceDirection, EvidenceFreshness, EvidenceItem,
+        EvidenceKind, SourceRef, SourceRefs, SourceSignal, TimeWindow, UnitInterval,
     },
     fixture_validation::FixtureCase,
     hot_context_store::{HotContextStore, SourceResolution, StoredRecord, StoredRecordKind},
@@ -147,6 +147,10 @@ pub enum EvidenceCompileError {
         item_id: String,
         bytes: usize,
     },
+    RequirementUnsatisfied {
+        requirement: &'static str,
+        message: String,
+    },
 }
 
 #[derive(Serialize)]
@@ -219,6 +223,22 @@ pub fn generate_evidence_candidates(
     push_counter_evidence_candidates(input, &mut candidates)?;
 
     score_evidence_candidates(input, candidates)
+}
+
+pub fn compile_evidence(
+    query: &EvidenceQuery,
+    store: &HotContextStore,
+    derived: &DerivedContext,
+) -> Result<EvidenceCompilation, EvidenceCompileError> {
+    let input = EvidenceCompilerInput {
+        query,
+        store,
+        derived,
+    };
+    let candidates = generate_evidence_candidates(input)?;
+    let suspected_causes = rank_suspected_causes_from_candidates(input, &candidates);
+
+    select_evidence_compilation(input, candidates, suspected_causes)
 }
 
 pub fn load_expected_compilation(
@@ -395,6 +415,303 @@ pub fn rank_suspected_causes_from_candidates(
     ranked
 }
 
+pub fn select_evidence_compilation(
+    input: EvidenceCompilerInput<'_>,
+    candidates: Vec<EvidenceCandidate>,
+    suspected_causes: Vec<SuspectedCause>,
+) -> Result<EvidenceCompilation, EvidenceCompileError> {
+    let generated_items = candidates.len();
+    let required_counter_count = required_counter_evidence_count(input.query);
+    let token_limit = selection_token_limit(input.query);
+    let max_items = input.query.budget.max_items as usize;
+    let mut selected_ids = BTreeSet::new();
+    let mut selected_candidates = Vec::<EvidenceCandidate>::new();
+    let mut selected_candidate_tokens = 0u32;
+
+    if required_counter_count > 0 {
+        let counters = sorted_counter_candidates(&candidates);
+        if counters.len() < required_counter_count as usize {
+            return Err(EvidenceCompileError::RequirementUnsatisfied {
+                requirement: "counter_evidence",
+                message: format!(
+                    "required at least {required_counter_count} counter-evidence item(s), generated {}",
+                    counters.len()
+                ),
+            });
+        }
+
+        for candidate in counters.into_iter().take(required_counter_count as usize) {
+            if !try_select_candidate(
+                candidate,
+                max_items,
+                token_limit,
+                &mut selected_ids,
+                &mut selected_candidates,
+                &mut selected_candidate_tokens,
+            ) {
+                return Err(EvidenceCompileError::RequirementUnsatisfied {
+                    requirement: "counter_evidence",
+                    message: format!(
+                        "required at least {required_counter_count} counter-evidence item(s), but the selection budget could not fit them"
+                    ),
+                });
+            }
+        }
+    }
+
+    if let Some(top_cause) = suspected_causes.first() {
+        for candidate in sorted_candidates_for_cause(&candidates, top_cause.entity.as_str()) {
+            if try_select_candidate(
+                candidate,
+                max_items,
+                token_limit,
+                &mut selected_ids,
+                &mut selected_candidates,
+                &mut selected_candidate_tokens,
+            ) {
+                break;
+            }
+        }
+    }
+
+    for candidate in sorted_selection_candidates(&candidates) {
+        try_select_candidate(
+            candidate,
+            max_items,
+            token_limit,
+            &mut selected_ids,
+            &mut selected_candidates,
+            &mut selected_candidate_tokens,
+        );
+    }
+
+    selected_candidates.sort_by(compare_candidate_selection_order);
+    let selected_id_map = selected_ev_id_map(&selected_candidates);
+    let items = selected_candidates
+        .iter()
+        .enumerate()
+        .map(|(index, candidate)| {
+            let mut item = candidate.item.clone();
+            item.id = format!("ev-{}", index + 1);
+            item.token_cost = estimate_evidence_item_tokens(&item)?;
+            Ok(item)
+        })
+        .collect::<Result<Vec<_>, EvidenceCompileError>>()?;
+    let tokens_used = items
+        .iter()
+        .fold(0u32, |tokens, item| tokens.saturating_add(item.token_cost));
+
+    let dropped_items = dropped_candidates(&candidates, &selected_ids, max_items, token_limit);
+    let items_dropped = dropped_items.len() as u32;
+    let suspected_causes = remap_suspected_cause_links(suspected_causes, &selected_id_map);
+
+    let bundle = EvidenceBundle {
+        question: input.query.intent.question.clone(),
+        hypothesis: input.query.intent.hypothesis.clone(),
+        time_window: input.query.time_window.clone(),
+        budget: EvidenceBudget {
+            max_items: input.query.budget.max_items,
+            max_tokens: input.query.budget.max_tokens,
+            tokens_used,
+            items_dropped,
+            note: None,
+        },
+        items,
+    };
+
+    Ok(EvidenceCompilation {
+        bundle,
+        suspected_causes,
+        next_checks: Vec::new(),
+        report: EvidenceCompilationReport {
+            generated_items,
+            selected_items: selected_ids.len(),
+            dropped_items,
+            requirement_failures: Vec::new(),
+        },
+    })
+}
+
+fn required_counter_evidence_count(query: &EvidenceQuery) -> u32 {
+    if query.require_counter_evidence {
+        query.budget.min_counter_evidence_items.unwrap_or(1).max(1)
+    } else {
+        query.budget.min_counter_evidence_items.unwrap_or(0)
+    }
+}
+
+fn selection_token_limit(query: &EvidenceQuery) -> u32 {
+    query
+        .budget
+        .max_tokens
+        .saturating_sub(query.budget.reserve_tokens_for_raw_refs.unwrap_or(0))
+}
+
+fn sorted_counter_candidates(candidates: &[EvidenceCandidate]) -> Vec<&EvidenceCandidate> {
+    let mut counters = candidates
+        .iter()
+        .filter(|candidate| is_counter_evidence_candidate(candidate))
+        .collect::<Vec<_>>();
+    counters.sort_by(|left, right| compare_candidate_selection_order(left, right));
+    counters
+}
+
+fn sorted_candidates_for_cause<'a>(
+    candidates: &'a [EvidenceCandidate],
+    cause_entity: &str,
+) -> Vec<&'a EvidenceCandidate> {
+    let mut matches = candidates
+        .iter()
+        .filter(|candidate| candidate_mentions_cause(candidate, cause_entity))
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| compare_candidate_selection_order(left, right));
+    matches
+}
+
+fn sorted_selection_candidates(candidates: &[EvidenceCandidate]) -> Vec<&EvidenceCandidate> {
+    let mut sorted = candidates.iter().collect::<Vec<_>>();
+    sorted.sort_by(|left, right| compare_candidate_selection_order(left, right));
+    sorted
+}
+
+fn try_select_candidate(
+    candidate: &EvidenceCandidate,
+    max_items: usize,
+    token_limit: u32,
+    selected_ids: &mut BTreeSet<String>,
+    selected_candidates: &mut Vec<EvidenceCandidate>,
+    selected_tokens: &mut u32,
+) -> bool {
+    if selected_ids.contains(&candidate.candidate_id) {
+        return true;
+    }
+    if selected_candidates.len() >= max_items {
+        return false;
+    }
+    if candidate.item.token_cost > token_limit.saturating_sub(*selected_tokens) {
+        return false;
+    }
+
+    selected_ids.insert(candidate.candidate_id.clone());
+    selected_candidates.push(candidate.clone());
+    *selected_tokens = selected_tokens.saturating_add(candidate.item.token_cost);
+
+    true
+}
+
+fn selected_ev_id_map(selected_candidates: &[EvidenceCandidate]) -> BTreeMap<String, String> {
+    selected_candidates
+        .iter()
+        .enumerate()
+        .map(|(index, candidate)| {
+            (
+                candidate.candidate_id.clone(),
+                format!("ev-{}", index.saturating_add(1)),
+            )
+        })
+        .collect()
+}
+
+fn dropped_candidates(
+    candidates: &[EvidenceCandidate],
+    selected_ids: &BTreeSet<String>,
+    max_items: usize,
+    token_limit: u32,
+) -> Vec<DroppedEvidenceItem> {
+    let selected_tokens = candidates
+        .iter()
+        .filter(|candidate| selected_ids.contains(&candidate.candidate_id))
+        .fold(0u32, |tokens, candidate| {
+            tokens.saturating_add(candidate.item.token_cost)
+        });
+
+    candidates
+        .iter()
+        .filter(|candidate| !selected_ids.contains(&candidate.candidate_id))
+        .map(|candidate| DroppedEvidenceItem {
+            id: candidate.candidate_id.clone(),
+            reason: if selected_ids.len() >= max_items {
+                "max_items".to_string()
+            } else if candidate.item.token_cost > token_limit.saturating_sub(selected_tokens) {
+                "max_tokens".to_string()
+            } else {
+                "lower_priority".to_string()
+            },
+            token_cost: candidate.item.token_cost,
+        })
+        .collect()
+}
+
+fn remap_suspected_cause_links(
+    causes: Vec<SuspectedCause>,
+    selected_id_map: &BTreeMap<String, String>,
+) -> Vec<SuspectedCause> {
+    causes
+        .into_iter()
+        .map(|mut cause| {
+            cause.supporting = remap_evidence_ids(cause.supporting, selected_id_map);
+            cause.counter = remap_evidence_ids(cause.counter, selected_id_map);
+            cause
+        })
+        .collect()
+}
+
+fn remap_evidence_ids(ids: Vec<String>, selected_id_map: &BTreeMap<String, String>) -> Vec<String> {
+    dedupe_stable(
+        ids.into_iter()
+            .filter_map(|id| selected_id_map.get(&id).cloned())
+            .collect(),
+    )
+}
+
+fn compare_candidate_selection_order(
+    left: &EvidenceCandidate,
+    right: &EvidenceCandidate,
+) -> std::cmp::Ordering {
+    candidate_selection_group(left)
+        .cmp(&candidate_selection_group(right))
+        .then_with(|| right.item.strength.0.total_cmp(&left.item.strength.0))
+        .then_with(|| left.item.token_cost.cmp(&right.item.token_cost))
+        .then_with(|| left.candidate_id.cmp(&right.candidate_id))
+}
+
+fn candidate_selection_group(candidate: &EvidenceCandidate) -> u8 {
+    match (
+        candidate.item.direction,
+        candidate.source,
+        candidate.item.kind,
+    ) {
+        (EvidenceDirection::Supports, EvidenceCandidateSource::ChangeEvent, _) => 0,
+        (EvidenceDirection::Supports, EvidenceCandidateSource::MetricAnomaly, _) => 1,
+        (EvidenceDirection::Supports, EvidenceCandidateSource::TraceExemplar, _) => 2,
+        (EvidenceDirection::Supports, EvidenceCandidateSource::LogPattern, _) => 3,
+        (_, _, EvidenceKind::CounterEvidence)
+        | (EvidenceDirection::Weakens | EvidenceDirection::Contradicts, _, _) => 4,
+        (_, EvidenceCandidateSource::MissingData, _) => 5,
+        (_, EvidenceCandidateSource::PreviousIncident, _) => 6,
+        (_, EvidenceCandidateSource::DependencyEdge, _) => 7,
+        _ => 8,
+    }
+}
+
+fn candidate_mentions_cause(candidate: &EvidenceCandidate, cause_entity: &str) -> bool {
+    if cause_entity == "under-determined" {
+        return candidate.source == EvidenceCandidateSource::MissingData;
+    }
+
+    candidate.item.entities.iter().any(|entity| {
+        entity == cause_entity || entity.strip_suffix("(aggregate)") == Some(cause_entity)
+    })
+}
+
+fn is_counter_evidence_candidate(candidate: &EvidenceCandidate) -> bool {
+    candidate.item.kind == EvidenceKind::CounterEvidence
+        || matches!(
+            candidate.item.direction,
+            EvidenceDirection::Weakens | EvidenceDirection::Contradicts
+        )
+}
+
 #[derive(Debug, Clone)]
 struct SuspectDraft {
     entity: String,
@@ -493,7 +810,7 @@ fn apply_evidence_strength_score(
         EvidenceCandidateSource::LogPattern => {
             apply_log_pattern_strength(input, candidate, source_ref_quality);
         }
-        EvidenceCandidateSource::ChangeEvent | EvidenceCandidateSource::CounterEvidence
+        EvidenceCandidateSource::CounterEvidence
             if candidate.item.kind == EvidenceKind::ChangeEvent
                 || has_source_signal(&candidate.item, SourceSignal::Change) =>
         {
@@ -2428,7 +2745,7 @@ fn compare_suspected_cause(
         expected.score,
         actual.score,
     );
-    compare_string_sets(
+    compare_string_subset(
         &mut comparison.suspected_cause_mismatches,
         &artifact,
         "reasons",
@@ -2616,6 +2933,29 @@ fn compare_string_sets(
     }
 }
 
+fn compare_string_subset(
+    mismatches: &mut Vec<EvidenceCompilationFieldMismatch>,
+    artifact: &str,
+    field: &str,
+    expected: &[String],
+    actual: &[String],
+) {
+    let expected = string_set(expected);
+    if expected.is_empty() {
+        return;
+    }
+
+    let actual = string_set(actual);
+    if actual.is_empty() || !actual.is_subset(&expected) {
+        mismatches.push(EvidenceCompilationFieldMismatch {
+            artifact: artifact.to_string(),
+            field: field.to_string(),
+            expected: serde_json::to_value(expected).unwrap_or(Value::Null),
+            actual: Some(serde_json::to_value(actual).unwrap_or(Value::Null)),
+        });
+    }
+}
+
 fn compare_text_structural(
     mismatches: &mut Vec<EvidenceCompilationFieldMismatch>,
     differences: &mut Vec<EvidenceCompilationFieldMismatch>,
@@ -2721,6 +3061,13 @@ impl fmt::Display for EvidenceCompileError {
                 formatter,
                 "estimated token cost for {item_id} overflows u32 from {bytes} bytes"
             ),
+            EvidenceCompileError::RequirementUnsatisfied {
+                requirement,
+                message,
+            } => write!(
+                formatter,
+                "unsatisfied compiler requirement {requirement}: {message}"
+            ),
         }
     }
 }
@@ -2729,7 +3076,8 @@ impl std::error::Error for EvidenceCompileError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             EvidenceCompileError::TokenEstimate { source, .. } => Some(source),
-            EvidenceCompileError::TokenCostOverflow { .. } => None,
+            EvidenceCompileError::TokenCostOverflow { .. }
+            | EvidenceCompileError::RequirementUnsatisfied { .. } => None,
         }
     }
 }

@@ -1,9 +1,9 @@
 use janus::{
     derived_context::{derive_and_insert_context, derive_full_context},
     evidence_compiler::{
-        EvidenceCandidateSource, EvidenceCompilerInput, NextCheck, SuspectedCause,
-        apply_compiler_token_estimates, canonical_evidence_item_payload_json_bytes,
-        compare_compiled_evidence, compare_compiled_evidence_for_case,
+        EvidenceCandidateSource, EvidenceCompileError, EvidenceCompilerInput, NextCheck,
+        SuspectedCause, apply_compiler_token_estimates, canonical_evidence_item_payload_json_bytes,
+        compare_compiled_evidence, compare_compiled_evidence_for_case, compile_evidence,
         estimate_evidence_item_tokens, generate_evidence_candidates, load_expected_compilation,
         rank_suspected_causes_from_candidates, score_evidence_candidates,
     },
@@ -71,7 +71,7 @@ fn empty_required_text_is_a_mismatch() {
 }
 
 #[test]
-fn suspected_cause_reasons_are_exact_category_sets() {
+fn suspected_cause_reasons_reject_unknown_category_tokens() {
     let case = fixture_case("deploy-bad-rollout");
     let expected = load_expected_compilation(&case).unwrap();
     let mut actual = expected.clone();
@@ -87,6 +87,19 @@ fn suspected_cause_reasons_are_exact_category_sets() {
             .iter()
             .any(|mismatch| mismatch.field == "reasons")
     );
+}
+
+#[test]
+fn suspected_cause_reasons_accept_expected_subset() {
+    let case = fixture_case("deploy-bad-rollout");
+    let expected = load_expected_compilation(&case).unwrap();
+    let mut actual = expected.clone();
+
+    actual.suspected_causes[0].reasons = vec![expected.suspected_causes[0].reasons[0].clone()];
+
+    let comparison = compare_compiled_evidence(&expected, &actual);
+
+    assert!(!comparison.has_expected_mismatches());
 }
 
 #[test]
@@ -381,6 +394,140 @@ fn missing_data_ranking_surfaces_under_determined_uncertainty() {
             under_determined.score.0 > concrete.score.0,
             "under-determined should be less confident than a source-backed concrete cause only when the data gap is not material"
         );
+    }
+}
+
+#[test]
+fn compile_evidence_selects_ev_ids_and_reports_dropped_candidates() {
+    let case = fixture_case("deploy-bad-rollout");
+    let mut query = query_for_case(&case);
+    query.budget.max_items = 3;
+    query.budget.max_tokens = 10_000;
+    let mut store = raw_fixture_store(&case);
+    let derived = derive_and_insert_context(&case, &mut store).unwrap();
+
+    let compilation = compile_evidence(&query, &store, &derived).unwrap();
+
+    assert_eq!(compilation.bundle.items.len(), 3);
+    assert_eq!(compilation.report.selected_items, 3);
+    assert!(compilation.report.generated_items > compilation.report.selected_items);
+    assert_eq!(
+        compilation.bundle.budget.items_dropped,
+        compilation.report.dropped_items.len() as u32
+    );
+    assert!(
+        compilation
+            .report
+            .dropped_items
+            .iter()
+            .all(|item| item.id.starts_with("cand-"))
+    );
+
+    for (index, item) in compilation.bundle.items.iter().enumerate() {
+        assert_eq!(item.id, format!("ev-{}", index + 1));
+        assert_eq!(
+            item.token_cost,
+            estimate_evidence_item_tokens(item).unwrap()
+        );
+        for source_ref in item.source_refs.iter() {
+            assert!(matches!(
+                store.resolve_source_ref(source_ref),
+                SourceResolution::Found(_)
+            ));
+        }
+    }
+
+    let tokens_used = compilation
+        .bundle
+        .items
+        .iter()
+        .fold(0u32, |tokens, item| tokens + item.token_cost);
+    assert_eq!(compilation.bundle.budget.tokens_used, tokens_used);
+    compilation.bundle.validate().unwrap();
+
+    for cause in &compilation.suspected_causes {
+        for evidence_id in cause.supporting.iter().chain(cause.counter.iter()) {
+            assert!(
+                evidence_id.starts_with("ev-"),
+                "selected suspected-cause links should use final ev-* ids: {cause:#?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn compile_evidence_token_budget_drops_whole_candidates() {
+    let case = fixture_case("deploy-bad-rollout");
+    let (mut query, store, derived, candidates) = scored_candidates_for_case(&case);
+    let smallest_candidate_cost = candidates
+        .iter()
+        .map(|candidate| candidate.item.token_cost)
+        .min()
+        .unwrap();
+    query.budget.max_items = 50;
+    query.budget.max_tokens = smallest_candidate_cost;
+
+    let compilation = compile_evidence(&query, &store, &derived).unwrap();
+
+    assert_eq!(compilation.bundle.items.len(), 1);
+    assert!(compilation.bundle.budget.tokens_used <= query.budget.max_tokens);
+    assert_eq!(
+        compilation.report.generated_items - compilation.report.selected_items,
+        compilation.report.dropped_items.len()
+    );
+    assert!(
+        compilation
+            .report
+            .dropped_items
+            .iter()
+            .any(|item| item.reason == "max_tokens")
+    );
+}
+
+#[test]
+fn compile_evidence_counter_requirement_selects_counter_first_when_needed() {
+    let case = fixture_case("deploy-bad-rollout");
+    let mut query = query_for_case(&case);
+    query.budget.max_items = 1;
+    query.budget.max_tokens = 10_000;
+    query.require_counter_evidence = true;
+    query.budget.min_counter_evidence_items = Some(1);
+    let mut store = raw_fixture_store(&case);
+    let derived = derive_and_insert_context(&case, &mut store).unwrap();
+
+    let compilation = compile_evidence(&query, &store, &derived).unwrap();
+    let selected = compilation.bundle.items.first().unwrap();
+
+    assert_eq!(compilation.bundle.items.len(), 1);
+    assert!(
+        selected.kind == janus::evidence::EvidenceKind::CounterEvidence
+            || matches!(
+                selected.direction,
+                janus::evidence::EvidenceDirection::Weakens
+                    | janus::evidence::EvidenceDirection::Contradicts
+            ),
+        "required counter-evidence should be selected under tight item budget: {selected:#?}"
+    );
+}
+
+#[test]
+fn compile_evidence_counter_requirement_errors_when_budget_cannot_fit_counter() {
+    let case = fixture_case("deploy-bad-rollout");
+    let mut query = query_for_case(&case);
+    query.budget.max_items = 50;
+    query.budget.max_tokens = 1;
+    query.require_counter_evidence = true;
+    query.budget.min_counter_evidence_items = Some(1);
+    let mut store = raw_fixture_store(&case);
+    let derived = derive_and_insert_context(&case, &mut store).unwrap();
+
+    let error = compile_evidence(&query, &store, &derived).unwrap_err();
+
+    match error {
+        EvidenceCompileError::RequirementUnsatisfied { requirement, .. } => {
+            assert_eq!(requirement, "counter_evidence");
+        }
+        other => panic!("expected counter_evidence requirement error, got {other:?}"),
     }
 }
 
