@@ -114,3 +114,128 @@ Commands run:
   created
 
 <!-- Reviewer appends below; the Implementor must not edit past this line. -->
+
+## Review (by Claude)
+
+### Direction Verdict
+
+**Continue — milestone progress is excellent, but Milestone 5B is not quite
+complete: one coverage hole must close first.** Judging progress before defects:
+Slice 6 delivers the full pipeline (`derive_full_context`) and store integration
+(`derive_and_insert_context`) correctly, resolves the round-6 relationship-ref
+finding, and makes the timeline-generalization decision explicit and recorded —
+exactly the close-out I asked for. I reproduced verification against baseline
+`4da0926`: 19 `derived_context` tests pass, full suite green, clippy clean,
+`validate_fixtures` 0 errors / 0 warnings. The three formal-doc updates match
+their claims.
+
+This is genuinely strong final-integration work. I am withholding a clean
+"complete" for one reason only — a silent comparison gap (Finding 1) — and once
+that closes, the topic is done. So: **answering Focus Q5 directly — not yet; one
+focused fix remains**, then 5B is complete.
+
+### What This Round Resolves (confirmed)
+
+- **Relationship-ref resolution (Focus Q2): correct.** `derive_and_insert_context`
+  resolves entities/relationships and inserts `Entity` + `Relationship` records
+  *before* the derived context records, so `relationship:` provenance resolves via
+  `SourceSignal::Relationship`, like anomaly/log-pattern refs. A test asserts it.
+  This closes round-6 Finding 1, and the design's Store Integration section was
+  updated to require the ordering.
+- **Timeline marker decision (Focus Q3): acceptable and well-scoped.** Amplification
+  is now derived from resolved `retries` edges, and propagation only when a
+  downstream anomaly on a `calls`/`reads-from`/`depends-on` edge starts strictly
+  earlier; everything else stays `symptom`. That is real source-derived role
+  assignment (the Slice-5 approach applied to markers), it preserves the
+  false-causality fixtures, and the remaining corpus-bounded *event selection* is
+  now an explicit, recorded decision in the design doc rather than silent
+  overfitting. This is the outcome I required in rounds 5–6.
+- **Insertion keeps derived records out of `raw_source_records()`** — the
+  Milestone-5A separation still holds.
+
+### Findings
+
+**Finding 1 (must close before declaring 5B complete) — capability projection
+silently hides a legitimate gold artifact in `traffic-shift-hotspot`.**
+
+I audited every fixture's declared capabilities against the artifacts actually
+present in its `expected.json`. Eleven of twelve align. The exception:
+`traffic-shift-hotspot` declares `anomaly-windows`, `build_timeline`,
+`compare_windows` — but **not** `log-pattern-clustering` — yet its gold contains a
+well-formed `log_patterns` entry:
+
+```
+lp-1  WARN  shard:orders-shard-3
+"queue depth high on shard 3 (<n>), processing delayed"  count 2  exemplars [log-1]
+```
+
+This is not stale junk — the template even reflects the Slice-3
+parenthesized-integer normalization, and the underlying WARN ("queue depth high")
+is already in the log-notability allowlist. But because the capability tag is
+missing, three things compound:
+
+- `derive_log_patterns` gates on `log-pattern-clustering` and returns empty for
+  this fixture;
+- `capability_expected_context` projects the gold `log_patterns` out;
+- so the full-corpus test compares empty-vs-empty and **passes vacuously** — a
+  real gold log pattern is neither derived nor verified.
+
+Capability projection is a defensible reading of the design ("follow capability
+tags"), so this is not a code-logic bug per se — but it converts a fixture
+inconsistency into invisible lost coverage, which directly undercuts DoD item
+"current fixture gold artifacts are compared according to capability tags." Two
+fixes, ideally both:
+
+1. Add `log-pattern-clustering` to `traffic-shift-hotspot`'s capabilities (the
+   gold pattern is legitimate), then confirm `derive_full_context` actually
+   produces `lp-1` and the comparison checks it. This is the substantive fix.
+2. Make the comparison **surface present-but-undeclared gold** (a report list /
+   nonfatal channel, like the existing `extra_*` and `*_differences` fields) so a
+   future capability-tag omission cannot silently zero out coverage again. This
+   prevents recurrence.
+
+This is the single blocker to completion; it is narrow and the fix is small.
+
+### Definition Of Done — Status
+
+Checked each DoD item against the implementation:
+
+- anomaly windows / log patterns / timeline / related-anomalies / window-comparison
+  derived with bounded windows, source refs, confidence, stability, exemplars,
+  ordering — **met**;
+- derived anomaly + log-pattern refs resolve through the hot store; timeline /
+  related / window-comparison records inspectable via the store + comparison path
+  — **met** (and relationship refs now resolve too);
+- no evidence ranking, suspected-cause scoring, MCP, persistence, dashboard, or new
+  ingest introduced — **met**;
+- `cargo fmt` / `cargo test` / `cargo clippy --all-targets --all-features` /
+  `cargo run --bin validate_fixtures` pass — **met** (reproduced);
+- gold compared according to capability tags — **met in form, but with the
+  traffic-shift coverage hole of Finding 1**.
+
+So DoD is met on every axis except the one Finding-1 gap. That is why this is
+"one fix from done," not "done."
+
+### Answers To Reviewer Focus
+
+1. **Yes, with the Finding-1 caveat** — the pipeline and insertion satisfy Slice 6
+   integration; the only gap is the hidden traffic-shift log-pattern coverage.
+2. **Yes** — inserting derived relationship records before related anomalies is the
+   right resolution; provenance now resolves through the store boundary.
+3. **Yes** — the timeline marker decision is acceptable and properly recorded.
+4. **Defensible, but it creates the silent hole** — see Finding 1. Keep
+   capability-driven comparison, but surface present-but-undeclared gold and fix
+   the traffic-shift capability tag.
+5. **Not yet — close Finding 1 first.** Everything else meets the Definition Of
+   Done. With the traffic-shift gold log pattern derived and compared (and the
+   present-but-undeclared gold surfaced), Milestone 5B is complete.
+
+### Round Termination
+
+This round leaves actionable feedback (Finding 1), so per the framework a
+`review-8` round is justified to carry the fix. It should be small: declare the
+`traffic-shift-hotspot` log-pattern capability (or otherwise resolve the gold),
+make present-but-undeclared gold visible in the comparison, and re-run the corpus
+suite. If round 8 closes Finding 1 with no new findings, **Milestone 5B is
+complete and no further round should be opened** — report completion to the User
+rather than emitting an empty round.
