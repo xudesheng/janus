@@ -120,3 +120,122 @@ cargo run --bin validate_fixtures
 reported 12 fixtures, 0 errors, and 0 warnings.
 
 <!-- Reviewer appends below; the Implementor must not edit past this line. -->
+
+## Review (by Claude (Opus 4.8))
+
+### Direction Verdict
+
+On critical path: **yes** — Phase 3 (relationship builder) is the approved next
+slice, and the round also lands the review-2 confidence cleanup required before
+Phase 4.
+
+Milestone progress (judged before local defects): **strong and verified.** I
+read the code, not just the summary:
+
+- **Review-2 Finding A is genuinely fixed**, not relocated. `service_confidence`
+  now derives from a `(service.version, service.instance.id, namespace)` presence
+  tuple (`0.99/0.98/0.95/0.90`); `pod_confidence` from host presence; dependency
+  confidence from `db.system` kind. No fixture entity names remain in the
+  confidence path. Relationship confidence (`relationship_confidence`) is a base
+  per relationship *type*, lowered by `0.20` (floor `0.30`) only when an endpoint
+  entity is unresolved — a real rule, not memorized tuples. This directly honors
+  the review-2 caveat about not memorizing relationship confidence.
+- **Finding B is fixed**: `estimated_share` is computed
+  (`unresolved-mentioning records / total raw records`, rounded to 2 dp); `0.18`
+  now falls out of the data instead of being copied.
+- **Finding C is fixed**: the redis id-prefix choice keys on `cluster.name`
+  presence, not the literal `redis-cache` name.
+- **Phase 3 builds the priority relationship types structurally**: `calls` from
+  trace parent-child via `nearest_service_ancestor`, `reads-from`/`writes-to`
+  from dependency spans + SQL-verb classification, `deployed-as`/`runs-on` from
+  runtime resource mappings, `depends-on` from unmatched `peer.service`. These
+  are source-backed.
+- **Coverage is real**: `relationship_builder_derives_every_current_fixture_gold_relationship`
+  passes corpus-wide and asserts gold `evidence`/`attributes` are subsets of
+  derived; the retry/cache test pins concrete evidence + attributes; an isolation
+  test proves the builder ignores gold relationship records. I reproduced
+  `cargo test` (all pass), `cargo clippy --all-targets --all-features` clean,
+  `cargo fmt --check` clean, `validate_fixtures` 12/0/0.
+- Process correct: baseline `c0831d6` is pushed, an ancestor, and the
+  pre-review-document tree; covered code (`d6914ee`, `c0831d6`) was pushed before
+  the review document.
+
+Verdict: **continue, and I approve proceeding to Phase 4 (comparison helper +
+tests).** There is no memorization regression. The one open direction issue is
+the relationship builder's fixture-content heuristics (Finding 1), which Phase 4
+is the right place to make transparent and to guard. Two requirements attach to
+Phase 4 (see Findings 1–2). Next action: continue.
+
+### Finding 1 — relationship builder encodes fixture-content/naming heuristics (document + bound before/at Phase 4)
+
+To derive every gold relationship corpus-wide, the builder reaches past direct
+telemetry into fixture-content inference:
+
+- `insert_resource_name_relationships`: a `calls` edge inferred purely from the
+  `*-ui` -> `*-api` service-name convention (coincidental-deploy-trap), confidence
+  `0.95`, empty evidence.
+- `insert_change_inferred_relationships`: matches the free-text token `"vacuum"`
+  in a change `summary` to emit `writes-to` a database.
+- `insert_peer_service_relationship`: span name containing `"charge"` sets
+  `role: payment-provider`.
+- `insert_prior_inferred_relationships`: infers a *current* `writes-to` from a
+  `PriorIncident` signature.
+- `resource_attribute`: hard-codes the literal attribute namespace
+  `checkout.retry.max_attempts` / `checkout.retry.backoff`.
+
+These are deterministic and, importantly, **contract-honest on evidence**: the
+gold edges they target (`search-ui->search-api`, `reporting-job->db:orders-pg`,
+the runtime edges) are authored in gold with `evidence: None`, so emitting them
+without evidence is correct, not a shortcut. So this is *not* the review-2
+name->number memorization. But it is fixture-domain knowledge baked into code,
+and the design's own Review Focus #5 ("relationship evidence and confidence are
+source-backed instead of inferred from weak correlation") is in tension with
+naming/free-text inference.
+
+The design explicitly allows "deterministic rules for the current fixtures" for
+this first slice, so I am not blocking on these. The requirement is
+**transparency**: document these accepted Milestone-5A inference rules in
+`docs/core/entity-resolver-confidence.md` (the `-ui`/`-api` convention, the
+change-summary and prior-incident inferences, and the `checkout.retry.*`
+attribute namespace) so Phase 4's comparison is blessing a *reviewed* decision,
+not hidden heuristics. Prefer generalizing the most brittle free-text matches
+(`"vacuum"`, `"charge"`) to a structured attribute or a documented narrow scope.
+
+### Finding 2 — corpus test only proves gold ⊆ derived; Phase 4 must report extra/spurious relationships and entities
+
+Every coverage test checks that gold entities/relationships are *present* in the
+derived output; nothing checks the other direction. The keyword/naming heuristics
+in Finding 1 are exactly the kind of rule that can over-fire on a future fixture
+(another `*-ui`/`*-api` pair that should not call; a `"charge"` span that is not a
+payment provider). The design's Fixture Comparison Contract already requires
+reporting "unresolved extra entities and extra relationships" — Phase 4's
+`compare_entity_context` must implement that direction and the round should add a
+test that bounds spurious edges (e.g. derived relationships among gold entity ids
+that are not in gold are surfaced). Without it, the heuristics' false-positive
+rate is invisible.
+
+### Finding 3 — Phase 4 must finally exercise confidence/discriminators/alternatives end-to-end (minor, scope reminder)
+
+Through Phase 3 the only confidence/discriminator/alternative assertions are on
+`ambiguous-entity-resolution`. Now that entity confidence is property-derived, the
+Phase 4 comparison helper should compare confidence (within the pinned `±0.05`),
+discriminators (set-wise), and alternatives across the full required-fixture set —
+this is the deferral that Phase 4 is meant to close, and it is the real test of
+the de-memorized confidence rule from this round.
+
+### Answers to the round's review-focus questions
+
+1. Review-2 A/B/C addressed without new name memorization: **yes** — verified in
+   code; confidence and share are now property-derived.
+2. Relationship builder sufficiently source-backed/explainable: **mostly** — the
+   priority types are; the inference rules in Finding 1 are deterministic but
+   fixture-specific and need documentation.
+3. Any rule too fixture-specific (UI/API, change/prior reporting-job): **yes,
+   those named ones** — acceptable for 5A but document and bound them (Findings
+   1–2).
+4. Relationship confidence avoids the review-2 anti-pattern: **yes** —
+   type-based with an endpoint-unresolved penalty, not memorized.
+5. Corpus tuple/evidence/attribute tests enough to proceed to Phase 4: **yes for
+   presence**, but add the spurious-edge direction (Finding 2).
+6. Proceed to Phase 4: **yes**, with Findings 1–3 folded into the comparison
+   round.
