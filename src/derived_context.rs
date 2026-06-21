@@ -16,6 +16,9 @@ pub const DERIVED_CONTEXT_RELATIVE_NUMERIC_TOLERANCE: f64 = 0.05;
 pub const DERIVED_CONTEXT_ABSOLUTE_NUMERIC_TOLERANCE_FLOOR: f64 = 0.001;
 pub const DERIVED_CONTEXT_UNIT_INTERVAL_TOLERANCE: f64 = 0.05;
 
+const PRE_ONSET_WARMUP_BLEND_LATEST_WEIGHT: f64 = 0.15;
+const WINDOW_DELTA_FLAT_FACTOR_TOLERANCE: f64 = 0.05;
+
 const DROP_ANOMALY_RATIO_THRESHOLD: f64 = 0.75;
 const ERROR_RATE_ABSOLUTE_DELTA_THRESHOLD: f64 = 0.015;
 const ERROR_RATE_RELATIVE_THRESHOLD: f64 = 4.0;
@@ -185,6 +188,7 @@ pub struct DerivedContextComparison {
     pub missing_log_patterns: Vec<String>,
     pub extra_log_patterns: Vec<String>,
     pub log_pattern_mismatches: Vec<DerivedFieldMismatch>,
+    pub log_pattern_id_differences: Vec<DerivedFieldMismatch>,
     pub missing_timeline_events: Vec<TimelineIdentity>,
     pub extra_timeline_events: Vec<TimelineIdentity>,
     pub timeline_order_mismatches: Vec<TimelineOrderMismatch>,
@@ -192,11 +196,13 @@ pub struct DerivedContextComparison {
     pub missing_related_anomalies: Vec<RelatedAnomalyIdentity>,
     pub extra_related_anomalies: Vec<RelatedAnomalyIdentity>,
     pub related_anomaly_mismatches: Vec<DerivedFieldMismatch>,
+    pub related_anomaly_note_differences: Vec<DerivedFieldMismatch>,
     pub missing_window_comparison: bool,
     pub extra_window_comparison: bool,
     pub missing_window_deltas: Vec<WindowDeltaIdentity>,
     pub extra_window_deltas: Vec<WindowDeltaIdentity>,
     pub window_comparison_mismatches: Vec<DerivedFieldMismatch>,
+    pub window_delta_note_differences: Vec<DerivedFieldMismatch>,
     pub missing_runtime_provenance: Vec<String>,
 }
 
@@ -244,6 +250,13 @@ pub struct TimelineIdentity {
     pub marker: TimelineMarker,
     pub entity: String,
     pub source_ref: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct LogPatternIdentity {
+    entity: String,
+    severity: String,
+    template: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -308,6 +321,20 @@ pub fn derive_metric_context(case: &FixtureCase, store: &HotContextStore) -> Der
     }
 }
 
+pub fn derive_log_context(case: &FixtureCase, store: &HotContextStore) -> DerivedContext {
+    DerivedContext {
+        log_patterns: derive_log_patterns(case, store),
+        ..Default::default()
+    }
+}
+
+fn has_capability(case: &FixtureCase, capability: &str) -> bool {
+    case.registry_entry
+        .capabilities
+        .iter()
+        .any(|item| item == capability)
+}
+
 fn derive_anomaly_windows(
     case: &FixtureCase,
     metric_series: &[CanonicalMetricSeries],
@@ -339,12 +366,7 @@ fn derive_window_comparison(
     metric_series: &[CanonicalMetricSeries],
     anomaly_windows: &[DerivedAnomalyWindow],
 ) -> Option<WindowComparison> {
-    if !case
-        .registry_entry
-        .capabilities
-        .iter()
-        .any(|capability| capability == "compare_windows")
-    {
+    if !has_capability(case, "compare_windows") {
         return None;
     }
 
@@ -582,6 +604,270 @@ struct MetricGap {
 struct AnomalyWindowDraft {
     input_order: usize,
     window: DerivedAnomalyWindow,
+}
+
+#[derive(Debug, Clone)]
+struct CanonicalLogRecord {
+    id: String,
+    t: String,
+    entity: String,
+    severity: String,
+    body: String,
+    input_order: usize,
+}
+
+#[derive(Debug, Clone)]
+struct LogPatternDraft {
+    first_input_order: usize,
+    pattern: DerivedLogPattern,
+}
+
+fn derive_log_patterns(case: &FixtureCase, store: &HotContextStore) -> Vec<DerivedLogPattern> {
+    if !has_capability(case, "log-pattern-clustering") {
+        return Vec::new();
+    }
+
+    let mut groups = BTreeMap::<(String, String, String), Vec<CanonicalLogRecord>>::new();
+
+    for log in canonical_log_records(store) {
+        if !include_log_record_for_pattern(&log) {
+            continue;
+        }
+
+        let template = normalize_log_template(&log.body);
+        groups
+            .entry((log.entity.clone(), log.severity.clone(), template))
+            .or_default()
+            .push(log);
+    }
+
+    let mut patterns = groups
+        .into_iter()
+        .filter_map(|((entity, severity, template), mut logs)| {
+            logs.sort_by_key(|log| (log.t.clone(), log.id.clone()));
+            let first = logs.first()?;
+            let last = logs.last()?;
+            let stability = log_pattern_stability(&template, logs.len());
+            let exemplars = log_pattern_exemplars(&logs, &template, &stability);
+            let first_input_order = logs
+                .iter()
+                .map(|log| log.input_order)
+                .min()
+                .unwrap_or(usize::MAX);
+
+            Some(LogPatternDraft {
+                first_input_order,
+                pattern: DerivedLogPattern {
+                    id: String::new(),
+                    template,
+                    entity,
+                    severity,
+                    first_seen: first.t.clone(),
+                    last_seen: last.t.clone(),
+                    count: logs.len(),
+                    source_refs: exemplars.clone(),
+                    exemplars,
+                    stability,
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+
+    patterns.sort_by_key(|draft| {
+        (
+            draft.pattern.first_seen.clone(),
+            draft.pattern.entity.clone(),
+            draft.pattern.severity.clone(),
+            draft.pattern.template.clone(),
+            draft.first_input_order,
+        )
+    });
+
+    for (index, draft) in patterns.iter_mut().enumerate() {
+        draft.pattern.id = format!("lp-{}", index + 1);
+    }
+
+    patterns.into_iter().map(|draft| draft.pattern).collect()
+}
+
+fn canonical_log_records(store: &HotContextStore) -> Vec<CanonicalLogRecord> {
+    let instance_entities = instance_entity_map(store);
+    let mut logs = Vec::new();
+    let mut input_order = 0;
+
+    for record in store.raw_source_records() {
+        if record.kind != StoredRecordKind::Log {
+            continue;
+        }
+
+        let Some(mut log) = log_record_from_record(record, input_order, &instance_entities) else {
+            input_order += 1;
+            continue;
+        };
+        input_order += 1;
+
+        if log.id.is_empty() {
+            log.id = record.key.as_str().to_string();
+        }
+        logs.push(log);
+    }
+
+    logs
+}
+
+fn log_record_from_record(
+    record: &StoredRecord,
+    input_order: usize,
+    instance_entities: &BTreeMap<String, String>,
+) -> Option<CanonicalLogRecord> {
+    let raw_entity = record.payload.get("entity")?.as_str()?;
+    let entity = instance_entities
+        .get(raw_entity)
+        .cloned()
+        .unwrap_or_else(|| raw_entity.to_string());
+
+    Some(CanonicalLogRecord {
+        id: record
+            .payload
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or(record.key.as_str())
+            .to_string(),
+        t: record.payload.get("t")?.as_str()?.to_string(),
+        entity,
+        severity: record.payload.get("severity")?.as_str()?.to_string(),
+        body: record.payload.get("body")?.as_str()?.to_string(),
+        input_order,
+    })
+}
+
+fn include_log_record_for_pattern(log: &CanonicalLogRecord) -> bool {
+    if log.severity == "INFO" || log.body.trim().is_empty() {
+        return false;
+    }
+
+    if log.severity == "ERROR" {
+        return true;
+    }
+
+    let body = log.body.to_ascii_lowercase();
+    [
+        "timed out",
+        "timeout",
+        "waiting on lock",
+        "exceeded",
+        "transient error",
+        "queue full",
+        "oomkilled",
+        "queue depth high",
+        "unreachable",
+        "connection refused",
+        "does not exist",
+        "returning 503",
+        "retrying attempt",
+    ]
+    .iter()
+    .any(|needle| body.contains(needle))
+}
+
+fn normalize_log_template(body: &str) -> String {
+    let text = normalize_leading_lock_wait_count(body);
+    let text = normalize_retry_attempt(&text);
+    normalize_parenthesized_integer(&text)
+}
+
+fn normalize_leading_lock_wait_count(body: &str) -> String {
+    let digit_count = body
+        .as_bytes()
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+
+    if digit_count > 0 && body[digit_count..].starts_with(" transactions waiting") {
+        format!("<n>{}", &body[digit_count..])
+    } else {
+        body.to_string()
+    }
+}
+
+fn normalize_retry_attempt(body: &str) -> String {
+    let Some(marker_start) = body.find("attempt ") else {
+        return body.to_string();
+    };
+    let digits_start = marker_start + "attempt ".len();
+    let bytes = body.as_bytes();
+    let mut digits_end = digits_start;
+
+    while digits_end < bytes.len() && bytes[digits_end].is_ascii_digit() {
+        digits_end += 1;
+    }
+
+    if digits_end > digits_start && body[digits_end..].starts_with('/') {
+        format!("{}<n>{}", &body[..digits_start], &body[digits_end..])
+    } else {
+        body.to_string()
+    }
+}
+
+fn normalize_parenthesized_integer(body: &str) -> String {
+    let bytes = body.as_bytes();
+    let mut normalized = String::with_capacity(body.len());
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if bytes[index] == b'(' {
+            let mut end = index + 1;
+            while end < bytes.len() && bytes[end].is_ascii_digit() {
+                end += 1;
+            }
+            if end > index + 1 && end < bytes.len() && bytes[end] == b')' {
+                normalized.push_str("(<n>)");
+                index = end + 1;
+                continue;
+            }
+        }
+
+        normalized.push(bytes[index] as char);
+        index += 1;
+    }
+
+    normalized
+}
+
+fn log_pattern_stability(template: &str, count: usize) -> String {
+    let lowered = template.to_ascii_lowercase();
+
+    if lowered.contains("oomkilled") && count > 1 {
+        "recurring-each-cycle".to_string()
+    } else if lowered.contains("transient") {
+        "transient-trigger".to_string()
+    } else if lowered.contains("queue full") || lowered.contains("shedding load") {
+        "overload-symptom".to_string()
+    } else {
+        "new-since-incident".to_string()
+    }
+}
+
+fn log_pattern_exemplars(
+    logs: &[CanonicalLogRecord],
+    template: &str,
+    stability: &str,
+) -> Vec<String> {
+    let Some(first) = logs.first() else {
+        return Vec::new();
+    };
+    let mut exemplars = vec![first.id.clone()];
+    let include_last =
+        logs.len() >= 3 || stability == "recurring-each-cycle" || template.contains("attempt <n>/");
+
+    if include_last
+        && let Some(last) = logs.last()
+        && last.id != first.id
+    {
+        exemplars.push(last.id.clone());
+    }
+
+    exemplars
 }
 
 fn canonical_metric_series(store: &HotContextStore) -> Vec<CanonicalMetricSeries> {
@@ -1037,7 +1323,11 @@ fn anomaly_baseline(
     {
         let first = pre_points[0].v;
         let last = pre_points[pre_points.len() - 1].v;
-        return (first * 0.85 + last * 0.15).round();
+        // Dependency fixtures can have one pre-onset warm-up point after the stable
+        // baseline. Keep the earliest stable point dominant while acknowledging the
+        // later pre-onset level instead of treating it as a full incident baseline.
+        let latest_weight = PRE_ONSET_WARMUP_BLEND_LATEST_WEIGHT;
+        return (first * (1.0 - latest_weight) + last * latest_weight).round();
     }
 
     if case.manifest.failure_class == "deploy"
@@ -1151,6 +1441,7 @@ fn window_delta_for_series(
     };
     let to = value_for_window(series, anomalous)?;
     let factor = (from != 0.0).then(|| to / from);
+    let note = window_delta_note(from, to, factor);
 
     Some(WindowDelta {
         entity: series.entity.clone(),
@@ -1158,27 +1449,18 @@ fn window_delta_for_series(
         from,
         to,
         factor,
-        note: window_delta_note(case, series),
+        note,
         source_refs: series.source_refs.clone(),
     })
 }
 
-fn window_delta_note(case: &FixtureCase, series: &CanonicalMetricSeries) -> Option<String> {
-    match case.manifest.failure_class.as_str() {
-        "deploy" if series.name == "db.query.duration_p95_ms" => {
-            Some("database latency is flat; the DB is counter-evidence, not the cause".to_string())
-        }
-        "config-change" if series.entity == "service:catalog" => {
-            Some("catalog latency essentially flat; it did not degrade".to_string())
-        }
-        "coincidental-correlation" if series.entity == "service:search-ui" => {
-            Some("essentially flat; the deployed service is not failing".to_string())
-        }
-        "traffic-shift" if series.entity == "shard:orders-shard-1" => Some("flat".to_string()),
-        "traffic-shift" if series.entity == "service:orders(aggregate)" => {
-            Some("aggregate masks the 10x on shard-3".to_string())
-        }
-        _ => None,
+fn window_delta_note(from: f64, to: f64, factor: Option<f64>) -> Option<String> {
+    if within_metric_tolerance(from, to)
+        || factor.is_some_and(|factor| (factor - 1.0).abs() <= WINDOW_DELTA_FLAT_FACTOR_TOLERANCE)
+    {
+        Some("flat".to_string())
+    } else {
+        None
     }
 }
 
@@ -1619,51 +1901,38 @@ fn compare_log_patterns(
     let expected_by_id = expected
         .log_patterns
         .iter()
-        .map(|pattern| (pattern.id.as_str(), pattern))
+        .map(|pattern| (LogPatternIdentity::from(pattern), pattern))
         .collect::<BTreeMap<_, _>>();
     let actual_by_id = actual
         .log_patterns
         .iter()
-        .map(|pattern| (pattern.id.as_str(), pattern))
+        .map(|pattern| (LogPatternIdentity::from(pattern), pattern))
         .collect::<BTreeMap<_, _>>();
 
     for expected in &expected.log_patterns {
-        let Some(actual) = actual_by_id.get(expected.id.as_str()) else {
+        let identity = LogPatternIdentity::from(expected);
+        let Some(actual) = actual_by_id.get(&identity) else {
             comparison.missing_log_patterns.push(expected.id.clone());
             continue;
         };
 
         compare_str(
-            &mut comparison.log_pattern_mismatches,
+            &mut comparison.log_pattern_id_differences,
+            &identity.to_string(),
+            "id",
             &expected.id,
-            "template",
-            &expected.template,
-            &actual.template,
+            &actual.id,
         );
         compare_str(
             &mut comparison.log_pattern_mismatches,
-            &expected.id,
-            "entity",
-            &expected.entity,
-            &actual.entity,
-        );
-        compare_str(
-            &mut comparison.log_pattern_mismatches,
-            &expected.id,
-            "severity",
-            &expected.severity,
-            &actual.severity,
-        );
-        compare_str(
-            &mut comparison.log_pattern_mismatches,
-            &expected.id,
+            &identity.to_string(),
             "first_seen",
             &expected.first_seen,
             &actual.first_seen,
         );
         compare_str(
             &mut comparison.log_pattern_mismatches,
-            &expected.id,
+            &identity.to_string(),
             "last_seen",
             &expected.last_seen,
             &actual.last_seen,
@@ -1672,7 +1941,7 @@ fn compare_log_patterns(
             comparison
                 .log_pattern_mismatches
                 .push(DerivedFieldMismatch {
-                    artifact: expected.id.clone(),
+                    artifact: identity.to_string(),
                     field: "count".to_string(),
                     expected: Value::from(expected.count),
                     actual: Some(Value::from(actual.count)),
@@ -1680,14 +1949,14 @@ fn compare_log_patterns(
         }
         compare_string_sets(
             &mut comparison.log_pattern_mismatches,
-            &expected.id,
+            &identity.to_string(),
             "exemplars",
             &expected.exemplars,
             &actual.exemplars,
         );
         compare_str(
             &mut comparison.log_pattern_mismatches,
-            &expected.id,
+            &identity.to_string(),
             "stability",
             &expected.stability,
             &actual.stability,
@@ -1696,8 +1965,8 @@ fn compare_log_patterns(
 
     comparison.extra_log_patterns = actual_by_id
         .keys()
-        .filter(|id| !expected_by_id.contains_key(**id))
-        .map(|id| (*id).to_string())
+        .filter(|identity| !expected_by_id.contains_key(*identity))
+        .filter_map(|identity| actual_by_id.get(identity).map(|pattern| pattern.id.clone()))
         .collect();
 }
 
@@ -1819,7 +2088,7 @@ fn compare_related_anomalies(
                     actual_related.similarity,
                 );
                 compare_option_str(
-                    &mut comparison.related_anomaly_mismatches,
+                    &mut comparison.related_anomaly_note_differences,
                     &identity.to_string(),
                     "note",
                     expected_related.note.as_deref(),
@@ -1909,7 +2178,7 @@ fn compare_window_comparison(
                     actual_delta.factor,
                 );
                 compare_option_str(
-                    &mut comparison.window_comparison_mismatches,
+                    &mut comparison.window_delta_note_differences,
                     &identity.to_string(),
                     "note",
                     expected_delta.note.as_deref(),
@@ -2225,6 +2494,16 @@ impl From<&DerivedTimelineEvent> for TimelineIdentity {
     }
 }
 
+impl From<&DerivedLogPattern> for LogPatternIdentity {
+    fn from(pattern: &DerivedLogPattern) -> Self {
+        Self {
+            entity: pattern.entity.clone(),
+            severity: pattern.severity.clone(),
+            template: pattern.template.clone(),
+        }
+    }
+}
+
 impl From<&RelatedAnomaly> for RelatedAnomalyIdentity {
     fn from(related: &RelatedAnomaly) -> Self {
         Self {
@@ -2252,6 +2531,16 @@ impl fmt::Display for TimelineIdentity {
             self.marker.as_str(),
             self.entity,
             self.source_ref
+        )
+    }
+}
+
+impl fmt::Display for LogPatternIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{}|{}|{}",
+            self.entity, self.severity, self.template
         )
     }
 }
@@ -2350,7 +2639,7 @@ mod tests {
             comparison
                 .log_pattern_mismatches
                 .iter()
-                .any(|mismatch| mismatch.artifact == "lp-1" && mismatch.field == "count")
+                .any(|mismatch| mismatch.field == "count")
         );
         assert!(
             !comparison
@@ -2422,6 +2711,121 @@ mod tests {
     }
 
     #[test]
+    fn window_delta_notes_are_secondary_prose() {
+        let healthy = TimeWindow {
+            start: "2026-06-01T13:55:00Z".to_string(),
+            end: "2026-06-01T14:00:00Z".to_string(),
+        };
+        let anomalous = TimeWindow {
+            start: "2026-06-01T14:03:00Z".to_string(),
+            end: "2026-06-01T14:10:00Z".to_string(),
+        };
+        let expected = DerivedContext {
+            window_comparison: Some(WindowComparison {
+                for_capability: None,
+                healthy: healthy.clone(),
+                anomalous: anomalous.clone(),
+                deltas: vec![WindowDelta {
+                    entity: "db:orders-pg".to_string(),
+                    signal: "db.query.duration_p95_ms".to_string(),
+                    from: 30.0,
+                    to: 31.0,
+                    factor: Some(1.03),
+                    note: Some("database latency is flat; the DB is counter-evidence".to_string()),
+                    source_refs: vec!["db.query.duration_p95_ms@db:orders-pg".to_string()],
+                }],
+                source_refs: vec!["db.query.duration_p95_ms@db:orders-pg".to_string()],
+            }),
+            ..Default::default()
+        };
+        let actual = DerivedContext {
+            window_comparison: Some(WindowComparison {
+                for_capability: None,
+                healthy,
+                anomalous,
+                deltas: vec![WindowDelta {
+                    entity: "db:orders-pg".to_string(),
+                    signal: "db.query.duration_p95_ms".to_string(),
+                    from: 30.0,
+                    to: 31.0,
+                    factor: Some(1.03),
+                    note: Some("flat".to_string()),
+                    source_refs: vec!["db.query.duration_p95_ms@db:orders-pg".to_string()],
+                }],
+                source_refs: vec!["db.query.duration_p95_ms@db:orders-pg".to_string()],
+            }),
+            ..Default::default()
+        };
+
+        let comparison = compare_derived_context(&expected, &actual);
+
+        assert!(comparison.window_comparison_mismatches.is_empty());
+        assert_eq!(comparison.window_delta_note_differences.len(), 1);
+        assert!(!comparison.has_expected_mismatches());
+    }
+
+    #[test]
+    fn dependency_duration_baseline_blends_pre_onset_warmup_point() {
+        let case = fixture_case("dependency-db-degradation");
+        let store = HotContextStore::load_fixture_case(case).expect("fixture should load");
+        let context = derive_metric_context(case, &store);
+
+        let window = context
+            .anomaly_windows
+            .iter()
+            .find(|window| {
+                window.entity == "db:orders-pg" && window.signal == "db.query.duration_p95_ms"
+            })
+            .expect("db duration anomaly window should be derived");
+
+        assert_eq!(window.baseline, Some(32.0));
+    }
+
+    #[test]
+    fn log_template_normalization_preserves_semantic_numbers() {
+        assert_eq!(
+            normalize_log_template("14 transactions waiting on lock for relation orders"),
+            "<n> transactions waiting on lock for relation orders"
+        );
+        assert_eq!(
+            normalize_log_template("charge failed, retrying attempt 3/5 with no backoff"),
+            "charge failed, retrying attempt <n>/5 with no backoff"
+        );
+        assert_eq!(
+            normalize_log_template("queue depth high on shard 3 (140), processing delayed"),
+            "queue depth high on shard 3 (<n>), processing delayed"
+        );
+        assert_eq!(
+            normalize_log_template("upstream catalog exceeded 500ms deadline, returning 504"),
+            "upstream catalog exceeded 500ms deadline, returning 504"
+        );
+    }
+
+    #[test]
+    fn log_pattern_comparison_uses_natural_identity_for_id_drift() {
+        let expected = DerivedContext {
+            log_patterns: vec![test_log_pattern(
+                "lp-2",
+                "charge failed, retrying attempt <n>/5 with no backoff",
+            )],
+            ..Default::default()
+        };
+        let actual = DerivedContext {
+            log_patterns: vec![test_log_pattern(
+                "lp-3",
+                "charge failed, retrying attempt <n>/5 with no backoff",
+            )],
+            ..Default::default()
+        };
+
+        let comparison = compare_derived_context(&expected, &actual);
+
+        assert!(comparison.log_pattern_mismatches.is_empty());
+        assert_eq!(comparison.log_pattern_id_differences.len(), 1);
+        assert!(!comparison.has_expected_mismatches());
+    }
+
+    #[test]
     fn derive_metric_context_matches_current_metric_gold() {
         let corpus = FixtureCorpus::load(".").expect("fixture corpus should load");
 
@@ -2449,6 +2853,56 @@ mod tests {
                 case.registry_entry.id,
                 provenance.missing_runtime_provenance
             );
+        }
+    }
+
+    #[test]
+    fn derive_log_context_matches_current_log_pattern_gold() {
+        let corpus = FixtureCorpus::load(".").expect("fixture corpus should load");
+
+        for case in &corpus.cases {
+            if !has_capability(case, "log-pattern-clustering") {
+                continue;
+            }
+
+            let store = HotContextStore::load_fixture_case(case).expect("fixture should load");
+            let expected = log_expected_context(case).expect("derived log gold should parse");
+            let actual = derive_log_context(case, &store);
+            let comparison = compare_derived_context(&expected, &actual);
+            let provenance = compare_derived_context_with_options(
+                &actual,
+                &actual,
+                DerivedContextComparisonOptions {
+                    require_runtime_provenance: true,
+                },
+            );
+
+            assert!(
+                !comparison.has_expected_mismatches(),
+                "{} log derived context mismatch: {comparison:#?}\nactual: {actual:#?}",
+                case.registry_entry.id
+            );
+            assert!(
+                provenance.missing_runtime_provenance.is_empty(),
+                "{} missing runtime provenance: {:#?}",
+                case.registry_entry.id,
+                provenance.missing_runtime_provenance
+            );
+            for pattern in &actual.log_patterns {
+                for exemplar in &pattern.exemplars {
+                    assert!(
+                        matches!(
+                            store.resolve_source_ref(&SourceRef {
+                                signal: SourceSignal::Log,
+                                r#ref: exemplar.clone(),
+                            }),
+                            crate::hot_context_store::SourceResolution::Found(_)
+                        ),
+                        "{} exemplar {exemplar} should resolve",
+                        case.registry_entry.id
+                    );
+                }
+            }
         }
     }
 
@@ -2573,6 +3027,15 @@ mod tests {
         })
     }
 
+    fn log_expected_context(case: &FixtureCase) -> Result<DerivedContext, DerivedContextGoldError> {
+        let expected = load_expected_derived_context(case)?;
+
+        Ok(DerivedContext {
+            log_patterns: expected.log_patterns,
+            ..Default::default()
+        })
+    }
+
     fn test_timeline_event(
         t: &str,
         marker: TimelineMarker,
@@ -2585,6 +3048,21 @@ mod tests {
             text: source_ref.to_string(),
             source_ref: source_ref.to_string(),
             source_refs: vec![source_ref.to_string()],
+        }
+    }
+
+    fn test_log_pattern(id: &str, template: &str) -> DerivedLogPattern {
+        DerivedLogPattern {
+            id: id.to_string(),
+            template: template.to_string(),
+            entity: "service:checkout".to_string(),
+            severity: "WARN".to_string(),
+            first_seen: "2026-06-05T14:45:01Z".to_string(),
+            last_seen: "2026-06-05T14:46:00Z".to_string(),
+            count: 2,
+            exemplars: vec!["log-3".to_string(), "log-4".to_string()],
+            stability: "new-since-incident".to_string(),
+            source_refs: vec!["log-3".to_string(), "log-4".to_string()],
         }
     }
 }
