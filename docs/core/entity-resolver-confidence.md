@@ -65,6 +65,11 @@ model below are strong enough for Milestone 5A, especially for the
 contract is too loose, the implementation should not start until that contract
 is tightened.
 
+Default review mode is whole-design approval for Milestone 5A before any Rust
+implementation. Reviewers may instead approve phase-by-phase implementation,
+but their `Direction Verdict` must name the approved phase explicitly. A later
+phase must not start just because an earlier phase was accepted.
+
 ## Scope
 
 In scope:
@@ -108,6 +113,20 @@ OTLP JSON ingest sample -> HotContextStore -> entity resolver
 If the current store API does not expose enough read access, add a narrow
 read-only iterator or query method. Do not make the resolver reach into private
 store internals or parse fixture files as its primary path.
+
+The resolver must derive only from raw source records. The existing
+`HotContextStore::load_fixture_case` path loads same-fixture expected artifacts
+as derived reference targets, including gold `Entity` and `Relationship`
+records. Those records are comparison targets, not resolver inputs. Tests may
+load a full fixture store for convenience, but the resolver must filter its
+input to raw source kinds or use a raw-input-only store construction path so it
+cannot copy `expected.json`.
+
+Store `entities` metadata is a selector hint, not the entity-resolution source
+of truth. For example, resource records may need to be resolved from
+`payload.attributes["service.name"]`, `service.version`,
+`service.instance.id`, Kubernetes attributes, or deployment attributes even
+when the store record's `entities` field is empty.
 
 The first implementation should use these source record kinds:
 
@@ -417,6 +436,13 @@ store.insert_record(StoredRecord {
 
 Relationship records should include both endpoints in their store `entities`
 field so entity selectors can find them.
+
+Fixture gold relationships use the tuple `src`, `type`, and `dst` as the
+comparison identity and do not need an `id`. If derived relationships are
+inserted into the hot store, the implementation should assign a deterministic
+store key from that tuple, for example
+`relationship:{src}|{type}|{dst}`, instead of requiring fixture authors to add
+relationship ids. Relationship evidence remains a separate list of source refs.
 
 This topic may add a query or inspection helper for tests, but it should not
 change `get_evidence_bundle` from fixture-backed output into generated evidence.
