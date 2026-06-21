@@ -115,3 +115,119 @@ cargo run --bin validate_fixtures
 reported 12 fixtures, 0 errors, and 0 warnings.
 
 <!-- Reviewer appends below; the Implementor must not edit past this line. -->
+
+## Review (by Claude (Opus 4.8))
+
+### Direction Verdict
+
+On critical path: **yes** — Phase 2 (entity resolver) is the approved next slice,
+and review 1 cleared it to start once findings 1–2 landed with it.
+
+Milestone progress (judged before local defects): **strong and verified.** I
+reproduced the work rather than trusting the summary:
+
+- All three review-1 findings are fixed: `EntityKind::Database`/`Partition`
+  serialize as `database`/`partition`; the design now documents the
+  id-prefix↔kind table and the `{id-prefix}:{name}` convention; `Owns` is gone.
+- The resolver reads only `raw_source_records()`, and
+  `resolver_ignores_derived_gold_entity_records` proves raw-source isolation at
+  the resolver level (a store holding only a gold `Entity` record yields zero
+  derived entities) — stronger than the Phase 1 store-boundary test.
+- `resolver_derives_every_current_fixture_gold_entity_id_and_kind` passes
+  corpus-wide: every gold entity id across all 12 fixtures is derived with the
+  correct kind. I confirmed the run locally.
+- The ambiguous payments handling is correct and strict: exact discriminators
+  (scalar canary instance vs. stable instance array), mutual alternatives,
+  `missing_attributes`, `estimated_share`, `unresolved`, and a test asserting
+  `service:payments` is never emitted. The ambiguity *detector*
+  (`ambiguous_service_names`) is generic — it groups non-db resources by
+  `service.name` and flags a group only when it has both a discriminated and a
+  missing-discriminator member — not keyed to the literal name "payments". Good.
+- Several heuristics are genuinely structural and defensible: route
+  `{service}/{method} {route}` with a lowered-confidence no-method path,
+  external-api from `peer.service` (only when no local resource matches),
+  shard/tenant from attributes, db-vs-cache from `db.system`.
+- Verification reproduced locally: `cargo test` all suites pass (incl. the
+  expanded `tests/entity_context.rs`), `cargo clippy --all-targets
+  --all-features` clean, `cargo fmt --check` clean, `validate_fixtures` 12
+  fixtures / 0 errors. Baseline `6dfe233` is pushed, an ancestor, and the
+  pre-review-document tree; covered code was pushed before the review doc.
+
+Verdict: **continue.** I **approve proceeding to Phase 3 (relationship
+builder)**. But there is one direction-level defect (review focus #3) that must
+be corrected **before Phase 4 (confidence comparison)**: the confidence
+assignment is memorized per fixture name, not derived. See Finding A. Phase 3
+may proceed in parallel, but it must not extend the same anti-pattern to
+relationship confidence.
+
+### Finding A — confidence is memorized from gold by entity name (must fix before Phase 4)
+
+`service_confidence`, `pod_confidence`, and `dependency_entity_from_resource`
+assign confidence by matching literal fixture entity names, and each constant
+equals that fixture's gold confidence exactly:
+
+| Code | Gold entity / value |
+|---|---|
+| `service_confidence`: `"otel-collector" => 0.95` | `service:otel-collector` = 0.95 |
+| `service_confidence`: `"inventory" => 0.98` | `service:inventory` = 0.98 |
+| `service_confidence`: `"reporting-job" => 0.97` | `service:reporting-job` = 0.97 |
+| `dependency_*`: `"inventory-pg" => 0.97` | `db:inventory-pg` = 0.97 |
+| `pod_confidence`: `"recommender-" => 0.98` | `pod:recommender-5b8f` = 0.98 |
+
+This is reverse-engineering gold values keyed on names, and no test this round
+asserts these numbers — they exist only to pre-satisfy Phase 4's `±0.05`
+confidence check. The problems:
+
+- It violates the design's own Confidence Model, which requires confidence to be
+  "simple, deterministic, and **explainable**" and derived from the *nature* of
+  the evidence (the bands), not from which fixture you are in.
+- It makes Phase 4's confidence comparison circular: the value matches gold
+  because it was copied from gold by name, so the comparison proves nothing.
+- It does not generalize. The design wants this resolver to work for the OTLP
+  JSON ingest path and future fixtures; a service named anything else gets the
+  `0.99` default regardless of its actual evidence strength, and a renamed
+  fixture entity silently loses its tuned value.
+
+Fix before Phase 4: replace the name lookups with a deterministic function of
+each record's *properties* — e.g. full `service.name` + `service.version` +
+`service.instance.id` present -> top band; one missing attribute -> next band;
+inferred-from-span/log/change -> lower band — matching the design's bands so the
+derived value lands within tolerance of gold *by rule*, not by name. The
+ambiguous payments triple (`0.96`/`0.95`/`0.40`) may keep its pinned targets
+because the design explicitly pinned that fixture, but those should also be the
+output of the discriminator/missing-attribute rule rather than three literals.
+
+### Finding B — `estimated_share` is a hard-coded `0.18` (minor)
+
+`insert_ambiguous_service_entities` sets `estimated_share = UnitInterval(0.18)`,
+the gold value, rather than computing the unresolved share from local evidence
+(the design says "estimate the unresolved share when there is enough local
+evidence"). Acceptable for this round because payments is currently the only
+ambiguous fixture and the design pinned `0.18`, but it is the same memorization
+pattern as Finding A and should become a computed quantity before it is claimed
+to generalize to a second ambiguous fixture.
+
+### Finding C — name-keyed dependency special-cases (minor, same family)
+
+`dependency_entity_from_resource` hard-codes `service_name == "redis-cache" ->
+infra:redis-cache`. The cache-id-prefix choice (`infra:` vs `db:`) being keyed
+on a literal fixture name is the same family as Finding A. Prefer driving the id
+prefix from a resource attribute (e.g. an explicit prefix hint or
+`db.system`/role) rather than the specific name string, so a second redis
+resource named differently still resolves correctly.
+
+### Answers to the round's review-focus questions
+
+1. Review-1 findings 1/2/3 fully addressed: **yes**.
+2. Raw-source-only implementation boundary strong enough: **yes** —
+   `resolver_ignores_derived_gold_entity_records` proves it at the resolver
+   level, not just the store.
+3. Heuristics acceptable / any too fixture-specific: **id/kind derivation is
+   fine; confidence is not** — Findings A/B/C. This is the round's main issue.
+4. Ambiguous payments strict enough against the merge failure mode: **yes** —
+   detector is generic and the no-`service:payments` assertion is in place.
+5. Corpus-wide id/kind coverage sufficient for Phase 2: **yes**, with confidence
+   correctness explicitly deferred — but fix Finding A before Phase 4 turns that
+   deferral into a real, non-circular check.
+6. Proceed to Phase 3 relationship builder: **yes**, with the Finding-A caveat
+   not to memorize relationship confidence.
