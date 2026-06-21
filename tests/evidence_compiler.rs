@@ -1,15 +1,17 @@
 use janus::{
-    derived_context::derive_full_context,
+    derived_context::{derive_and_insert_context, derive_full_context},
     evidence_compiler::{
-        EvidenceCompilerInput, apply_compiler_token_estimates,
-        canonical_evidence_item_payload_json_bytes, compare_compiled_evidence,
-        compare_compiled_evidence_for_case, estimate_evidence_item_tokens,
-        load_expected_compilation,
+        EvidenceCandidateSource, EvidenceCompilerInput, NextCheck, SuspectedCause,
+        apply_compiler_token_estimates, canonical_evidence_item_payload_json_bytes,
+        compare_compiled_evidence, compare_compiled_evidence_for_case,
+        estimate_evidence_item_tokens, generate_evidence_candidates, load_expected_compilation,
     },
+    fixture_simulator::{plan_fixture_replay, replay_plan_into_store},
     fixture_validation::{FixtureCorpus, FixtureSelector},
-    hot_context_store::HotContextStore,
+    hot_context_store::{HotContextStore, SourceResolution},
     query::{EvidenceQuery, EvidenceQueryBudget, EvidenceQueryIntent, FreshnessPreference},
 };
+use std::collections::BTreeSet;
 
 #[test]
 fn loads_expected_compilation_artifacts_for_comparison_only() {
@@ -87,6 +89,55 @@ fn suspected_cause_reasons_are_exact_category_sets() {
 }
 
 #[test]
+fn extra_suspected_causes_and_next_checks_are_mismatches() {
+    let case = fixture_case("deploy-bad-rollout");
+    let expected = load_expected_compilation(&case).unwrap();
+    let mut actual = expected.clone();
+
+    actual.suspected_causes.push(SuspectedCause {
+        rank: 99,
+        entity: "service:unrelated".to_string(),
+        hypothesis: "unrelated extra cause".to_string(),
+        score: janus::evidence::UnitInterval(0.1),
+        reasons: vec!["extra".to_string()],
+        supporting: Vec::new(),
+        counter: Vec::new(),
+        note: None,
+        trap_note: None,
+    });
+    actual.next_checks.push(NextCheck {
+        action: "Inspect unrelated service.".to_string(),
+        rationale: "extra check should fail comparison".to_string(),
+        expected_signal: "metric_anomaly".to_string(),
+    });
+
+    let comparison = compare_compiled_evidence(&expected, &actual);
+
+    assert!(comparison.has_expected_mismatches());
+    assert_eq!(comparison.extra_suspected_causes, vec![99]);
+    assert_eq!(comparison.extra_next_checks, vec![3]);
+}
+
+#[test]
+fn next_check_expected_signal_is_exact_category_token() {
+    let case = fixture_case("deploy-bad-rollout");
+    let expected = load_expected_compilation(&case).unwrap();
+    let mut actual = expected.clone();
+
+    actual.next_checks[0].expected_signal = "log_cluster".to_string();
+
+    let comparison = compare_compiled_evidence(&expected, &actual);
+
+    assert!(comparison.has_expected_mismatches());
+    assert!(
+        comparison
+            .next_check_mismatches
+            .iter()
+            .any(|mismatch| mismatch.field == "expected_signal")
+    );
+}
+
+#[test]
 fn canonical_token_payload_is_pinned() {
     let case = fixture_case("deploy-bad-rollout");
     let expected = load_expected_compilation(&case).unwrap();
@@ -143,6 +194,90 @@ fn current_fixture_token_fields_match_compiler_estimator() {
 }
 
 #[test]
+fn generates_source_backed_candidates_for_current_corpus() {
+    let corpus = FixtureCorpus::load(repo_root()).unwrap();
+    let mut observed_sources = BTreeSet::new();
+
+    for case in &corpus.cases {
+        let query = query_for_case(case);
+        let mut store = raw_fixture_store(case);
+        let derived = derive_and_insert_context(case, &mut store).unwrap();
+        let candidates = generate_evidence_candidates(EvidenceCompilerInput {
+            query: &query,
+            store: &store,
+            derived: &derived,
+        })
+        .unwrap();
+        let mut candidate_ids = BTreeSet::new();
+
+        assert!(
+            !candidates.is_empty(),
+            "{} should generate at least one candidate",
+            case.registry_entry.id
+        );
+
+        for candidate in &candidates {
+            observed_sources.insert(candidate.source);
+            assert_eq!(candidate.candidate_id, candidate.item.id);
+            assert!(
+                candidate.candidate_id.starts_with("cand-"),
+                "{} has non-internal candidate id {}",
+                case.registry_entry.id,
+                candidate.candidate_id
+            );
+            assert!(
+                candidate_ids.insert(candidate.candidate_id.clone()),
+                "{} duplicate candidate id {}",
+                case.registry_entry.id,
+                candidate.candidate_id
+            );
+            candidate.item.validate().unwrap_or_else(|errors| {
+                panic!(
+                    "{} invalid candidate {}: {errors}",
+                    case.registry_entry.id, candidate.candidate_id
+                )
+            });
+            assert_eq!(
+                candidate.item.token_cost,
+                estimate_evidence_item_tokens(&candidate.item).unwrap(),
+                "{} {} token cost should come from compiler estimator",
+                case.registry_entry.id,
+                candidate.candidate_id
+            );
+
+            for source_ref in candidate.item.source_refs.iter() {
+                assert!(
+                    matches!(
+                        store.resolve_source_ref(source_ref),
+                        SourceResolution::Found(_)
+                    ),
+                    "{} {} source ref should resolve: {:?}",
+                    case.registry_entry.id,
+                    candidate.candidate_id,
+                    source_ref
+                );
+            }
+        }
+    }
+
+    for source in [
+        EvidenceCandidateSource::MetricAnomaly,
+        EvidenceCandidateSource::LogPattern,
+        EvidenceCandidateSource::ChangeEvent,
+        EvidenceCandidateSource::TraceExemplar,
+        EvidenceCandidateSource::DependencyEdge,
+        EvidenceCandidateSource::PreviousIncident,
+        EvidenceCandidateSource::MissingData,
+        EvidenceCandidateSource::CounterEvidence,
+    ] {
+        assert!(
+            observed_sources.contains(&source),
+            "current corpus should exercise {source:?} candidates"
+        );
+    }
+}
+
+#[test]
 fn runtime_input_excludes_expected_artifacts() {
     let case = fixture_case("deploy-bad-rollout");
     let query = query_for_case(&case);
@@ -171,6 +306,11 @@ fn fixture_case(id: &str) -> janus::fixture_validation::FixtureCase {
     };
 
     corpus.select(&selector).into_iter().next().unwrap().clone()
+}
+
+fn raw_fixture_store(case: &janus::fixture_validation::FixtureCase) -> HotContextStore {
+    let plan = plan_fixture_replay(case).unwrap();
+    replay_plan_into_store(&plan).unwrap()
 }
 
 fn query_for_case(case: &janus::fixture_validation::FixtureCase) -> EvidenceQuery {

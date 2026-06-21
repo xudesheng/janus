@@ -248,6 +248,12 @@ order. This keeps exact selected-id comparison meaningful without a fixture id
 migration. Internal candidate ids may use a separate deterministic scheme, but
 only selected `ev-N` ids are part of the public `EvidenceBundle` comparison.
 
+Slice 2 may expose candidate generation directly as an internal helper such as
+`generate_evidence_candidates(input) -> Vec<EvidenceCandidate>`. These candidates
+use internal ids such as `cand-001` and are not public selected bundle items.
+Later selection slices must assign the final selected `ev-N` ids and recompute
+estimator-owned token fields for that final selected output.
+
 ### Metric Anomaly Evidence
 
 Inputs:
@@ -627,19 +633,23 @@ Comparison mode must be explicit per field family:
 - Set or ordered-structural: item `entities`, using documented ordering when
   the compiler owns ordering and set comparison when order is not semantically
   meaningful.
-- Exact category set: suspected-cause `reasons`, which are category tokens such
-  as `time_alignment` and `downstream_db_healthy`, not free-form prose.
+- Exact category token or set: suspected-cause `reasons` and next-check
+  `expected_signal`, which are category tokens such as `time_alignment`,
+  `downstream_db_healthy`, `metric_anomaly`, and `log_cluster`, not free-form
+  prose.
 - Numeric tolerance: item `strength`, confidence dimensions, suspected-cause
   score, and other derived numeric confidence or score fields.
 - Estimator-owned exact after fixture migration: item `token_cost`,
   `EvidenceBudget.tokens_used`, and `EvidenceBudget.items_dropped`.
 - Text structural by default: `claim`, suspected-cause `hypothesis`, `note`,
-  `trap_note`, next-check `action`, `rationale`, and `expected_signal` must be
-  deterministic, non-empty where required, and anchored to the compared
-  entities, source refs, evidence ids, or reason/check categories. They should
-  not require verbatim equality with hand-authored gold prose unless a later
-  reviewed slice introduces compiler-owned templates and migrates the fixtures
-  to those templates.
+  `trap_note`, next-check `action`, and `rationale` must be deterministic,
+  non-empty where required, and anchored to the compared entities, source refs,
+  evidence ids, or reason/check categories. They should not require verbatim
+  equality with hand-authored gold prose unless a later reviewed slice
+  introduces compiler-owned templates and migrates the fixtures to those
+  templates. Until field-specific anchoring checks are implemented, the
+  comparison shell treats text-structural equality as non-empty required text
+  plus tracked non-blocking text differences.
 
 The comparison must fail if:
 
@@ -686,7 +696,11 @@ Recommended slices:
    needed to make estimator-owned token comparison exact.
 2. Candidate generation: generate source-backed EvidenceItem candidates from
    changes, anomaly windows, log patterns, traces, dependency edges, prior
-   incidents, missing data, and counter-evidence.
+   incidents, missing data, and counter-evidence. This slice exposes internal
+   candidates for later scoring and selection, but does not yet perform final
+   ranking, token-budget selection, selected `ev-N` assignment, suspected-cause
+   ranking, next-check generation, store insertion, or `get_evidence_bundle`
+   integration.
 3. Scoring and suspected causes: add evidence-strength dimensions, causal
    suspicion scoring, false-causality penalties, and suspected cause ranking.
 4. Token budget selection: compute deterministic token costs, select whole
