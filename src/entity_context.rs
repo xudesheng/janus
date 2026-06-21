@@ -103,9 +103,16 @@ impl RelationshipType {
 pub fn resolve_entities(store: &HotContextStore) -> Vec<ResolvedEntity> {
     let resources = resource_identities(store);
     let ambiguous_services = ambiguous_service_names(&resources);
+    let ambiguous_unresolved_shares =
+        ambiguous_unresolved_share_estimates(store, &resources, &ambiguous_services);
     let mut entities = BTreeMap::new();
 
-    insert_resource_entities(&mut entities, &resources, &ambiguous_services);
+    insert_resource_entities(
+        &mut entities,
+        &resources,
+        &ambiguous_services,
+        &ambiguous_unresolved_shares,
+    );
 
     for record in store.raw_source_records() {
         match record.kind {
@@ -1065,6 +1072,7 @@ fn insert_resource_entities(
     entities: &mut BTreeMap<String, ResolvedEntity>,
     resources: &[ResourceIdentity],
     ambiguous_services: &BTreeSet<String>,
+    ambiguous_unresolved_shares: &BTreeMap<String, UnitInterval>,
 ) {
     for resource in resources {
         if let Some((id, kind, confidence)) = dependency_entity_from_resource(resource) {
@@ -1126,8 +1134,81 @@ fn insert_resource_entities(
     }
 
     for service_name in ambiguous_services {
-        insert_ambiguous_service_entities(entities, resources, service_name);
+        insert_ambiguous_service_entities(
+            entities,
+            resources,
+            service_name,
+            ambiguous_unresolved_shares.get(service_name).copied(),
+        );
     }
+}
+
+fn ambiguous_unresolved_share_estimates(
+    store: &HotContextStore,
+    resources: &[ResourceIdentity],
+    ambiguous_services: &BTreeSet<String>,
+) -> BTreeMap<String, UnitInterval> {
+    let raw_records = store.raw_source_records().collect::<Vec<_>>();
+    let total_records = raw_records.len();
+    let mut estimates = BTreeMap::new();
+
+    if total_records == 0 {
+        return estimates;
+    }
+
+    for service_name in ambiguous_services {
+        let unresolved_resource_ids = resources
+            .iter()
+            .filter(|resource| {
+                resource.service_name.as_deref() == Some(service_name)
+                    && (resource.service_version.is_none()
+                        || resource.service_instance_id.is_none())
+            })
+            .map(|resource| resource.id.as_str())
+            .collect::<BTreeSet<_>>();
+        let unresolved_records = raw_records
+            .iter()
+            .filter(|record| {
+                record.kind != StoredRecordKind::Resource
+                    && record_mentions_unresolved_service(
+                        record,
+                        service_name,
+                        &unresolved_resource_ids,
+                    )
+            })
+            .count();
+
+        if unresolved_records > 0 {
+            let share = unresolved_records as f64 / total_records as f64;
+            estimates.insert(
+                service_name.clone(),
+                UnitInterval(round_two_decimals(share)),
+            );
+        }
+    }
+
+    estimates
+}
+
+fn record_mentions_unresolved_service(
+    record: &StoredRecord,
+    service_name: &str,
+    unresolved_resource_ids: &BTreeSet<&str>,
+) -> bool {
+    str_field(&record.payload, "resource")
+        .is_some_and(|resource| unresolved_resource_ids.contains(resource))
+        || str_field(&record.payload, "entity").is_some_and(|entity| {
+            entity == format!("{service_name}(unresolved)")
+                || entity == format!("service:{service_name}@unresolved")
+        })
+        || record
+            .entities
+            .iter()
+            .any(|entity| unresolved_resource_ids.contains(entity.as_str()))
+}
+
+fn round_two_decimals(value: f64) -> f64 {
+    (value * 100.0).round() / 100.0
 }
 
 fn dependency_entity_from_resource(
@@ -1184,6 +1265,7 @@ fn insert_ambiguous_service_entities(
     entities: &mut BTreeMap<String, ResolvedEntity>,
     resources: &[ResourceIdentity],
     service_name: &str,
+    unresolved_share: Option<UnitInterval>,
 ) {
     let service_resources = resources
         .iter()
@@ -1276,7 +1358,7 @@ fn insert_ambiguous_service_entities(
             "service.version".to_string(),
             "service.instance.id".to_string(),
         ];
-        entity.estimated_share = Some(UnitInterval(0.18));
+        entity.estimated_share = unresolved_share;
         entity.alternatives = vec![
             EntityAlternative {
                 id: format!("service:{service_name}@canary"),
