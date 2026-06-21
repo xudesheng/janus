@@ -122,9 +122,9 @@ Out of scope:
 
 The compiler should consume:
 
-- `EvidenceQuery`, including intent, time window, entities, budget, counter-
-  evidence requirement, raw-ref requirement, freshness preference, and privacy
-  scope;
+- `EvidenceQuery`, including the nested `EvidenceQueryIntent` question and/or
+  hypothesis, time window, entities, budget, counter-evidence requirement,
+  raw-ref requirement, freshness preference, and privacy scope;
 - raw source records from `HotContextStore`;
 - derived entities and relationships from Milestone 5A;
 - derived context from Milestone 5B, including anomaly windows, log patterns,
@@ -132,6 +132,11 @@ The compiler should consume:
 - fixture-provided `prior_incidents` records when available;
 - fixture scenario metadata and ground truth only for tests and comparison, not
   for runtime compilation.
+
+`EvidenceQuery.scenario_id` is a current fixture-selection adapter, not a
+production query primitive. It may still be used by fixture helpers during this
+topic, but the compiler boundary should be defined around query intent, source
+records, and derived context rather than around scenario id.
 
 The compiler must not use these expected artifacts as inputs:
 
@@ -213,7 +218,14 @@ The helper can load the selected fixture, replay source telemetry into a fresh
 store, derive entity and derived context, and then call `compile_evidence`.
 
 The public `get_evidence_bundle(EvidenceQuery)` boundary should keep its
-request and response types. This topic should either:
+request and response types. The current path is not only a gold-bundle loader:
+it already validates the query, checks budget fit, enforces raw-ref and
+counter-evidence requirements, resolves every returned source ref through
+`HotContextStore`, and checks that the query selects hot-context records. Slice
+6 should preserve those acceptance checks and swap the bundle source from
+fixture gold to compiled evidence.
+
+This topic should either:
 
 1. make `get_evidence_bundle` call the compiler and return
    `EvidenceCompilation.bundle`; or
@@ -222,6 +234,8 @@ request and response types. This topic should either:
 
 The preferred outcome is option 1. Milestone 6 should be the point where
 `get_evidence_bundle` becomes compiled evidence rather than fixture-gold lookup.
+If a temporary gold path coexists during Slice 6, it should be explicitly named
+as a compatibility path and removed or quarantined by the end of that slice.
 
 ## Candidate Evidence Generation
 
@@ -406,6 +420,10 @@ cause probability.
 `expected.suspected_causes` already exists in the fixture corpus. This topic
 should give that artifact a concrete generation path.
 
+Only the hot-store `StoredRecordKind::SuspectedCause` category exists today.
+The runtime `SuspectedCause` struct, gold parser, comparison helper, and store
+payload projection are all Slice 1 work.
+
 Suggested runtime shape:
 
 ```rust
@@ -439,6 +457,10 @@ Minimum behavior:
 
 `expected.next_checks` should also get a concrete generation path in this topic.
 
+Only the hot-store `StoredRecordKind::NextCheck` category exists today. The
+runtime `NextCheck` struct, gold parser, comparison helper, and store payload
+projection are all Slice 1 work.
+
 Suggested runtime shape:
 
 ```rust
@@ -471,20 +493,45 @@ Examples:
 
 Token budget is a query constraint, not a presentation detail.
 
-The first implementation should use a deterministic local estimator. Suggested
-starting point:
+Design decision: token costs are estimator-owned fixture fields, not exact
+comparison against the currently hand-authored token numbers.
+
+Slice 1 should adopt a deterministic local estimator and then regenerate
+fixture `token_cost`, `tokens_used`, and other token-budget expected fields from
+that estimator as formal fixture data. That fixture migration is not "gold as
+runtime input"; it makes the fixture oracle reflect the reviewed estimator.
+Until that migration exists, token fields are not an exact comparison target
+for generated compiler output.
+
+The first estimator should use this shape:
 
 ```text
-estimated_tokens = ceil(serialized_evidence_item_json_bytes / 4)
+estimated_tokens = ceil(canonical_evidence_item_payload_json_bytes / 4)
 ```
 
-The exact estimator can change, but it must be:
+Where `canonical_evidence_item_payload_json_bytes` means compact JSON bytes for
+a deterministic token payload derived from the selected `EvidenceItem`:
+
+- no incidental whitespace;
+- stable struct field order;
+- map keys sorted, using `BTreeMap` or an equivalent canonical representation;
+- array order exactly as selected by the compiler;
+- `token_cost` omitted from the estimator payload to avoid self-reference;
+- deterministic number formatting from the chosen JSON serializer.
+
+The exact estimator can change in a later reviewed round, but the V1 estimator
+must be:
 
 - deterministic;
 - tested;
 - independent of fixture gold `token_cost`;
 - applied before final selection;
 - reflected in each selected item's `token_cost`.
+
+For V1, `EvidenceBudget.tokens_used` is the sum of selected item `token_cost`
+values. Bundle envelope fields such as `question`, `time_window`, and `budget`
+are not counted in the selection budget. The later comparative eval may still
+measure full serialized response size separately.
 
 Selection should operate on whole evidence items. It should not truncate claims,
 entities, source refs, or missing-data lists to squeeze an item into budget.
@@ -556,10 +603,31 @@ It should compare:
   counter ids, notes, and trap notes;
 - generated next checks.
 
-Gold fixture artifacts are the required target for the current corpus. The
-compiler may generate extra candidates internally, but selected output should be
-budgeted and deterministic. Extra unselected candidates should appear only in
-the internal report.
+Gold fixture artifacts are the semantic comparison target for the current
+corpus. The compiler may generate extra candidates internally, but selected
+output should be budgeted and deterministic. Extra unselected candidates should
+appear only in the internal report.
+
+Comparison mode must be explicit per field family:
+
+- Exact: bundle `question` and `hypothesis` echo, bundle time window, selected
+  item ids and ordering, item kind, direction, freshness, privacy scope,
+  source refs, missing-data entries, suspected-cause rank/entity/supporting ids
+  and counter ids, and next-check ordering.
+- Set or ordered-structural: item `entities` and candidate reason lists, using
+  documented ordering when the compiler owns ordering and set comparison when
+  order is not semantically meaningful.
+- Numeric tolerance: item `strength`, confidence dimensions, suspected-cause
+  score, and other derived numeric confidence or score fields.
+- Estimator-owned exact after fixture migration: item `token_cost`,
+  `EvidenceBudget.tokens_used`, and `EvidenceBudget.items_dropped`.
+- Text structural by default: `claim`, suspected-cause `hypothesis`, textual
+  `reasons`, `note`, `trap_note`, next-check `action`, `rationale`, and
+  `expected_signal` must be deterministic, non-empty where required, and
+  anchored to the compared entities, source refs, evidence ids, or reason/check
+  categories. They should not require verbatim equality with hand-authored gold
+  prose unless a later reviewed slice introduces compiler-owned templates and
+  migrates the fixtures to those templates.
 
 The comparison must fail if:
 
@@ -600,8 +668,10 @@ that slice explicitly.
 Recommended slices:
 
 1. Compiler model and comparison shell: define `EvidenceCompilation`,
-   suspected-cause and next-check runtime types, comparison structs, errors, and
-   tests that prove gold is only a comparison target.
+   suspected-cause and next-check runtime types, comparison structs, comparison
+   modes, token estimator, errors, and tests that prove gold is only a
+   comparison target. This slice also owns the fixture token-field migration
+   needed to make estimator-owned token comparison exact.
 2. Candidate generation: generate source-backed EvidenceItem candidates from
    changes, anomaly windows, log patterns, traces, dependency edges, prior
    incidents, missing data, and counter-evidence.
@@ -614,8 +684,10 @@ Recommended slices:
    insert evidence, suspected-cause, and next-check records without polluting
    raw source records.
 6. `get_evidence_bundle` integration and full-corpus verification: route the
-   public query path through compiled evidence, compare against fixture gold,
-   and remove or quarantine the old fixture-gold return path.
+   public query path through compiled evidence while preserving the existing
+   query validation, budget, raw-ref, counter-evidence, source-ref, and
+   query-context acceptance checks; compare against fixture gold; and remove or
+   quarantine the old fixture-gold bundle source.
 
 The topic is complete only when the Definition Of Done below is met or
 reviewers explicitly narrow the milestone.
