@@ -210,6 +210,7 @@ pub struct DerivedContextComparison {
     pub window_comparison_mismatches: Vec<DerivedFieldMismatch>,
     pub window_delta_note_differences: Vec<DerivedFieldMismatch>,
     pub missing_runtime_provenance: Vec<String>,
+    pub undeclared_gold_artifacts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -500,6 +501,20 @@ pub fn compare_derived_context(
     )
 }
 
+pub fn compare_derived_context_for_case(
+    case: &FixtureCase,
+    actual: &DerivedContext,
+) -> Result<DerivedContextComparison, DerivedContextGoldError> {
+    let expected = load_expected_derived_context(case)?;
+    let (expected, undeclared_gold_artifacts) =
+        capability_projected_expected_context(case, expected);
+    let mut comparison = compare_derived_context(&expected, actual);
+
+    comparison.undeclared_gold_artifacts = undeclared_gold_artifacts;
+
+    Ok(comparison)
+}
+
 pub fn compare_derived_context_with_options(
     expected: &DerivedContext,
     actual: &DerivedContext,
@@ -526,6 +541,91 @@ pub fn compare_derived_context_with_options(
     }
 
     comparison
+}
+
+fn capability_projected_expected_context(
+    case: &FixtureCase,
+    expected: DerivedContext,
+) -> (DerivedContext, Vec<String>) {
+    let mut undeclared_gold_artifacts = Vec::new();
+
+    let projected = DerivedContext {
+        anomaly_windows: project_expected_vec_by_capability(
+            case,
+            "anomaly-windows",
+            "anomaly_windows",
+            expected.anomaly_windows,
+            &mut undeclared_gold_artifacts,
+        ),
+        log_patterns: project_expected_vec_by_capability(
+            case,
+            "log-pattern-clustering",
+            "log_patterns",
+            expected.log_patterns,
+            &mut undeclared_gold_artifacts,
+        ),
+        timeline: project_expected_vec_by_capability(
+            case,
+            "build_timeline",
+            "timeline",
+            expected.timeline,
+            &mut undeclared_gold_artifacts,
+        ),
+        related_anomalies: project_expected_option_by_capability(
+            case,
+            "find_related_anomalies",
+            "related_anomalies",
+            expected.related_anomalies,
+            &mut undeclared_gold_artifacts,
+        ),
+        window_comparison: project_expected_option_by_capability(
+            case,
+            "compare_windows",
+            "window_comparison",
+            expected.window_comparison,
+            &mut undeclared_gold_artifacts,
+        ),
+    };
+
+    (projected, undeclared_gold_artifacts)
+}
+
+fn project_expected_vec_by_capability<T>(
+    case: &FixtureCase,
+    capability: &str,
+    artifact: &str,
+    values: Vec<T>,
+    undeclared_gold_artifacts: &mut Vec<String>,
+) -> Vec<T> {
+    if has_capability(case, capability) {
+        values
+    } else {
+        if !values.is_empty() {
+            undeclared_gold_artifacts.push(undeclared_gold_artifact(case, artifact));
+        }
+        Vec::new()
+    }
+}
+
+fn project_expected_option_by_capability<T>(
+    case: &FixtureCase,
+    capability: &str,
+    artifact: &str,
+    value: Option<T>,
+    undeclared_gold_artifacts: &mut Vec<String>,
+) -> Option<T> {
+    if has_capability(case, capability) {
+        value
+    } else {
+        if value.is_some() {
+            undeclared_gold_artifacts.push(undeclared_gold_artifact(case, artifact));
+        }
+        None
+    }
+}
+
+fn undeclared_gold_artifact(case: &FixtureCase, artifact: &str) -> String {
+    format!("{}:{artifact}", case.registry_entry.id)
 }
 
 pub fn insert_derived_context(
@@ -4420,10 +4520,9 @@ mod tests {
 
         for case in &corpus.cases {
             let store = raw_fixture_store(case);
-            let expected =
-                capability_expected_context(case).expect("derived context gold should parse");
             let actual = derive_full_context(case, &store);
-            let comparison = compare_derived_context(&expected, &actual);
+            let comparison =
+                compare_derived_context_for_case(case, &actual).expect("derived context gold");
             let provenance = compare_derived_context_with_options(
                 &actual,
                 &actual,
@@ -4436,6 +4535,12 @@ mod tests {
                 !comparison.has_expected_mismatches(),
                 "{} full derived context mismatch: {comparison:#?}\nactual: {actual:#?}",
                 case.registry_entry.id
+            );
+            assert!(
+                comparison.undeclared_gold_artifacts.is_empty(),
+                "{} has gold artifacts without matching capability tags: {:#?}",
+                case.registry_entry.id,
+                comparison.undeclared_gold_artifacts
             );
             assert!(
                 provenance.missing_runtime_provenance.is_empty(),
@@ -4698,6 +4803,24 @@ mod tests {
     }
 
     #[test]
+    fn capability_comparison_surfaces_present_but_undeclared_gold() {
+        let mut case = fixture_case("traffic-shift-hotspot").clone();
+        case.registry_entry
+            .capabilities
+            .retain(|capability| capability != "log-pattern-clustering");
+        case.manifest
+            .capabilities
+            .retain(|capability| capability != "log-pattern-clustering");
+        let comparison = compare_derived_context_for_case(&case, &DerivedContext::default())
+            .expect("derived context gold should parse");
+
+        assert_eq!(
+            comparison.undeclared_gold_artifacts,
+            vec!["traffic-shift-hotspot:log_patterns"]
+        );
+    }
+
+    #[test]
     fn derive_and_insert_context_exposes_full_pipeline_records() {
         let corpus = FixtureCorpus::load(".").expect("fixture corpus should load");
 
@@ -4918,40 +5041,6 @@ mod tests {
         Ok(DerivedContext {
             related_anomalies: expected.related_anomalies,
             ..Default::default()
-        })
-    }
-
-    fn capability_expected_context(
-        case: &FixtureCase,
-    ) -> Result<DerivedContext, DerivedContextGoldError> {
-        let expected = load_expected_derived_context(case)?;
-
-        Ok(DerivedContext {
-            anomaly_windows: if has_capability(case, "anomaly-windows") {
-                expected.anomaly_windows
-            } else {
-                Vec::new()
-            },
-            log_patterns: if has_capability(case, "log-pattern-clustering") {
-                expected.log_patterns
-            } else {
-                Vec::new()
-            },
-            timeline: if has_capability(case, "build_timeline") {
-                expected.timeline
-            } else {
-                Vec::new()
-            },
-            related_anomalies: if has_capability(case, "find_related_anomalies") {
-                expected.related_anomalies
-            } else {
-                None
-            },
-            window_comparison: if has_capability(case, "compare_windows") {
-                expected.window_comparison
-            } else {
-                None
-            },
         })
     }
 

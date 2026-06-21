@@ -498,6 +498,12 @@ The current corpus has mixed coverage:
 The comparison tests should follow those capability tags instead of requiring
 every artifact type from every fixture.
 
+If a fixture contains gold for an artifact whose capability tag is missing, the
+capability-projected comparison must surface that as undeclared gold coverage
+rather than silently comparing empty output against empty expected output. The
+fixture metadata should then be corrected, or the gold artifact should be
+removed if it is not meant to be exercised.
+
 ## Suggested Implementation Slices After Design Approval
 
 No slice should start until reviewers agree on the design direction, or
