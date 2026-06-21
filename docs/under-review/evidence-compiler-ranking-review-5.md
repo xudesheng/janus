@@ -116,3 +116,132 @@ All checks passed on the baseline commit:
 Fixture validation reported `0 error(s), 0 warning(s)`.
 
 <!-- Reviewer appends below; the Implementor must not edit past this line. -->
+
+## Review (by Claude (Opus 4.8))
+
+### Direction Verdict
+
+Implementation round (Slice 4: token-budget selection).
+
+**On critical path: yes. Milestone progress: real and verified. Next action:
+continue — I approve starting Slice 5 (next-check generation + store insertion).
+One milestone-critical item (the D-OVERFIT structural ranking refactor) is now
+formally deferred once; it must land before/with Slice 6 gold-gating and must
+not be deferred again past that point.**
+
+Slice 4 is clean and correct on the points that matter:
+
+- **Whole-item budget selection** under `max_items` and an effective token limit
+  (`max_tokens - reserve_tokens_for_raw_refs`); no item is truncated to fit.
+- **Counter-evidence enforcement fails hard** with
+  `EvidenceCompileError::RequirementUnsatisfied` both when too few counters are
+  generated and when the budget cannot fit the required counters — which is the
+  design's intent (focus-question 4: yes, hard failure is correct, not a partial
+  bundle).
+- **Token recomputation is ordered correctly.** `ev-N` ids are assigned after
+  the final sort, then `token_cost` is recomputed per item, and `tokens_used` is
+  the sum. Because `ev-N` ids are shorter than `cand-NNN`, the recomputed costs
+  are ≤ the costs used during budget checking, so the final bundle can never
+  exceed the token limit. That is a sound invariant.
+- **Link remapping** rewrites selected suspected-cause `supporting`/`counter`
+  from `cand-*` to `ev-*` consistently with the item ids, and unresolved links
+  are dropped. **Dropped reporting** lists every unselected `cand-*` with a
+  stable reason.
+- **D-OVERFIT comparison decision implemented per my Option B recommendation:**
+  `compare_string_subset` accepts a non-empty subset of the gold reason
+  vocabulary and rejects unknown tokens, with both an accept-subset and a
+  reject-unknown test. The design records the decision.
+
+The tests are genuinely end-to-end:
+`compile_evidence_selects_ev_ids_and_reports_dropped_candidates` runs
+generate→rank→select and checks ev-N assignment, token recomputation,
+source-ref resolution, `bundle.validate()`, and ev-* link remapping; the
+budget-drop, counter-first, and counter-error tests each drive `compile_evidence`
+through a real budget. I ran the gate on baseline `bcb13dc`: `cargo fmt --check`
+clean, `cargo clippy --all-targets --all-features` clean, `cargo test` all green
+(`evidence_compiler` now 19 tests, +5).
+
+I also credit the scope discipline: the implementor resisted adding causal
+heuristics to satisfy D-OVERFIT inside the selector change, keeping that refactor
+as its own reviewed step. That is the right call.
+
+### Deferral tracking — D-OVERFIT structural ranking refactor (must not slip past Slice 6)
+
+D-OVERFIT had two halves. The comparison half (relax `reasons` to a structural
+subset) is **resolved** this round. The mechanism half — replacing
+`entity_causal_multiplier`'s fixture-specific entity-name multipliers with
+structural signals (the suspect's own anomaly state, dependency direction, onset
+ordering, blast radius) and deriving reason tokens from structured source
+content — is **deferred once** (round 5), with a stated deadline of before the
+Slice 6 gold-gated suspected-cause comparison.
+
+That deferral is acceptable here: Slice 4 selection is orthogonal to causal
+ranking, and isolating the refactor avoids scope creep. But per the review
+framework, the same milestone-critical item cannot be deferred indefinitely. So,
+on the record: this is deferral #1. The structural refactor must land **before
+or with Slice 6**, when suspected causes become gold-gated. If Slice 5 also
+leaves it undone, Slice 6 must carry it — it cannot be pushed past gold-gating.
+
+### Forward concern — the exact-match tension will hit `items` next (anticipate before Slice 6)
+
+The structural relaxation we applied to `reasons` exists because exact-match to
+hand-authored gold forces fixture-tuning. The **same tension applies to selected
+`items`**, which the comparison contract still lists as Exact (selected item ids
+and ordering). The selector's final ordering is `candidate_selection_group`
+(change-support, then metric, trace, log, counter, missing, prior, dependency) —
+a reasonable concretization of the design's documented order, but not yet
+verified against gold, and the review-2 budget re-tuning means the compiler's
+selected set/order may legitimately diverge from each fixture's gold bundle.
+
+Before Slice 6 turns the bundle into a gold-gated comparison, decide — as a
+deliberate choice, the same way we decided D-OVERFIT — whether selected item ids
+and ordering are judged **exactly** (which may force per-fixture selection
+tuning) or **structurally** (e.g., the top support items and the key
+counter-evidence are present, ordering by documented group rule). I am not
+asking for action this round; I am flagging that Slice 6 should not discover this
+late.
+
+### Smaller notes (low, non-blocking)
+
+- The top-cause preservation step (`sorted_candidates_for_cause` + break-on-true)
+  does not distinguish `Supports` from counter direction and breaks even when the
+  first match was already selected as a counter. So "preserve ≥1 support item for
+  the top cause" is not strictly guaranteed by that step alone; in practice the
+  deterministic fill covers it. Consider filtering that step to supporting
+  candidates so the intent is explicit.
+- The dropped-candidate `reason` is a best-effort post-hoc label
+  (`max_items` / `max_tokens` / `lower_priority`) computed against aggregate
+  selected tokens, not exact per-candidate causality. Fine for diagnostics; just
+  don't let a later slice assert exact drop reasons against gold.
+
+### Answers to the implementor's reviewer-focus questions
+
+1. `compile_evidence(query, store, derived)` and `select_evidence_compilation`
+   are the right internal boundaries — `compile_evidence` matches the design's
+   intended entry shape and is the natural seam for Slice 6's
+   `get_evidence_bundle` routing.
+2. Selection priority (forced counters → top-cause support → deterministic fill)
+   is acceptable and deterministic. Note the final bundle is re-sorted by group,
+   so counter-first is about inclusion, not final order — correctly separated.
+3. Budget behavior is correct for this stage: whole-item, raw-ref reserve, token
+   recomputation after `ev-N`, dropped reporting. Yes.
+4. Counter-evidence should fail hard with `RequirementUnsatisfied`. Agreed — and
+   it does.
+5. The D-OVERFIT mitigation is enough to proceed to Slice 5. Yes — the
+   comparison half is resolved and Slice 5 (next checks + store insertion) is
+   orthogonal to causal ranking. The structural refactor stays on the deadline
+   above.
+
+**Approved next scope: Slice 5 (deterministic next-check generation and
+compiled-record store insertion without polluting raw source records).**
+`get_evidence_bundle` integration remains deferred to Slice 6, which should also
+carry the D-OVERFIT structural refactor and the item-comparison decision above.
+
+### Verification
+
+Independently ran on baseline `bcb13dc`: `cargo fmt --check` (clean),
+`cargo clippy --all-targets --all-features` (clean), `cargo test` (all suites
+green, `evidence_compiler` 19 tests incl. the 5 new). Read the full selection
+diff, the `compare_string_subset` change, the design-doc diff, and the test diff;
+confirmed the counter-evidence hard-fail paths and the token-recomputation
+ordering. Branch confirmed `evidence-compiler-ranking`.
