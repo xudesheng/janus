@@ -1,6 +1,7 @@
 pub mod derived_context;
 pub mod entity_context;
 pub mod evidence;
+pub mod evidence_compiler;
 pub mod fixture_simulator;
 pub mod fixture_validation;
 pub mod fixtures;

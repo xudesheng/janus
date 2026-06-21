@@ -1,7 +1,10 @@
 use crate::{
+    derived_context::derive_and_insert_context,
     evidence::{
         EvidenceBundle, EvidenceDirection, EvidenceKind, SourceRef, TimeWindow, ValidationErrors,
     },
+    evidence_compiler::{EvidenceCompileError, compile_evidence},
+    fixture_simulator::{FixtureReplayError, plan_fixture_replay, replay_plan_into_store},
     fixture_validation::{FixtureCase, FixtureCorpus, FixtureCorpusLoadError, FixtureSelector},
     hot_context_store::{HotContextStore, HotStoreError, SourceQuery, SourceResolution},
 };
@@ -83,7 +86,9 @@ pub enum GetEvidenceBundleError {
         scenario_id: String,
         source: serde_json::Error,
     },
+    FixtureReplay(FixtureReplayError),
     InvalidFixtureBundle(ValidationErrors),
+    EvidenceCompile(EvidenceCompileError),
     HotStore(HotStoreError),
     SourceLookup {
         item_id: String,
@@ -124,7 +129,18 @@ pub fn get_evidence_bundle(query: EvidenceQuery) -> Result<EvidenceBundle, GetEv
         .expect("validated fixture-backed queries always have scenario_id");
 
     let case = load_fixture_case_by_scenario_id(scenario_id)?;
-    let bundle = load_bundle_from_case(&case)?;
+    let plan = plan_fixture_replay(&case)
+        .map_err(|error| GetEvidenceBundleError::FixtureReplay(error.into()))?;
+    let mut store = replay_plan_into_store(&plan).map_err(GetEvidenceBundleError::FixtureReplay)?;
+    let derived =
+        derive_and_insert_context(&case, &mut store).map_err(GetEvidenceBundleError::HotStore)?;
+
+    ensure_query_context_selects(&store, &query)?;
+
+    let bundle = compile_evidence(&query, &store, &derived)
+        .map(|compilation| compilation.bundle)
+        .map_err(map_compile_error)?;
+
     bundle
         .validate()
         .map_err(GetEvidenceBundleError::InvalidFixtureBundle)?;
@@ -132,11 +148,7 @@ pub fn get_evidence_bundle(query: EvidenceQuery) -> Result<EvidenceBundle, GetEv
     ensure_budget_fits(&query, &bundle)?;
     ensure_required_raw_refs(&query, &bundle)?;
     ensure_required_counter_evidence(&query, &bundle)?;
-
-    let store =
-        HotContextStore::load_fixture_case(&case).map_err(GetEvidenceBundleError::HotStore)?;
     ensure_source_refs_resolve(&store, &bundle)?;
-    ensure_query_context_selects(&store, &query)?;
 
     Ok(bundle)
 }
@@ -249,8 +261,14 @@ impl fmt::Display for GetEvidenceBundleError {
                 formatter,
                 "invalid evidence_bundle JSON in fixture case {scenario_id}: {source}"
             ),
+            GetEvidenceBundleError::FixtureReplay(error) => {
+                write!(formatter, "fixture replay error: {error}")
+            }
             GetEvidenceBundleError::InvalidFixtureBundle(errors) => {
-                write!(formatter, "invalid fixture bundle: {errors}")
+                write!(formatter, "invalid compiled bundle: {errors}")
+            }
+            GetEvidenceBundleError::EvidenceCompile(error) => {
+                write!(formatter, "evidence compile error: {error}")
             }
             GetEvidenceBundleError::HotStore(error) => {
                 write!(formatter, "hot context store error: {error}")
@@ -271,7 +289,7 @@ impl fmt::Display for GetEvidenceBundleError {
                 required_tokens,
             } => write!(
                 formatter,
-                "unsupported budget for fixture stub: requested max_items={requested_max_items}, \
+                "unsupported budget for compiled evidence: requested max_items={requested_max_items}, \
                  required items={required_items}, requested max_tokens={requested_max_tokens}, \
                  required tokens={required_tokens}"
             ),
@@ -280,7 +298,7 @@ impl fmt::Display for GetEvidenceBundleError {
                 message,
             } => write!(
                 formatter,
-                "unsatisfied fixture requirement {requirement}: {message}"
+                "unsatisfied evidence requirement {requirement}: {message}"
             ),
         }
     }
@@ -294,12 +312,27 @@ impl std::error::Error for GetEvidenceBundleError {
             GetEvidenceBundleError::FixtureBundleParse { source, .. } => Some(source),
             GetEvidenceBundleError::InvalidFixtureBundle(errors) => Some(errors),
             GetEvidenceBundleError::HotStore(error) => Some(error),
+            GetEvidenceBundleError::FixtureReplay(error) => Some(error),
+            GetEvidenceBundleError::EvidenceCompile(error) => Some(error),
             GetEvidenceBundleError::FixtureCaseNotFound { .. }
             | GetEvidenceBundleError::MissingFixtureBundle { .. }
             | GetEvidenceBundleError::SourceLookup { .. }
             | GetEvidenceBundleError::UnsupportedBudget { .. }
             | GetEvidenceBundleError::UnsatisfiedRequirement { .. } => None,
         }
+    }
+}
+
+fn map_compile_error(error: EvidenceCompileError) -> GetEvidenceBundleError {
+    match error {
+        EvidenceCompileError::RequirementUnsatisfied {
+            requirement,
+            message,
+        } => GetEvidenceBundleError::UnsatisfiedRequirement {
+            requirement,
+            message,
+        },
+        other => GetEvidenceBundleError::EvidenceCompile(other),
     }
 }
 
@@ -481,22 +514,6 @@ fn load_fixture_case_by_scenario_id(
 
 fn fixture_root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-}
-
-fn load_bundle_from_case(case: &FixtureCase) -> Result<EvidenceBundle, GetEvidenceBundleError> {
-    let scenario_id = case.registry_entry.id.clone();
-    let value = case.expected.get("evidence_bundle").ok_or_else(|| {
-        GetEvidenceBundleError::MissingFixtureBundle {
-            scenario_id: scenario_id.clone(),
-        }
-    })?;
-
-    serde_json::from_value(value.clone()).map_err(|source| {
-        GetEvidenceBundleError::FixtureBundleParse {
-            scenario_id,
-            source,
-        }
-    })
 }
 
 fn describe_resolution(resolution: SourceResolution<'_>) -> String {

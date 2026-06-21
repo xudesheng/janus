@@ -122,9 +122,9 @@ Out of scope:
 
 The compiler should consume:
 
-- `EvidenceQuery`, including intent, time window, entities, budget, counter-
-  evidence requirement, raw-ref requirement, freshness preference, and privacy
-  scope;
+- `EvidenceQuery`, including the nested `EvidenceQueryIntent` question and/or
+  hypothesis, time window, entities, budget, counter-evidence requirement,
+  raw-ref requirement, freshness preference, and privacy scope;
 - raw source records from `HotContextStore`;
 - derived entities and relationships from Milestone 5A;
 - derived context from Milestone 5B, including anomaly windows, log patterns,
@@ -132,6 +132,11 @@ The compiler should consume:
 - fixture-provided `prior_incidents` records when available;
 - fixture scenario metadata and ground truth only for tests and comparison, not
   for runtime compilation.
+
+`EvidenceQuery.scenario_id` is a current fixture-selection adapter, not a
+production query primitive. It may still be used by fixture helpers during this
+topic, but the compiler boundary should be defined around query intent, source
+records, and derived context rather than around scenario id.
 
 The compiler must not use these expected artifacts as inputs:
 
@@ -213,7 +218,14 @@ The helper can load the selected fixture, replay source telemetry into a fresh
 store, derive entity and derived context, and then call `compile_evidence`.
 
 The public `get_evidence_bundle(EvidenceQuery)` boundary should keep its
-request and response types. This topic should either:
+request and response types. The current path is not only a gold-bundle loader:
+it already validates the query, checks budget fit, enforces raw-ref and
+counter-evidence requirements, resolves every returned source ref through
+`HotContextStore`, and checks that the query selects hot-context records. Slice
+6 should preserve those acceptance checks and swap the bundle source from
+fixture gold to compiled evidence.
+
+This topic should either:
 
 1. make `get_evidence_bundle` call the compiler and return
    `EvidenceCompilation.bundle`; or
@@ -222,11 +234,40 @@ request and response types. This topic should either:
 
 The preferred outcome is option 1. Milestone 6 should be the point where
 `get_evidence_bundle` becomes compiled evidence rather than fixture-gold lookup.
+If a temporary gold path coexists during Slice 6, it should be explicitly named
+as a compatibility path and removed or quarantined by the end of that slice.
+
+Slice 6 implements the preferred outcome. `get_evidence_bundle(EvidenceQuery)`
+loads only the selected fixture's source input, replays it into a fresh
+`HotContextStore`, derives context, calls `compile_evidence`, and returns
+`EvidenceCompilation.bundle`. The existing public acceptance checks remain in
+place after compilation: query validation, hot-context query selection,
+compiled bundle validation, budget fit, required raw refs, required
+counter-evidence, and source-ref resolution through the store. Fixture
+`expected.evidence_bundle` is no longer a runtime input for this path.
 
 ## Candidate Evidence Generation
 
 The compiler should generate a broad candidate set before ranking and budget
 selection. Candidate generation should be source-backed and deterministic.
+
+For V1, selected evidence item ids should follow the current fixture convention
+`ev-1`, `ev-2`, and so on, assigned after final selection in selected-output
+order. This keeps exact selected-id comparison meaningful without a fixture id
+migration. Internal candidate ids may use a separate deterministic scheme, but
+only selected `ev-N` ids are part of the public `EvidenceBundle` comparison.
+
+Slice 2 may expose candidate generation directly as an internal helper such as
+`generate_evidence_candidates(input) -> Vec<EvidenceCandidate>`. These candidates
+use internal ids such as `cand-001` and are not public selected bundle items.
+Later selection slices must assign the final selected `ev-N` ids and recompute
+estimator-owned token fields for that final selected output.
+
+After Slice 3, `generate_evidence_candidates` returns generated candidates with
+compiler-owned evidence-strength scores applied. `score_evidence_candidates` is
+also exposed as an internal helper so tests and later slices can rescore a
+candidate set explicitly. The ids remain internal `cand-*` ids; this is still
+not final bundle selection.
 
 ### Metric Anomaly Evidence
 
@@ -401,10 +442,50 @@ The compiler should store causal dimensions in `confidence` maps or suspected
 cause records, but it must not overwrite `EvidenceItem.strength` with a root-
 cause probability.
 
+Slice 3 implements evidence-strength scoring before suspected-cause ranking.
+Candidate `strength` is computed from source-specific dimensions such as
+`source_ref_quality`, `magnitude`, `coverage`, `severity`, `volume`,
+`exemplar_quality`, `span_specificity`, `time_alignment`,
+`relationship_confidence`, `signature_similarity`, `gap_materiality`, and
+`contradiction_quality`. For metric anomalies, `confidence.detector` is retained
+as a separate detector dimension and is not copied into `strength`.
+
+Slice 3 also introduces causal suspicion scoring for suspected causes. This
+score is computed from linked supporting evidence, counter-evidence penalties,
+source-family causal weights, runtime-child rollups such as `pod:` to owning
+`service:`, and material missing-data uncertainty. It is deliberately separate
+from any individual evidence item's `strength`.
+
+Direction decision after Slice 3: suspected-cause ranking should be judged by
+structural outcomes, not by reproducing every hand-authored reason token. Before
+suspected causes become a gold-gated final comparison in Slice 6, ranking
+heuristics must move away from fixture-specific entity-name multipliers and
+toward structural signals such as the suspect's own anomaly state, dependency
+direction, onset ordering, blast radius, change proximity, counter-evidence,
+and missing-data uncertainty. Reason tokens should be derived from structured
+source content such as signal names, log templates, change kinds, relationships,
+and detected gaps.
+
+Slice 6 removes the entity-name causal multiplier. Causal suspicion now uses
+structured dimensions already present on candidates and derived context:
+anomaly activity and magnitude, source-ref richness, source-specific confidence
+dimensions, change time alignment and kind, trace specificity, prior-incident
+similarity, relationship direction, relationship attributes such as fallback
+load, retry/fan-out structure, counter-evidence dominance, and local runtime
+failure signatures such as OOM/restart/memory sawtooth patterns. The
+relationship adjustment is intentionally topological: explicit `retries`
+relationships move downstream overload suspicion back to the caller; ordinary
+dependency symptoms can move suspicion toward the dependency unless the target
+is already counter-dominated or the edge is marked as fallback load.
+
 ## Suspected Causes
 
 `expected.suspected_causes` already exists in the fixture corpus. This topic
 should give that artifact a concrete generation path.
+
+Only the hot-store `StoredRecordKind::SuspectedCause` category exists today.
+The runtime `SuspectedCause` struct, gold parser, comparison helper, and store
+payload projection are all Slice 1 work.
 
 Suggested runtime shape:
 
@@ -435,9 +516,21 @@ Minimum behavior:
 - insert or expose suspected causes as inspectable store records, even before
   MCP exposes `rank_suspected_causes`.
 
+Slice 3 exposes `rank_suspected_causes_from_candidates(input, candidates)` as an
+internal helper. It ranks suspected causes from generated candidate ids, links
+supporting and counter evidence with `cand-*` ids, emits deterministic reason
+category tokens, lowers suspects whose counter score dominates support, and
+emits an `under-determined` suspect when missing-data candidates materially
+weaken diagnosis. It does not yet rewrite links to selected `ev-*` ids because
+token-budget selection is Slice 4.
+
 ## Next Checks
 
 `expected.next_checks` should also get a concrete generation path in this topic.
+
+Only the hot-store `StoredRecordKind::NextCheck` category exists today. The
+runtime `NextCheck` struct, gold parser, comparison helper, and store payload
+projection are all Slice 1 work.
 
 Suggested runtime shape:
 
@@ -467,24 +560,70 @@ Examples:
 - avoid rolling back an innocent service when flat metrics and timing contradict
   the deploy hypothesis.
 
+Slice 5 exposes `suggest_next_checks(input, bundle, suspected_causes)` through
+`compile_evidence`. The generator is deterministic and derives checks only from
+selected evidence, suspected-cause links, counter-evidence, and missing-data
+state. It emits at most three checks in priority order:
+
+1. recover or inspect selected missing-data evidence;
+2. validate selected counter-evidence for false-causality risks;
+3. confirm the top suspected cause, or gather another independent signal when
+   the top score is weak.
+
+`expected_signal` is a structural category token, not a positional prose
+comparison target. The V1 vocabulary includes tokens such as `metric_anomaly`,
+`log_cluster`, `change_event`, `compare_windows`, `relationship`,
+`find_related_anomalies`, `profile_hotspot`, `entity_resolution`, and `trace`.
+Comparison normalizes known fixture aliases such as `code_change` to
+`change_event` and `entity-resolution` to `entity_resolution`.
+
 ## Token Budget Selection
 
 Token budget is a query constraint, not a presentation detail.
 
-The first implementation should use a deterministic local estimator. Suggested
-starting point:
+Design decision: token costs are estimator-owned fixture fields, not exact
+comparison against the currently hand-authored token numbers.
+
+Slice 1 should adopt a deterministic local estimator and then regenerate
+fixture `token_cost`, `tokens_used`, and other token-budget expected fields from
+that estimator as formal fixture data. That fixture migration is not "gold as
+runtime input"; it makes the fixture oracle reflect the reviewed estimator.
+Until that migration exists, token fields are not an exact comparison target
+for generated compiler output.
+
+The first estimator should use this shape:
 
 ```text
-estimated_tokens = ceil(serialized_evidence_item_json_bytes / 4)
+estimated_tokens = ceil(canonical_evidence_item_payload_json_bytes / 4)
 ```
 
-The exact estimator can change, but it must be:
+Where `canonical_evidence_item_payload_json_bytes` means compact JSON bytes for
+a deterministic token payload derived from the selected `EvidenceItem`:
+
+- no incidental whitespace;
+- stable struct field order;
+- map keys sorted, using `BTreeMap` or an equivalent canonical representation;
+- array order exactly as selected by the compiler;
+- `token_cost` omitted from the estimator payload to avoid self-reference;
+- deterministic number formatting from the chosen JSON serializer.
+
+The V1 serializer is `serde_json::to_vec` over the canonical estimator payload.
+Slice 1 tests must pin at least one payload byte count so token costs cannot
+drift silently under dependency or payload-shape changes.
+
+The exact estimator can change in a later reviewed round, but the V1 estimator
+must be:
 
 - deterministic;
 - tested;
 - independent of fixture gold `token_cost`;
 - applied before final selection;
 - reflected in each selected item's `token_cost`.
+
+For V1, `EvidenceBudget.tokens_used` is the sum of selected item `token_cost`
+values. Bundle envelope fields such as `question`, `time_window`, and `budget`
+are not counted in the selection budget. The later comparative eval may still
+measure full serialized response size separately.
 
 Selection should operate on whole evidence items. It should not truncate claims,
 entities, source refs, or missing-data lists to squeeze an item into budget.
@@ -514,6 +653,23 @@ Ordering should be deterministic after selection:
 
 If this ordering conflicts with a stronger reviewed local rule, document the
 rule in code and tests.
+
+Slice 4 exposes `compile_evidence(query, store, derived)` and
+`select_evidence_compilation(input, candidates, suspected_causes)` as internal
+compiler paths. The selector:
+
+- starts from scored `cand-*` candidates;
+- enforces `max_items`, `max_tokens`, and `reserve_tokens_for_raw_refs`;
+- selects whole evidence items only;
+- forces the requested number of counter-evidence items or returns a compiler
+  requirement error;
+- assigns final selected `ev-N` ids in deterministic selected-output order;
+- recomputes token costs after final id assignment;
+- remaps selected suspected-cause evidence links from `cand-*` to `ev-*`;
+- reports unselected candidates as dropped with a stable reason.
+
+This remains internal compiler output. Store insertion, next-check generation,
+and `get_evidence_bundle` routing are still later slices.
 
 ## False-Causality Guard
 
@@ -556,10 +712,48 @@ It should compare:
   counter ids, notes, and trap notes;
 - generated next checks.
 
-Gold fixture artifacts are the required target for the current corpus. The
-compiler may generate extra candidates internally, but selected output should be
-budgeted and deterministic. Extra unselected candidates should appear only in
-the internal report.
+Gold fixture artifacts are the semantic comparison target for the current
+corpus. The compiler may generate extra candidates internally, and selected
+output is compared by structural outcome rather than by verbatim fixture prose
+or exact positional equality.
+
+Comparison mode must be explicit per field family:
+
+- Exact: bundle `question` and `hypothesis` echo, bundle time window, and
+  returned budget integrity (`tokens_used` equals selected item token sum and
+  stays within the query budget).
+- Structural selected items: expected gold item families are matched by source
+  signal, kind/direction family, entity overlap, source-ref identity where
+  available, and missing-data/counter-evidence role. Extra generated selected
+  items are not failures by themselves.
+- Structural suspected causes: expected true causes must be present and rank
+  correctly when the fixture declares them as rank 1, false-causality traps must
+  retain counter links/trap notes, duplicate hand-authored expected entities are
+  de-duplicated for comparison, and score checks are applied only where a trap
+  fixture depends on a low-confidence innocent suspect.
+- Structural next checks: generated checks are matched by normalized
+  `expected_signal` category. Unknown categories fail; positional ordering and
+  hand-authored action/rationale prose are not exact targets.
+- Structural category subset: suspected-cause `reasons` must be non-empty when
+  gold declares reasons and must be drawn from a derivable category vocabulary.
+  Full exact-set equality is not a stable acceptance target until the compiler
+  owns the reason vocabulary and the fixtures are migrated to it.
+- Estimator-owned exact internally: selected item `token_cost` and
+  `EvidenceBudget.tokens_used` are recomputed by the compiler and checked for
+  internal consistency, not copied from fixture gold.
+- Text structural by default: `claim`, suspected-cause `hypothesis`, `note`,
+  `trap_note`, next-check `action`, and `rationale` must be deterministic,
+  non-empty where required, and anchored to the compared entities, source refs,
+  evidence ids, or reason/check categories. They should not require verbatim
+  equality with hand-authored gold prose unless a later reviewed slice
+  introduces compiler-owned templates and migrates the fixtures to those
+  templates. Until field-specific anchoring checks are implemented, the
+  comparison shell treats text-structural equality as non-empty required text
+  plus tracked non-blocking text differences.
+
+Slice 6 chooses structural selected-output comparison for items, suspected
+causes, and next checks. Exact positional equality against hand-authored gold is
+not the acceptance target.
 
 The comparison must fail if:
 
@@ -592,6 +786,13 @@ Minimum expectations:
 - store insertion is optional only if a reviewer approves an equivalent
   inspectable compiler result path.
 
+Slice 5 exposes `insert_evidence_compilation(store, compilation)`. It inserts
+selected evidence items, suspected causes, and next checks through
+`HotContextStore::insert_record` using the store's derived-record kinds. These
+records are selectable and inspectable, but `StoredRecordKind::is_raw_source`
+continues to exclude them, so compiled output does not pollute raw source
+records.
+
 ## Implementation Slices After Design Approval
 
 No slice should start until reviewers agree on the design direction or approve
@@ -600,22 +801,37 @@ that slice explicitly.
 Recommended slices:
 
 1. Compiler model and comparison shell: define `EvidenceCompilation`,
-   suspected-cause and next-check runtime types, comparison structs, errors, and
-   tests that prove gold is only a comparison target.
+   suspected-cause and next-check runtime types, comparison structs, comparison
+   modes, token estimator, errors, and tests that prove gold is only a
+   comparison target. This slice also owns the fixture token-field migration
+   needed to make estimator-owned token comparison exact.
 2. Candidate generation: generate source-backed EvidenceItem candidates from
    changes, anomaly windows, log patterns, traces, dependency edges, prior
-   incidents, missing data, and counter-evidence.
+   incidents, missing data, and counter-evidence. This slice exposes internal
+   candidates for later scoring and selection, but does not yet perform final
+   ranking, token-budget selection, selected `ev-N` assignment, suspected-cause
+   ranking, next-check generation, store insertion, or `get_evidence_bundle`
+   integration.
 3. Scoring and suspected causes: add evidence-strength dimensions, causal
    suspicion scoring, false-causality penalties, and suspected cause ranking.
+   This slice keeps `cand-*` ids and does not perform final token-budget
+   selection, selected `ev-N` assignment, next-check generation, store
+   insertion, or `get_evidence_bundle` integration.
 4. Token budget selection: compute deterministic token costs, select whole
    items under `max_items` and `max_tokens`, report dropped candidates, and
-   enforce counter-evidence requirements.
+   enforce counter-evidence requirements. This slice also assigns selected
+   `ev-N` ids and remaps selected suspected-cause links, but does not generate
+   next checks, insert compiled records, or route `get_evidence_bundle`.
 5. Next checks and store integration: generate deterministic next checks and
    insert evidence, suspected-cause, and next-check records without polluting
-   raw source records.
+   raw source records. This slice does not route `get_evidence_bundle` through
+   the compiler.
 6. `get_evidence_bundle` integration and full-corpus verification: route the
-   public query path through compiled evidence, compare against fixture gold,
-   and remove or quarantine the old fixture-gold return path.
+   public query path through compiled evidence while preserving the existing
+   query validation, budget, raw-ref, counter-evidence, source-ref, and
+   query-context acceptance checks; compare against fixture gold structurally;
+   and remove or quarantine the old fixture-gold bundle source. Slice 6 now
+   implements this path.
 
 The topic is complete only when the Definition Of Done below is met or
 reviewers explicitly narrow the milestone.
