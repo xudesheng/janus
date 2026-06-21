@@ -67,3 +67,100 @@ Results:
 - Default `simulate_fixture --fixture deploy-bad-rollout` reported 28 events, 20 stored records, 6 raw source refs resolved, 2 non-replayed refs skipped, 17 query time-window records, and 0 validation errors.
 
 <!-- Reviewer appends below; the Implementor must not edit past this line. -->
+
+## Review (by Claude)
+
+### Direction Verdict
+
+**Milestone complete — stop here; do not submit review-5.** This round delivers slice 3 and
+closes the topic's Definition of Done. I re-verified every DoD gate independently: `cargo
+fmt --check` clean, `cargo test` green (9 + 12 + 15), `cargo clippy --all-targets
+--all-features` clean (exit 0), `validate_fixtures` 0/0 across 12 fixtures, and the default
+`simulate_fixture --fixture deploy-bad-rollout` prints exactly the claimed summary
+(28 events / 20 records / 6 raw resolved / 2 skipped / 17 window / 0 errors). The S3 decision
+I asked for in review-3 is resolved cleanly as option (b). I found **no defects and no new
+requirements**; the two notes below are optional, non-blocking polish that do **not** by
+themselves warrant another round. Next action for the Implementor: **report completion to
+the User and stop** (this answers Q5: yes).
+
+### Milestone progress (judged first) — DoD met
+
+I checked the slice-3 work against the topic's Definition of Done, item by item:
+
+- **Replay through the ingest adapter** — `replay_plan_into_store` ingests every planned
+  event into a fresh `HotContextStore` via the slice-2 boundary. ✓
+- **Metric points land under expected series refs** — unchanged from slice 2, still proven. ✓
+- **Full replay resolves raw refs, derived reported as skipped (S3 / option b)** —
+  `validate_raw_source_refs` resolves raw signals and counts non-raw as skipped; I confirmed
+  the only non-raw signals in the entire fixture corpus are `anomaly_window` and
+  `log_pattern` (both genuinely derived), so the skip path is exactly the derived refs. The
+  validator hard-errors on any *raw* ref that fails to resolve, which is the right success
+  criterion. ✓
+- **Partial-replay availability** — the slice-2 tests proving Missing-before/Found-after and
+  trace-before-span remain in place. ✓
+- **Deterministic local CLI summary** — `format_replay_summary` is a fixed-field, ordered
+  report; default mode wired correctly, with `--dry-run`/`--jsonl` preserved as mutually
+  exclusive inspection modes. ✓
+- **Scope exclusions held** — no OTLP protobuf, network receiver, persistence, derivation,
+  ranking, or MCP surface introduced. The design doc DoD wording was tightened to "raw
+  source refs … reports derived refs as skipped," so the spec and the code now agree. ✓
+- **Toolchain gates** — fmt / test / clippy / validate_fixtures all pass. ✓
+
+The error taxonomy (`FixtureReplayError` with `source()` chaining and `describe_resolution`
+diagnostics) and the empty-match guard on the manifest time-window check are good defensive
+touches beyond the minimum.
+
+### Minor notes (optional polish — NOT blocking, do NOT require a review-5)
+
+- **[n1] `is_raw_replay_source_signal` buckets `Profile` and `External` with the derived
+  signals.** The raw set is Trace/Metric/Log/Change/PriorIncident/TelemetryGap; everything
+  else (including `Profile` and `External`) is counted as "skipped." No current fixture
+  references either, so this is harmless today and the corpus-wide numbers are correct. But
+  `Profile` is semantically a *raw* telemetry signal the simulator simply doesn't model, not
+  a derived one — if a future fixture adds a profile ref it would be silently counted as a
+  "skipped derived" ref instead of flagged as an unmodeled raw signal. Optional: distinguish
+  "unmodeled raw" from "derived/out-of-scope," or note `Profile`/`External` explicitly. This
+  is a natural thing to carry into the future real-OTLP topic rather than reopen this one.
+- **[n2] `FixtureReplaySummary.validation_errors` is structurally always `0`.** Any
+  validation failure returns `Err(FixtureReplayError)` and never produces a summary, so a
+  returned summary's `validation errors:` line is always `0`. The field communicates nothing
+  today. Optional: drop it, or change the validator to aggregate non-fatal findings into it.
+  Cosmetic; a one-line cleanup commit would suffice if the Implementor wants it — it does not
+  need a review round.
+
+### Answers to the round's questions
+
+- **Q1 (S3 option (b) wording clear?)** — Yes. The design doc now says the simulator replays
+  `input.json` only and reports derived refs as skipped, and the DoD matches. A reviewer will
+  not expect derived refs to resolve from input replay.
+- **Q2 (compact summary sufficient for the demo milestone?)** — Yes; deterministic and
+  legible.
+- **Q3 (raw validation + skipped counts the right criteria?)** — Yes, with the n1 caveat for
+  future non-`derived` non-raw signals.
+- **Q4 (public replay-summary API acceptable?)** — Yes. `replay_fixture_case`,
+  `replay_plan_into_store`, `format_replay_summary`, and the summary/error types are a
+  reasonable module surface; nothing needs to be hidden.
+- **Q5 (stop after this review rather than produce review-5?)** — **Yes, stop.** Milestone
+  complete, no defects, no new requirements. Under the framework's Round Termination rule
+  this is exactly the "report completion and wait" case, not a new round.
+
+### Framework / process check (passes)
+
+- Baseline `fd3f66f` is pushed and is the parent of the review-4 commit `5d2edf9`
+  (pre-review-document tree); frozen. Correct.
+- Implementation round: `## Verification` lists real commands; I reproduced them
+  independently and they pass as claimed, including the exact default-CLI summary.
+- Locked rounds 0–3 are unchanged (`f89cda1..5d2edf9` touches only the round-4 doc, the
+  formal design doc, and source/test files). Editing the formal design doc is permitted (no
+  review section there). Locking honored.
+- Header fields complete; `Deferred milestone work: none` is accurate now that the DoD is
+  met.
+
+### Bottom line
+
+The `fixture-otel-simulator` topic is **done**: a deterministic fixture→`HotContextStore`
+replay path with raw source-ref validation, derived refs reported as skipped, and a local
+CLI demo — built across four well-disciplined rounds with each prior finding closed and
+proven. **Stop here; report completion to the User. No review-5.** n1/n2 are optional polish;
+n1 belongs to the future real-OTLP topic, and n2 is a trivial cleanup if wanted — neither
+requires another review round.
