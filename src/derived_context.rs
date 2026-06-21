@@ -1,7 +1,7 @@
 use crate::{
     entity_context::{
-        RelationshipType, ResolvedRelationship, relationship_store_key, resolve_entities,
-        resolve_relationships,
+        RelationshipType, ResolvedRelationship, insert_derived_entity_context,
+        relationship_store_key, resolve_entities, resolve_relationships,
     },
     evidence::{TimeWindow, UnitInterval},
     fixture_validation::FixtureCase,
@@ -327,6 +327,29 @@ pub fn derive_metric_context(case: &FixtureCase, store: &HotContextStore) -> Der
     }
 }
 
+pub fn derive_full_context(case: &FixtureCase, store: &HotContextStore) -> DerivedContext {
+    let metric_series = canonical_metric_series(store);
+    let anomaly_windows = derive_anomaly_windows(case, &metric_series);
+    let log_patterns = derive_log_patterns(case, store);
+    let mut timeline = derive_timeline_events(case, store, &metric_series, &anomaly_windows);
+    let entities = resolve_entities(store);
+    let relationships = resolve_relationships(store, &entities);
+    let prior_incidents = canonical_prior_incident_records(store);
+    let related_anomalies =
+        derive_related_anomalies(case, &anomaly_windows, &relationships, &prior_incidents);
+    let window_comparison = derive_window_comparison(case, &metric_series, &anomaly_windows);
+
+    sort_timeline_events(&mut timeline);
+
+    DerivedContext {
+        anomaly_windows,
+        log_patterns,
+        timeline,
+        related_anomalies,
+        window_comparison,
+    }
+}
+
 pub fn derive_log_context(case: &FixtureCase, store: &HotContextStore) -> DerivedContext {
     DerivedContext {
         log_patterns: derive_log_patterns(case, store),
@@ -360,6 +383,20 @@ pub fn derive_related_context(case: &FixtureCase, store: &HotContextStore) -> De
         related_anomalies,
         ..Default::default()
     }
+}
+
+pub fn derive_and_insert_context(
+    case: &FixtureCase,
+    store: &mut HotContextStore,
+) -> Result<DerivedContext, HotStoreError> {
+    let context = derive_full_context(case, store);
+    let entities = resolve_entities(store);
+    let relationships = resolve_relationships(store, &entities);
+
+    insert_derived_entity_context(store, &entities, &relationships)?;
+    insert_derived_context(store, &context)?;
+
+    Ok(context)
 }
 
 fn has_capability(case: &FixtureCase, capability: &str) -> bool {
@@ -944,6 +981,12 @@ fn log_pattern_exemplars(
     exemplars
 }
 
+#[derive(Debug)]
+struct TimelineMarkerContext<'a> {
+    relationships: &'a [ResolvedRelationship],
+    anomaly_windows: &'a [DerivedAnomalyWindow],
+}
+
 fn derive_timeline_events(
     case: &FixtureCase,
     store: &HotContextStore,
@@ -960,6 +1003,12 @@ fn derive_timeline_events(
     let gaps = canonical_telemetry_gaps(store);
     let active_entities = active_timeline_entities(anomaly_windows);
     let onset = earliest_timeline_onset(anomaly_windows, &logs);
+    let entities = resolve_entities(store);
+    let relationships = resolve_relationships(store, &entities);
+    let marker_context = TimelineMarkerContext {
+        relationships: &relationships,
+        anomaly_windows,
+    };
     let mut events = Vec::new();
 
     match case.manifest.failure_class.as_str() {
@@ -970,6 +1019,7 @@ fn derive_timeline_events(
             &spans,
             metric_series,
             anomaly_windows,
+            &marker_context,
         ),
         "dependency-degradation" => derive_db_degradation_timeline(
             &mut events,
@@ -977,25 +1027,36 @@ fn derive_timeline_events(
             &spans,
             metric_series,
             anomaly_windows,
+            &marker_context,
         ),
-        "retry-storm" => {
-            derive_retry_storm_timeline(&mut events, &logs, metric_series, anomaly_windows)
-        }
+        "retry-storm" => derive_retry_storm_timeline(
+            &mut events,
+            &logs,
+            metric_series,
+            anomaly_windows,
+            &marker_context,
+        ),
         "config-change" => derive_config_change_timeline(
             &mut events,
             &changes,
             &logs,
             metric_series,
             anomaly_windows,
+            &marker_context,
         ),
-        "traffic-shift" => {
-            derive_traffic_shift_timeline(&mut events, &changes, metric_series, anomaly_windows)
-        }
+        "traffic-shift" => derive_traffic_shift_timeline(
+            &mut events,
+            &changes,
+            metric_series,
+            anomaly_windows,
+            &marker_context,
+        ),
         "resource-exhaustion" => derive_resource_exhaustion_timeline(
             &mut events,
             &changes,
             metric_series,
             anomaly_windows,
+            &marker_context,
         ),
         "schema-change" => derive_schema_change_timeline(
             &mut events,
@@ -1003,6 +1064,7 @@ fn derive_timeline_events(
             &logs,
             metric_series,
             anomaly_windows,
+            &marker_context,
         ),
         "downstream-outage" => {
             derive_downstream_outage_timeline(&mut events, &changes, &logs, &spans)
@@ -1013,6 +1075,7 @@ fn derive_timeline_events(
             &logs,
             metric_series,
             anomaly_windows,
+            &marker_context,
         ),
         "missing-data" => derive_missing_data_timeline(&mut events, &changes, &spans, &gaps),
         "coincidental-correlation" => derive_coincidental_timeline(
@@ -1021,11 +1084,78 @@ fn derive_timeline_events(
             anomaly_windows,
             onset.as_deref(),
             &active_entities,
+            &marker_context,
         ),
         _ => {}
     }
 
     events
+}
+
+fn timeline_marker_for_anomaly_window(
+    window: &DerivedAnomalyWindow,
+    context: &TimelineMarkerContext<'_>,
+) -> TimelineMarker {
+    if is_retry_amplifier_window(window, context.relationships) {
+        return TimelineMarker::Amplification;
+    }
+
+    if depends_on_earlier_downstream_anomaly(window, context) {
+        return TimelineMarker::Propagation;
+    }
+
+    TimelineMarker::Symptom
+}
+
+fn is_retry_amplifier_window(
+    window: &DerivedAnomalyWindow,
+    relationships: &[ResolvedRelationship],
+) -> bool {
+    window.signal.contains("retry")
+        && relationships.iter().any(|relationship| {
+            relationship.src == window.entity
+                && relationship.relationship_type == RelationshipType::Retries
+        })
+}
+
+fn depends_on_earlier_downstream_anomaly(
+    window: &DerivedAnomalyWindow,
+    context: &TimelineMarkerContext<'_>,
+) -> bool {
+    if !is_latency_degradation_signal(&window.signal) {
+        return false;
+    }
+
+    context
+        .relationships
+        .iter()
+        .filter(|relationship| {
+            relationship.src == window.entity
+                && matches!(
+                    relationship.relationship_type,
+                    RelationshipType::Calls
+                        | RelationshipType::ReadsFrom
+                        | RelationshipType::DependsOn
+                )
+        })
+        .any(|relationship| {
+            context
+                .anomaly_windows
+                .iter()
+                .filter(|candidate| candidate.entity == relationship.dst)
+                .any(|candidate| anomaly_starts_before(candidate, window))
+        })
+}
+
+fn is_latency_degradation_signal(signal: &str) -> bool {
+    signal.contains("duration") || signal.contains("latency")
+}
+
+fn anomaly_starts_before(candidate: &DerivedAnomalyWindow, window: &DerivedAnomalyWindow) -> bool {
+    matches!(
+        (candidate.start.as_deref(), window.start.as_deref()),
+        (Some(candidate_start), Some(window_start)) if candidate_start < window_start
+    )
 }
 
 fn derive_deploy_timeline(
@@ -1035,6 +1165,7 @@ fn derive_deploy_timeline(
     spans: &[CanonicalSpanRecord],
     metric_series: &[CanonicalMetricSeries],
     anomaly_windows: &[DerivedAnomalyWindow],
+    marker_context: &TimelineMarkerContext<'_>,
 ) {
     if let Some(change) = first_change_of_kind(changes, "deploy") {
         push_change_timeline_event(events, change, TimelineMarker::Change);
@@ -1055,7 +1186,7 @@ fn derive_deploy_timeline(
         push_timeline_event(
             events,
             t,
-            TimelineMarker::Symptom,
+            timeline_marker_for_anomaly_window(window, marker_context),
             window.entity.clone(),
             metric_ref(&window.signal, &window.entity),
             format!("{} anomaly", window.signal),
@@ -1078,6 +1209,7 @@ fn derive_db_degradation_timeline(
     spans: &[CanonicalSpanRecord],
     metric_series: &[CanonicalMetricSeries],
     anomaly_windows: &[DerivedAnomalyWindow],
+    marker_context: &TimelineMarkerContext<'_>,
 ) {
     if let Some(change) = first_change_of_kind(changes, "job_start") {
         push_change_timeline_event(events, change, TimelineMarker::Change);
@@ -1085,7 +1217,11 @@ fn derive_db_degradation_timeline(
     if let Some(window) =
         anomaly_window_for(anomaly_windows, "db:orders-pg", "db.query.duration_p95_ms")
     {
-        push_anomaly_timeline_event(events, window, TimelineMarker::Symptom);
+        push_anomaly_timeline_event(
+            events,
+            window,
+            timeline_marker_for_anomaly_window(window, marker_context),
+        );
         push_recovery_event(events, metric_series, window);
     }
     if let Some(window) = anomaly_window_for(
@@ -1093,7 +1229,11 @@ fn derive_db_degradation_timeline(
         "service:checkout",
         "http.server.duration_p95_ms",
     ) {
-        push_anomaly_timeline_event(events, window, TimelineMarker::Propagation);
+        push_anomaly_timeline_event(
+            events,
+            window,
+            timeline_marker_for_anomaly_window(window, marker_context),
+        );
     }
     if let Some(span) = first_error_server_span_for_entity(spans, "service:api-gateway") {
         push_span_timeline_event(
@@ -1110,6 +1250,7 @@ fn derive_retry_storm_timeline(
     logs: &[CanonicalLogRecord],
     metric_series: &[CanonicalMetricSeries],
     anomaly_windows: &[DerivedAnomalyWindow],
+    marker_context: &TimelineMarkerContext<'_>,
 ) {
     if let Some(log) = first_log_containing(logs, "transient error") {
         push_log_timeline_event(events, log, TimelineMarker::Trigger);
@@ -1117,7 +1258,11 @@ fn derive_retry_storm_timeline(
     if let Some(window) =
         anomaly_window_for(anomaly_windows, "service:checkout", "client.retry.rate_rps")
     {
-        push_anomaly_timeline_event(events, window, TimelineMarker::Amplification);
+        push_anomaly_timeline_event(
+            events,
+            window,
+            timeline_marker_for_anomaly_window(window, marker_context),
+        );
     }
     if let Some(window) =
         anomaly_window_for(anomaly_windows, "service:payment-svc", "request.rate_rps")
@@ -1128,7 +1273,7 @@ fn derive_retry_storm_timeline(
         push_timeline_event(
             events,
             t,
-            TimelineMarker::Symptom,
+            timeline_marker_for_anomaly_window(window, marker_context),
             window.entity.clone(),
             window.id.clone(),
             format!("{} anomaly", window.signal),
@@ -1150,6 +1295,7 @@ fn derive_config_change_timeline(
     logs: &[CanonicalLogRecord],
     metric_series: &[CanonicalMetricSeries],
     anomaly_windows: &[DerivedAnomalyWindow],
+    marker_context: &TimelineMarkerContext<'_>,
 ) {
     if let Some(change) = first_change_of_kind(changes, "config_change") {
         push_change_timeline_event(events, change, TimelineMarker::Change);
@@ -1168,7 +1314,7 @@ fn derive_config_change_timeline(
         push_timeline_event(
             events,
             t,
-            TimelineMarker::Symptom,
+            timeline_marker_for_anomaly_window(window, marker_context),
             window.entity.clone(),
             window.id.clone(),
             format!("{} anomaly", window.signal),
@@ -1186,6 +1332,7 @@ fn derive_traffic_shift_timeline(
     changes: &[CanonicalChangeRecord],
     metric_series: &[CanonicalMetricSeries],
     anomaly_windows: &[DerivedAnomalyWindow],
+    marker_context: &TimelineMarkerContext<'_>,
 ) {
     if let Some(change) = first_change_of_kind(changes, "traffic_shift") {
         push_change_timeline_event(events, change, TimelineMarker::Change);
@@ -1201,7 +1348,7 @@ fn derive_traffic_shift_timeline(
         push_timeline_event(
             events,
             t,
-            TimelineMarker::Symptom,
+            timeline_marker_for_anomaly_window(window, marker_context),
             window.entity.clone(),
             window.id.clone(),
             format!("{} anomaly", window.signal),
@@ -1216,7 +1363,7 @@ fn derive_traffic_shift_timeline(
         push_timeline_event(
             events,
             t,
-            TimelineMarker::Symptom,
+            timeline_marker_for_anomaly_window(window, marker_context),
             window.entity.clone(),
             window.id.clone(),
             format!("{} anomaly", window.signal),
@@ -1230,6 +1377,7 @@ fn derive_resource_exhaustion_timeline(
     changes: &[CanonicalChangeRecord],
     metric_series: &[CanonicalMetricSeries],
     anomaly_windows: &[DerivedAnomalyWindow],
+    marker_context: &TimelineMarkerContext<'_>,
 ) {
     if let Some(change) = first_change_of_kind(changes, "deploy") {
         push_change_timeline_event(events, change, TimelineMarker::Change);
@@ -1243,7 +1391,7 @@ fn derive_resource_exhaustion_timeline(
         push_timeline_event(
             events,
             t,
-            TimelineMarker::Symptom,
+            timeline_marker_for_anomaly_window(window, marker_context),
             window.entity.clone(),
             window.id.clone(),
             format!("{} anomaly", window.signal),
@@ -1268,6 +1416,7 @@ fn derive_schema_change_timeline(
     logs: &[CanonicalLogRecord],
     metric_series: &[CanonicalMetricSeries],
     anomaly_windows: &[DerivedAnomalyWindow],
+    marker_context: &TimelineMarkerContext<'_>,
 ) {
     if let Some(change) = first_change_of_kind(changes, "schema_migration") {
         push_change_timeline_event(events, change, TimelineMarker::Change);
@@ -1284,7 +1433,7 @@ fn derive_schema_change_timeline(
         push_timeline_event(
             events,
             t,
-            TimelineMarker::Symptom,
+            timeline_marker_for_anomaly_window(window, marker_context),
             window.entity.clone(),
             window.id.clone(),
             format!("{} anomaly", window.signal),
@@ -1325,6 +1474,7 @@ fn derive_recurring_incident_timeline(
     logs: &[CanonicalLogRecord],
     metric_series: &[CanonicalMetricSeries],
     anomaly_windows: &[DerivedAnomalyWindow],
+    marker_context: &TimelineMarkerContext<'_>,
 ) {
     if let Some(change) = first_change_of_kind(changes, "job_start") {
         push_change_timeline_event(events, change, TimelineMarker::Change);
@@ -1338,7 +1488,7 @@ fn derive_recurring_incident_timeline(
         push_timeline_event(
             events,
             t,
-            TimelineMarker::Symptom,
+            timeline_marker_for_anomaly_window(window, marker_context),
             window.entity.clone(),
             window.id.clone(),
             format!("{} anomaly", window.signal),
@@ -1413,6 +1563,7 @@ fn derive_coincidental_timeline(
     anomaly_windows: &[DerivedAnomalyWindow],
     onset: Option<&str>,
     active_entities: &BTreeSet<String>,
+    marker_context: &TimelineMarkerContext<'_>,
 ) {
     for change in changes {
         let marker = timeline_non_causal_after_onset_rule(change, onset, active_entities);
@@ -1421,14 +1572,22 @@ fn derive_coincidental_timeline(
     if let Some(window) =
         anomaly_window_for(anomaly_windows, "infra:redis-cache", "cache.hit_ratio")
     {
-        push_anomaly_timeline_event(events, window, TimelineMarker::Symptom);
+        push_anomaly_timeline_event(
+            events,
+            window,
+            timeline_marker_for_anomaly_window(window, marker_context),
+        );
     }
     if let Some(window) = anomaly_window_for(
         anomaly_windows,
         "service:search-api",
         "http.server.error_rate",
     ) {
-        push_anomaly_timeline_event(events, window, TimelineMarker::Symptom);
+        push_anomaly_timeline_event(
+            events,
+            window,
+            timeline_marker_for_anomaly_window(window, marker_context),
+        );
     }
 }
 
@@ -3930,6 +4089,7 @@ impl std::error::Error for DerivedContextGoldError {
 mod tests {
     use super::*;
     use crate::evidence::{SourceRef, SourceSignal};
+    use crate::fixture_simulator::{plan_fixture_replay, replay_plan_into_store};
     use crate::fixture_validation::{FixtureCorpus, FixtureSelector};
 
     #[test]
@@ -4255,6 +4415,38 @@ mod tests {
     }
 
     #[test]
+    fn derive_full_context_matches_current_gold_by_capability() {
+        let corpus = FixtureCorpus::load(".").expect("fixture corpus should load");
+
+        for case in &corpus.cases {
+            let store = raw_fixture_store(case);
+            let expected =
+                capability_expected_context(case).expect("derived context gold should parse");
+            let actual = derive_full_context(case, &store);
+            let comparison = compare_derived_context(&expected, &actual);
+            let provenance = compare_derived_context_with_options(
+                &actual,
+                &actual,
+                DerivedContextComparisonOptions {
+                    require_runtime_provenance: true,
+                },
+            );
+
+            assert!(
+                !comparison.has_expected_mismatches(),
+                "{} full derived context mismatch: {comparison:#?}\nactual: {actual:#?}",
+                case.registry_entry.id
+            );
+            assert!(
+                provenance.missing_runtime_provenance.is_empty(),
+                "{} missing runtime provenance: {:#?}",
+                case.registry_entry.id,
+                provenance.missing_runtime_provenance
+            );
+        }
+    }
+
+    #[test]
     fn derive_timeline_context_matches_current_timeline_gold() {
         let corpus = FixtureCorpus::load(".").expect("fixture corpus should load");
 
@@ -4315,10 +4507,15 @@ mod tests {
                 continue;
             }
 
-            let store = HotContextStore::load_fixture_case(case).expect("fixture should load");
+            let mut store = raw_fixture_store(case);
             let expected =
                 related_expected_context(case).expect("derived related gold should parse");
-            let actual = derive_related_context(case, &store);
+            let full_actual = derive_and_insert_context(case, &mut store)
+                .expect("full derived context should insert");
+            let actual = DerivedContext {
+                related_anomalies: full_actual.related_anomalies.clone(),
+                ..Default::default()
+            };
             let comparison = compare_derived_context(&expected, &actual);
             let provenance = compare_derived_context_with_options(
                 &actual,
@@ -4500,6 +4697,135 @@ mod tests {
         );
     }
 
+    #[test]
+    fn derive_and_insert_context_exposes_full_pipeline_records() {
+        let corpus = FixtureCorpus::load(".").expect("fixture corpus should load");
+
+        for case in &corpus.cases {
+            let mut store = raw_fixture_store(case);
+            let raw_count = store.raw_source_records().count();
+            let context = derive_and_insert_context(case, &mut store)
+                .expect("full derived context should insert");
+
+            assert_eq!(
+                store.raw_source_records().count(),
+                raw_count,
+                "{} derived records must not become raw resolver inputs",
+                case.registry_entry.id
+            );
+            assert_eq!(
+                store
+                    .select(crate::hot_context_store::SourceQuery {
+                        kinds: vec![StoredRecordKind::AnomalyWindow],
+                        ..Default::default()
+                    })
+                    .len(),
+                context.anomaly_windows.len(),
+                "{} anomaly windows should be inspectable through store records",
+                case.registry_entry.id
+            );
+            assert_eq!(
+                store
+                    .select(crate::hot_context_store::SourceQuery {
+                        kinds: vec![StoredRecordKind::LogPattern],
+                        ..Default::default()
+                    })
+                    .len(),
+                context.log_patterns.len(),
+                "{} log patterns should be inspectable through store records",
+                case.registry_entry.id
+            );
+            assert_eq!(
+                store
+                    .select(crate::hot_context_store::SourceQuery {
+                        kinds: vec![StoredRecordKind::TimelineEvent],
+                        ..Default::default()
+                    })
+                    .len(),
+                context.timeline.len(),
+                "{} timeline events should be inspectable through store records",
+                case.registry_entry.id
+            );
+            assert_eq!(
+                store
+                    .select(crate::hot_context_store::SourceQuery {
+                        kinds: vec![StoredRecordKind::RelatedAnomaly],
+                        ..Default::default()
+                    })
+                    .len(),
+                usize::from(context.related_anomalies.is_some()),
+                "{} related anomalies should be inspectable through store records",
+                case.registry_entry.id
+            );
+            assert_eq!(
+                store
+                    .select(crate::hot_context_store::SourceQuery {
+                        kinds: vec![StoredRecordKind::WindowComparison],
+                        ..Default::default()
+                    })
+                    .len(),
+                usize::from(context.window_comparison.is_some()),
+                "{} window comparison should be inspectable through store records",
+                case.registry_entry.id
+            );
+
+            for window in &context.anomaly_windows {
+                assert_source_ref_resolves(
+                    &store,
+                    SourceSignal::AnomalyWindow,
+                    &window.id,
+                    &case.registry_entry.id,
+                );
+            }
+
+            for pattern in &context.log_patterns {
+                assert_source_ref_resolves(
+                    &store,
+                    SourceSignal::LogPattern,
+                    &pattern.id,
+                    &case.registry_entry.id,
+                );
+                for exemplar in &pattern.exemplars {
+                    assert_source_ref_resolves(
+                        &store,
+                        SourceSignal::Log,
+                        exemplar,
+                        &case.registry_entry.id,
+                    );
+                }
+            }
+
+            for event in &context.timeline {
+                if let Some(signal) = source_signal_for_timeline_ref(&event.source_ref) {
+                    assert_source_ref_resolves(
+                        &store,
+                        signal,
+                        &event.source_ref,
+                        &case.registry_entry.id,
+                    );
+                }
+            }
+
+            if let Some(related) = &context.related_anomalies {
+                for source_ref in related.source_refs.iter().chain(
+                    related
+                        .related
+                        .iter()
+                        .flat_map(|item| item.source_refs.iter()),
+                ) {
+                    if let Some(signal) = source_signal_for_related_ref(source_ref) {
+                        assert_source_ref_resolves(
+                            &store,
+                            signal,
+                            source_ref,
+                            &case.registry_entry.id,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     fn fixture_case(fixture_id: &str) -> &'static FixtureCase {
         let corpus = Box::leak(Box::new(
             FixtureCorpus::load(".").expect("fixture corpus should load"),
@@ -4512,6 +4838,29 @@ mod tests {
             .into_iter()
             .next()
             .expect("fixture should exist")
+    }
+
+    fn raw_fixture_store(case: &FixtureCase) -> HotContextStore {
+        let plan = plan_fixture_replay(case).expect("fixture replay plan should build");
+        replay_plan_into_store(&plan).expect("fixture raw replay should load")
+    }
+
+    fn assert_source_ref_resolves(
+        store: &HotContextStore,
+        signal: SourceSignal,
+        source_ref: &str,
+        fixture_id: &str,
+    ) {
+        assert!(
+            matches!(
+                store.resolve_source_ref(&SourceRef {
+                    signal,
+                    r#ref: source_ref.to_string(),
+                }),
+                crate::hot_context_store::SourceResolution::Found(_)
+            ),
+            "{fixture_id} source_ref {source_ref} should resolve as {signal:?}"
+        );
     }
 
     fn assert_capability_shape(case: &FixtureCase, capability: &str, present: bool) {
@@ -4572,9 +4921,43 @@ mod tests {
         })
     }
 
+    fn capability_expected_context(
+        case: &FixtureCase,
+    ) -> Result<DerivedContext, DerivedContextGoldError> {
+        let expected = load_expected_derived_context(case)?;
+
+        Ok(DerivedContext {
+            anomaly_windows: if has_capability(case, "anomaly-windows") {
+                expected.anomaly_windows
+            } else {
+                Vec::new()
+            },
+            log_patterns: if has_capability(case, "log-pattern-clustering") {
+                expected.log_patterns
+            } else {
+                Vec::new()
+            },
+            timeline: if has_capability(case, "build_timeline") {
+                expected.timeline
+            } else {
+                Vec::new()
+            },
+            related_anomalies: if has_capability(case, "find_related_anomalies") {
+                expected.related_anomalies
+            } else {
+                None
+            },
+            window_comparison: if has_capability(case, "compare_windows") {
+                expected.window_comparison
+            } else {
+                None
+            },
+        })
+    }
+
     fn source_signal_for_timeline_ref(source_ref: &str) -> Option<SourceSignal> {
         if source_ref.starts_with("aw-") {
-            None
+            Some(SourceSignal::AnomalyWindow)
         } else if source_ref.starts_with("change:") {
             Some(SourceSignal::Change)
         } else if source_ref.starts_with("log-") {
@@ -4594,7 +4977,7 @@ mod tests {
         if source_ref.starts_with("aw-") {
             Some(SourceSignal::AnomalyWindow)
         } else if source_ref.starts_with("relationship:") {
-            None
+            Some(SourceSignal::Relationship)
         } else if source_ref.starts_with("prior:") {
             Some(SourceSignal::PriorIncident)
         } else if source_ref.starts_with("change:") {

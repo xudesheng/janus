@@ -337,6 +337,24 @@ Boundary:
 - the timeline must not produce suspected-cause ranks or final causal labels;
 - final classification of nearby changes belongs to the evidence compiler.
 
+Slice 6 marker-assignment decision:
+
+- timeline event candidate selection remains intentionally corpus-bounded for
+  this milestone, because Janus does not yet have a general agent query surface
+  or evidence-ranking surface to decide which possible event candidates are
+  worth emitting;
+- anomaly marker assignment is no longer purely fixture-class hardcoding where
+  the current source context is strong enough: retry-source anomaly windows are
+  marked as `amplification` from resolved `retries` relationships, and dependent
+  latency/duration anomaly windows are marked as `propagation` only when a
+  downstream anomaly on a `calls`, `reads-from`, or `depends-on` relationship
+  starts strictly earlier;
+- all other anomaly windows remain `symptom` unless a named source-backed rule
+  assigns a narrower marker, so the false-causality fixtures do not turn every
+  dependency edge into propagation;
+- broad event selection and richer role assignment are tracked for the later
+  agent/evidence API milestone, after caller-provided questions and seeds exist.
+
 Comparison should check marker, entity, time, source ref, and stable text for
 the current corpus. Timeline text comparison should normalize insignificant
 whitespace and treat text as secondary to marker, entity, time, and source ref.
@@ -366,6 +384,13 @@ Minimum behavior:
 - preserve a simple relation label such as `downstream-dependency`,
   `amplifier`, `load-amplification`, or `same-signature`;
 - preserve optional prior incident references when fixture data supports it.
+
+Current milestone boundary: because `find_related_anomalies` has no public
+caller-provided seed/query surface yet, the first implementation selects the
+seed deterministically from the fixture failure class and source-derived context.
+That selection is a placeholder for the later agent API; relationship traversal,
+lag calculation, and prior-incident matching remain source-driven derivation
+logic.
 
 This is relationship-aware retrieval, not causality ranking. A related anomaly
 can support, weaken, or remain neutral later; this topic only makes it
@@ -407,6 +432,8 @@ by entity and signal, with numeric tolerance for values and factors.
 Derived artifacts should be inserted into or exposed through the hot-store
 derived-record boundary:
 
+- `StoredRecordKind::Entity`;
+- `StoredRecordKind::Relationship`;
 - `StoredRecordKind::AnomalyWindow`;
 - `StoredRecordKind::LogPattern`;
 - `StoredRecordKind::TimelineEvent`;
@@ -415,6 +442,9 @@ derived-record boundary:
 
 Anomaly windows and log patterns already have source-ref categories. They must
 resolve through `SourceSignal::AnomalyWindow` and `SourceSignal::LogPattern`.
+Derived relationships must be inserted before relationship-backed related
+anomalies so `relationship:` provenance refs resolve through
+`SourceSignal::Relationship`.
 
 Timeline events, related anomalies, and window comparisons currently do not map
 to first-class `SourceSignal` variants. They still should be inspectable through
@@ -487,10 +517,10 @@ Recommended slices:
 5. Related anomalies: connect anomaly windows through relationships and time,
    compare relation labels and lag.
 6. Final integration: insert derived records into the hot store, prove source
-   refs resolve where applicable, run full-corpus comparison, and either
-   generalize timeline marker assignment through entity/relationship/onset
-   context or explicitly record the current timeline algorithm as
-   fixture-corpus scaffolding to be generalized after this milestone.
+   refs resolve where applicable, run full-corpus comparison, and generalize the
+   current supported timeline marker roles through entity/relationship/onset
+   context while keeping broader event selection as corpus-bounded milestone
+   scaffolding.
 
 Slice 1 should land and pass before the generator slices produce anomaly,
 pattern, timeline, related-anomaly, or comparison artifacts. The comparison
