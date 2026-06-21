@@ -470,9 +470,10 @@ The next review topics should follow the contract-first path:
 3. `fixture-validation-harness`
 4. `hot-context-store`
 5. `entity-resolver-confidence`
-6. `evidence-compiler-ranking`
-7. `mcp-agent-surface`
-8. `comparative-eval-v1`
+6. `derived-context-baseline`
+7. `evidence-compiler-ranking`
+8. `mcp-agent-surface`
+9. `comparative-eval-v1`
 
 Each topic should name a concrete artifact as its milestone, follow
 `docs/review-framework.md`, and stop once the milestone is complete with no open

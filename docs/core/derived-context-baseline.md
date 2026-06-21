@@ -203,6 +203,8 @@ Minimum provenance expectations:
   exemplar ids resolve through the hot store;
 - timeline events carry one scalar `source_ref` that resolves to the source or
   derived artifact represented by the event;
+- the scalar timeline `source_ref` is the fixture-compatible projection, not
+  necessarily the full runtime provenance set;
 - related anomalies point back to the seed anomaly, related anomaly windows,
   and relationship or prior-incident refs when those inputs explain the
   relation label;
@@ -322,14 +324,23 @@ Timeline rules:
 
 Boundary:
 
-- `non-causal-change` may be preserved when the fixture has explicit timing and
-  counter-evidence, such as a change after incident onset;
+- `non-causal-change` may be emitted only by a named
+  `timeline_non_causal_after_onset_rule`;
+- that rule may mark a change as `non-causal-change` only when the change
+  timestamp is strictly after the earliest derived symptom or anomaly onset for
+  the active incident, and the changed entity is not already on the derived
+  symptom or propagation path at that time;
+- if the active incident onset or path cannot be established from source-backed
+  derived context, the builder must emit an ordinary `change` marker instead of
+  guessing `non-causal-change`;
 - the timeline must not produce suspected-cause ranks or final causal labels;
 - final classification of nearby changes belongs to the evidence compiler.
 
 Comparison should check marker, entity, time, source ref, and stable text for
-the current corpus. If stable natural text proves too brittle, reviewers should
-approve a structured timeline payload before implementation broadens.
+the current corpus. Timeline text comparison should normalize insignificant
+whitespace and treat text as secondary to marker, entity, time, and source ref.
+If stable natural text proves too brittle, reviewers should approve a
+structured timeline payload before implementation broadens.
 
 ## Related Anomalies
 
@@ -439,6 +450,12 @@ objects are allowed only when they are deterministic, source-backed, and do not
 contradict current gold. The comparison report must make extras visible so they
 can be reviewed.
 
+When a runtime object carries richer provenance than the fixture shape, the
+comparison should validate the runtime provenance first and then project the
+object into the fixture-compatible shape. For example, a timeline event may
+carry multiple provenance refs internally while matching one scalar
+`source_ref` in gold.
+
 The current corpus has mixed coverage:
 
 - all fixtures declare `anomaly-windows`;
@@ -471,6 +488,10 @@ Recommended slices:
 6. Final integration: insert derived records into the hot store, prove source
    refs resolve where applicable, and run full-corpus comparison.
 
+Slice 1 should land and pass before the generator slices produce anomaly,
+pattern, timeline, related-anomaly, or comparison artifacts. The comparison
+shell is the guardrail against drifting fixture gold output.
+
 These are implementation slices only. The topic is complete only when the
 Definition Of Done below is met or reviewers explicitly narrow the milestone.
 
@@ -490,6 +511,9 @@ Add tests that prove:
 - missing-data fixtures lower confidence or produce data-gap markers;
 - false-causality trap fixtures preserve counter-evidence context without
   producing final root-cause ranks;
+- the `timeline_non_causal_after_onset_rule` has both a positive test for the
+  current coincidental-change fixture and a negative test proving the timeline
+  builder does not over-label nearby changes as non-causal;
 - `entity-resolver-confidence` tests continue to pass.
 
 Existing verification should continue to pass:
