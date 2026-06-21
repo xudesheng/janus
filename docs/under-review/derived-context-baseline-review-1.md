@@ -88,3 +88,79 @@ Commands run:
   created
 
 <!-- Reviewer appends below; the Implementor must not edit past this line. -->
+
+## Review (by Claude)
+
+### Direction Verdict
+
+**AGREE — design approved; implementation may begin.** From my side the design
+gate is satisfied. (The topic's Design Review Gate requires *every* active
+reviewer to agree, so if the User has other active reviewers they still need to
+sign off before Rust starts.)
+
+- On critical path: **yes**. This round folded review 0's must-fix design
+  feedback into the formal docs, which the Design Review Gate required before any
+  code.
+- Moves the milestone: **yes**. The design contract is now implementation-ready;
+  the only thing that was blocking Slice 1 was reviewer agreement on the
+  `non-causal-change` rule, and that is now resolved.
+- Next action: **continue**. Round 2 should start **Slice 1 (data model +
+  comparison shell)** — that directly answers Reviewer Focus question 5.
+
+I verified the formal-doc edits against the diff (`063c0b2..21db98a`) rather than
+trusting the response prose; every claim in the response matches the actual
+changes to `docs/core/derived-context-baseline.md` and `docs/core/roadmap.md`.
+
+### Round 0 Findings — All Resolved
+
+- **Finding 1 (must-fix): resolved, and slightly stronger than I asked.** The new
+  `timeline_non_causal_after_onset_rule` carries both conditions I required
+  (change strictly after earliest derived symptom/anomaly onset **and** the
+  changed entity not on the derived symptom/propagation path), plus a safe
+  fallback to an ordinary `change` marker when onset or path cannot be
+  established — which closes the "builder guesses" gap. Both a positive
+  (`coincidental-deploy-trap`) and a negative (no over-labeling) test are now
+  required. This keeps the marker a deterministic temporal annotation, not a
+  causal rank.
+- **Finding 2: resolved.** Slice 1 is now a hard prerequisite before any
+  generator slice produces artifacts.
+- **Finding 3: resolved.** The scalar timeline `source_ref` is now explicitly the
+  fixture-compatible *projection*; the comparison contract validates richer
+  runtime provenance first, then projects to the gold shape.
+- **Finding 4: resolved.** Timeline text comparison normalizes whitespace and
+  treats text as secondary to marker/entity/time/source-ref.
+- **Finding 5: resolved.** `roadmap.md` Near-Term Review Order now lists
+  `derived-context-baseline` at position 6, renumbered cleanly.
+
+### Answers To Reviewer Focus
+
+1. **Yes** — the rule resolves the must-fix concern without moving final
+   classification into 5B. It is purely temporal + path-membership and
+   deterministic; the actual causal ranking still lives in `suspected_causes`
+   (Milestone 6, out of scope here).
+2. **Precise enough for the current corpus.** "Derived symptom or propagation
+   path" is operationally pinned by the anomaly-window entity set the builder
+   already has: in `coincidental-deploy-trap`, `service:search-ui` has no anomaly
+   window, so "not on the symptom path" is derivable at Slice 4 from Slice 2
+   output alone — the positive test does not depend on Slice 5. And because the
+   rule falls back to plain `change` whenever onset/path is unestablished, any
+   residual imprecision can only *under-*label, never invent a false
+   `non-causal-change`. That is the safe failure direction.
+3. **Yes, sufficient** — the negative test is the real guard. One optional
+   strengthening for the implementation round (guidance, not a gate): make the
+   negative test exercise *both* failure conditions, not just one — i.e. include
+   a change at/before onset **and** a change whose entity *is* on the failing
+   path — so a future regression that drops either clause is caught.
+4. **Yes** — the provenance and text clarifications keep the fixture contract
+   matchable while requiring inspectable runtime provenance. Good balance.
+5. **Yes** — start Slice 1 next (see Direction Verdict).
+
+### Round Termination Note
+
+This round left **no new actionable design defects**; the design is approved.
+The single item under Focus answer 3 is optional implementation guidance, not a
+required fix. A `review-2` round is nonetheless justified — not because design
+feedback is open, but because the topic's milestone work (the 5B implementation)
+is not yet started. Round 2 should therefore be an **implementation round
+carrying Slice 1**, after which I will judge milestone progress before local
+defects per the framework.
