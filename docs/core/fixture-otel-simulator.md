@@ -61,7 +61,7 @@ In scope:
   events, prior incidents, and telemetry gaps;
 - a hot-store ingest sink or equivalent API that accepts replay events without
   bypassing `HotContextStore`;
-- final-store source-ref resolution checks against current fixture gold
+- final-store raw source-ref resolution checks against current fixture gold
   evidence bundles;
 - step or dry-run mode that shows event order without needing wall-clock sleeps;
 - a small CLI for local demos;
@@ -92,9 +92,35 @@ The future `otel-ingest-prototype` topic should be able to replace
 `FixtureReplaySource` with an OTLP receiver while keeping the same normalized
 hot-store write model and source-ref semantics.
 
+The source-specific adapter owns source-key derivation. `FixtureReplaySource`
+uses fixture conventions such as `t-0001`, `t-0001/s-3`, and `name@entity`; a
+future `OtlpReceiverSource` must normalize real OTLP trace ids, span ids, metric
+identity, resource attributes, and entity hints into the same hot-store write
+model without assuming fixture ids.
+
 This topic should not add `opentelemetry-proto`, a network listener, or Collector
 configuration. Those belong to real ingest. The simulator is allowed to be
 "OTel-shaped" rather than byte-exact OTLP, matching the fixture contract.
+
+## Incremental Replay Requirement
+
+The current hot store already has an all-at-once fixture loader. This topic
+should not make the simulator a thin wrapper around that loader. The simulator
+must build a replay plan and apply events to a fresh `HotContextStore` through an
+incremental ingest boundary.
+
+It is acceptable to use `HotContextStore::load_fixture_case` as a test oracle for
+full-replay source-ref compatibility, but not as the main replay implementation.
+Full replay must preserve source-key and source-ref resolution semantics; it does
+not require byte-for-byte `StoredRecord` payload equality with batch fixture
+loading except where this document explicitly pins a stored shape. Partial replay
+is a required behavior: before an event is ingested, source refs owned by that
+event should be missing; after the event is ingested, the same refs should be
+resolvable.
+
+This distinction is what makes the topic useful for later real ingest. A future
+OTLP receiver should be able to feed the same normalized ingest boundary without
+going through fixture-only batch loading.
 
 ## Event Model
 
@@ -133,14 +159,20 @@ invent source ids that differ from fixture conventions.
 Replay order should be deterministic:
 
 1. preload records without event time, such as resources, before timed records;
-2. order timed records by comparable fixture timestamp strings;
+2. order timed records by normalized UTC fixture timestamp keys;
 3. use fixture file order as the stable tie-breaker;
 4. use event `sequence` as the final tie-breaker.
 
-The current fixtures use UTC RFC3339-like strings that compare lexicographically.
-This topic can keep that convention rather than adding a time library. If a
-future fixture needs offsets, fractional formats, or one-sided windows, that
-should be a separate timestamp-normalization topic.
+The current fixtures use UTC RFC3339-like strings with a `Z` suffix and optional
+fractional seconds. Replay planning should normalize those forms for ordering
+while preserving the original timestamp string on the emitted event. If a future
+fixture needs offsets or one-sided windows, that should be a separate timestamp
+normalization topic.
+
+Tests should assert that produced plans are monotonic when timestamps are parsed
+for the current fixture corpus. Before adding time-slicing features such as
+`--until`, any broader timestamp formats should be normalized or rejected rather
+than relying on accidental lexical order.
 
 Suggested event timing:
 
@@ -153,6 +185,10 @@ Suggested event timing:
 - prior incidents: preload, or `first_seen` if the simulator is running a
   warm-context scenario;
 - telemetry gaps: gap `start`, carrying the full gap payload.
+
+For this topic, timed signal events are invalid if the required timestamp field
+is missing. Prior incidents are the exception in the current corpus because they
+may represent warm-context memory instead of a replay-time signal.
 
 ## Metric Handling
 
@@ -175,8 +211,47 @@ The stored metric-series record should contain only observed points up to the
 current replay step. After replay completes, it should preserve the same source
 key that Evidence IR uses today.
 
+The accumulated metric-series payload should converge to the fixture metric
+shape after full replay:
+
+- preserve `name`, `entity`, `unit`, and other non-point fields from the fixture
+  metric record;
+- append point payloads in replay order, which should match fixture point order
+  for the current fixtures;
+- keep only observed points before full replay and all points after full replay;
+- never drop or synthesize metric points.
+
 This is the main reason the topic needs an ingest sink instead of only calling
 `HotContextStore::load_fixture_case`.
+
+## Trace And Span Handling
+
+Trace and span replay should follow the same incremental principle as metrics:
+records become resolvable as the relevant simulated event is ingested, not when
+the fixture file is first parsed.
+
+The stored source keys remain compatible with the current hot-store convention:
+
+```text
+trace record:
+  key=t-0001
+
+span record:
+  key=t-0001/s-3
+```
+
+The design should preserve these rules:
+
+- the `Trace` event makes the trace source key resolvable and should be emitted
+  when the trace first has observable data, normally the earliest span time;
+- if a trace has no span start time, including an empty `spans` array, the
+  trace event uses a trace-level `start` field when present; otherwise it is an
+  untimed preload event;
+- a span source ref does not resolve before that span's event is ingested;
+- full replay preserves the same trace and span lookup semantics as current
+  fixture loading;
+- trace aggregation can be simple and fixture-shaped for this topic, as long as
+  it does not hide partial-replay behavior.
 
 ## Hot-Store Ingest Boundary
 
@@ -189,7 +264,7 @@ pub enum HotIngestEvent {
     Resource(serde_json::Value),
     Trace(serde_json::Value),
     Span { trace_id: String, payload: serde_json::Value },
-    MetricPoint { series: MetricSeriesKey, point: serde_json::Value },
+    MetricPoint { series: MetricSeriesKey, payload: serde_json::Value },
     Log(serde_json::Value),
     Change(serde_json::Value),
     PriorIncident(serde_json::Value),
@@ -207,8 +282,10 @@ Required behavior:
   as direct fixture loading;
 - metric points update their metric-series record instead of conflicting on
   duplicate primary keys;
+- metric series is the only merge-eligible `(StoredRecordKind, SourceKey)` pair;
 - trace and span events preserve trace and span aliases;
-- duplicate primary keys with different payloads remain errors;
+- duplicate primary keys with different payloads remain errors for all non-metric
+  record kinds;
 - source-ref resolution outcomes stay unchanged.
 
 It is acceptable for `HotIngestEvent` to be internal to this topic at first, as
@@ -230,12 +307,19 @@ The simulator CLI can then:
 1. load a fixture;
 2. replay the input into a fresh hot store;
 3. load the fixture gold evidence bundle;
-4. validate that every returned source ref resolves against the simulated store;
+4. validate that every returned raw source ref resolves against the simulated
+   store;
 5. run the existing query-context checks;
 6. print a compact demo report.
 
 The returned bundle should remain unchanged. The simulator proves source-backed
 ingest plumbing, not evidence compilation.
+
+Gold bundles may also contain derived refs such as anomaly windows, log patterns,
+evidence items, entities, and relationships. This simulator replays fixture
+`input.json` only, so it should report those derived refs as skipped during demo
+validation rather than loading `expected.json` derived records or deriving them
+itself. Full derived-ref validation belongs to derived-context topics.
 
 ## CLI
 
@@ -255,6 +339,8 @@ Minimum useful behavior:
 - `--dry-run` prints event order without mutating the store;
 - `--jsonl` prints one event per line as JSON for inspection or later scripts.
 
+`--dry-run` and `--jsonl` are mutually exclusive render modes.
+
 Optional, useful if small:
 
 - `--until <timestamp>` replays only through a simulated time;
@@ -263,6 +349,24 @@ Optional, useful if small:
 
 Do not add wall-clock sleeps in the minimum implementation. A deterministic
 logical clock is easier to test and more useful for review.
+
+## Suggested Implementation Slices After Design Approval
+
+No slice should start until reviewers agree on the design direction, or
+explicitly approve that slice in their `Direction Verdict`.
+
+If reviewers accept phase-by-phase implementation, the recommended slices are:
+
+1. Replay planning and dry-run output: deterministic event extraction, ordering,
+   sequence assignment, and event rendering without mutating a store.
+2. Hot-store ingest boundary: `HotIngestEvent`, incremental record insertion or
+   update behavior, metric-point accumulation, trace/span availability, and
+   partial-replay source-ref tests.
+3. Demo and validation surface: CLI summary, JSONL mode, bundle source-ref
+   validation after replay, and a smoke test.
+
+These are implementation slices only. The topic's Definition Of Done remains the
+full simulator contract below.
 
 ## Tests
 
@@ -275,7 +379,7 @@ the old fixture loader:
 - resources are emitted before timed records;
 - metric points accumulate into metric-series records with the existing source
   keys;
-- after full replay, every current fixture Evidence IR source ref resolves
+- after full replay, every current fixture Evidence IR raw source ref resolves
   against the simulated store;
 - a partial replay before a known event leaves that event's source ref missing;
 - replaying through that event makes the same source ref resolvable;
@@ -285,6 +389,10 @@ the old fixture loader:
 The partial replay tests are important. They prove this is a stream simulator,
 not just another all-at-once fixture loader.
 
+Derived evidence refs, such as anomaly windows and log patterns, are outside the
+simulator's ingest-only validation scope. The demo should count and report them
+as skipped rather than silently treating them as replayed input evidence.
+
 ## Definition Of Done
 
 This topic is complete when:
@@ -293,8 +401,8 @@ This topic is complete when:
   ingest-like adapter;
 - metric points are represented as replay events and end up under the expected
   metric-series source refs;
-- full replay resolves all current fixture evidence source refs through the hot
-  store;
+- full replay resolves all current fixture evidence raw source refs through the
+  hot store and reports derived refs as skipped;
 - partial replay can show a source ref becoming available over simulated time;
 - a local CLI can run a fixture simulation and print a deterministic summary;
 - no OTLP protobuf, network receiver, persistence, derivation, ranking, or MCP

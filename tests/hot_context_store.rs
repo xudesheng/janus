@@ -1,9 +1,10 @@
 use janus::{
     evidence::{EvidenceBundle, SourceRef, SourceSignal, TimeWindow},
+    fixture_simulator::plan_fixture_replay,
     fixture_validation::{FixtureCase, FixtureCorpus, FixtureSelector},
     hot_context_store::{
-        HotContextStore, HotStoreError, SourceKey, SourceQuery, SourceResolution, StoredRecord,
-        StoredRecordKind,
+        HotContextStore, HotIngestEvent, HotStoreError, IngestOutcome, MetricSeriesKey, SourceKey,
+        SourceQuery, SourceResolution, StoredRecord, StoredRecordKind,
     },
 };
 use serde_json::{Value, json};
@@ -50,6 +51,228 @@ fn every_current_evidence_source_ref_resolves_to_concrete_record() {
                     }
                     other => panic!(
                         "failed to resolve {:?} in fixture {}: {:?}",
+                        source_ref, case.registry_entry.id, other
+                    ),
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn ingest_metric_points_accumulates_observed_prefix() {
+    let case = fixture_case("deploy-bad-rollout");
+    let plan = plan_fixture_replay(case).unwrap();
+    let events: Vec<_> = plan
+        .events()
+        .iter()
+        .filter(|event| event.source_key == "http.server.error_rate@service:checkout")
+        .collect();
+    let mut store = HotContextStore::new();
+
+    assert!(matches!(
+        ingest_simulation_event(&mut store, events[0]),
+        IngestOutcome::Inserted {
+            kind: StoredRecordKind::MetricSeries,
+            ..
+        }
+    ));
+    assert_metric_points(&store, "http.server.error_rate@service:checkout", 1);
+
+    assert!(matches!(
+        ingest_simulation_event(&mut store, events[1]),
+        IngestOutcome::Updated {
+            kind: StoredRecordKind::MetricSeries,
+            ..
+        }
+    ));
+    let metric = assert_metric_points(&store, "http.server.error_rate@service:checkout", 2);
+    assert_eq!(metric.payload["name"], "http.server.error_rate");
+    assert_eq!(metric.payload["entity"], "service:checkout");
+    assert_eq!(metric.payload["unit"], "ratio");
+}
+
+#[test]
+fn non_metric_duplicate_ingest_keys_remain_errors() {
+    let mut store = HotContextStore::new();
+
+    store
+        .ingest(HotIngestEvent::Log(json!({
+            "id": "log-dup",
+            "t": "2026-06-01T00:00:00Z",
+            "entity": "service:test",
+            "severity": "ERROR",
+            "body": "first"
+        })))
+        .unwrap();
+    let error = store
+        .ingest(HotIngestEvent::Log(json!({
+            "id": "log-dup",
+            "t": "2026-06-01T00:00:01Z",
+            "entity": "service:test",
+            "severity": "ERROR",
+            "body": "second"
+        })))
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        HotStoreError::DuplicatePrimaryKey {
+            kind: StoredRecordKind::Log,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn metric_series_is_the_only_merge_eligible_ingest_key() {
+    let mut store = HotContextStore::new();
+    let series = MetricSeriesKey::new("requests.count", "service:test");
+
+    store
+        .ingest(HotIngestEvent::MetricPoint {
+            series: series.clone(),
+            payload: json!({
+                "name": "requests.count",
+                "entity": "service:test",
+                "unit": "1",
+                "point": { "t": "2026-06-01T00:00:00Z", "v": 1 }
+            }),
+        })
+        .unwrap();
+    store
+        .ingest(HotIngestEvent::MetricPoint {
+            series: series.clone(),
+            payload: json!({
+                "name": "requests.count",
+                "entity": "service:test",
+                "unit": "1",
+                "point": { "t": "2026-06-01T00:00:01Z", "v": 2 }
+            }),
+        })
+        .unwrap();
+    assert_metric_points(&store, "requests.count@service:test", 2);
+
+    let error = store
+        .ingest(HotIngestEvent::MetricPoint {
+            series,
+            payload: json!({
+                "name": "requests.count",
+                "entity": "service:test",
+                "unit": "seconds",
+                "point": { "t": "2026-06-01T00:00:02Z", "v": 3 }
+            }),
+        })
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        HotStoreError::DuplicatePrimaryKey {
+            kind: StoredRecordKind::MetricSeries,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn partial_replay_makes_change_ref_available_at_owning_event() {
+    let case = fixture_case("deploy-bad-rollout");
+    let plan = plan_fixture_replay(case).unwrap();
+    let mut store = HotContextStore::new();
+    let change_ref = source_ref(SourceSignal::Change, "change:deploy-checkout-v2");
+    let change_index = plan
+        .events()
+        .iter()
+        .position(|event| event.source_key == "change:deploy-checkout-v2")
+        .unwrap();
+
+    for event in &plan.events()[..change_index] {
+        ingest_simulation_event(&mut store, event);
+    }
+    assert!(matches!(
+        store.resolve_source_ref(&change_ref),
+        SourceResolution::Missing { .. }
+    ));
+
+    ingest_simulation_event(&mut store, &plan.events()[change_index]);
+    assert!(matches!(
+        store.resolve_source_ref(&change_ref),
+        SourceResolution::Found(_)
+    ));
+}
+
+#[test]
+fn partial_replay_distinguishes_trace_and_span_availability() {
+    let case = fixture_case("deploy-bad-rollout");
+    let plan = plan_fixture_replay(case).unwrap();
+    let mut store = HotContextStore::new();
+    let trace_ref = source_ref(SourceSignal::Trace, "t-0001");
+    let span_ref = source_ref(SourceSignal::Trace, "t-0001/s-1");
+    let trace_index = plan
+        .events()
+        .iter()
+        .position(|event| event.source_key == "t-0001")
+        .unwrap();
+    let span_index = plan
+        .events()
+        .iter()
+        .position(|event| event.source_key == "t-0001/s-1")
+        .unwrap();
+
+    for event in &plan.events()[..trace_index] {
+        ingest_simulation_event(&mut store, event);
+    }
+    assert!(matches!(
+        store.resolve_source_ref(&trace_ref),
+        SourceResolution::Missing { .. }
+    ));
+
+    ingest_simulation_event(&mut store, &plan.events()[trace_index]);
+    assert!(matches!(
+        store.resolve_source_ref(&trace_ref),
+        SourceResolution::Found(_)
+    ));
+    assert!(matches!(
+        store.resolve_source_ref(&span_ref),
+        SourceResolution::Missing { .. }
+    ));
+
+    for event in &plan.events()[trace_index + 1..=span_index] {
+        ingest_simulation_event(&mut store, event);
+    }
+    assert!(matches!(
+        store.resolve_source_ref(&span_ref),
+        SourceResolution::Found(_)
+    ));
+}
+
+#[test]
+fn full_replay_resolves_current_raw_evidence_source_refs() {
+    let corpus = FixtureCorpus::load(repo_root()).unwrap();
+
+    for case in &corpus.cases {
+        let plan = plan_fixture_replay(case).unwrap();
+        let mut store = HotContextStore::new();
+        for event in plan.events() {
+            ingest_simulation_event(&mut store, event);
+        }
+
+        for item in evidence_bundle(case).items {
+            for source_ref in item.source_refs.iter().filter(|source_ref| {
+                matches!(
+                    source_ref.signal,
+                    SourceSignal::Trace
+                        | SourceSignal::Metric
+                        | SourceSignal::Log
+                        | SourceSignal::Change
+                        | SourceSignal::PriorIncident
+                        | SourceSignal::TelemetryGap
+                )
+            }) {
+                match store.resolve_source_ref(source_ref) {
+                    SourceResolution::Found(_) => {}
+                    other => panic!(
+                        "failed to resolve raw ref {:?} in fixture {}: {:?}",
                         source_ref, case.registry_entry.id, other
                     ),
                 }
@@ -259,6 +482,30 @@ fn found(resolution: SourceResolution<'_>) -> &StoredRecord {
         SourceResolution::Found(record) => record,
         other => panic!("expected found record, got {other:?}"),
     }
+}
+
+fn ingest_simulation_event(
+    store: &mut HotContextStore,
+    event: &janus::fixture_simulator::SimulationEvent,
+) -> IngestOutcome {
+    let ingest_event = HotIngestEvent::try_from(event).unwrap();
+    store.ingest(ingest_event).unwrap()
+}
+
+fn assert_metric_points<'a>(
+    store: &'a HotContextStore,
+    source_key: &str,
+    expected_count: usize,
+) -> &'a StoredRecord {
+    let metric = found(store.resolve_source_ref(&source_ref(SourceSignal::Metric, source_key)));
+
+    assert_eq!(metric.kind, StoredRecordKind::MetricSeries);
+    assert_eq!(
+        metric.payload["points"].as_array().unwrap().len(),
+        expected_count
+    );
+
+    metric
 }
 
 fn test_record(kind: StoredRecordKind, key: &str) -> StoredRecord {
