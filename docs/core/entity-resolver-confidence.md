@@ -425,6 +425,44 @@ Relationship confidence should combine:
 Do not infer ownership or causal direction from time correlation alone in this
 topic. Ownership and root-cause ranking belong later.
 
+### Accepted Milestone 5A Inference Rules
+
+The first relationship builder prefers direct trace, resource, and dependency
+attributes. A few deterministic fixture-corpus bridge rules are accepted for
+Milestone 5A only because current gold relationships intentionally model
+operational context that has no direct source evidence yet. These rules are
+reviewed scope, not a general natural-language inference engine:
+
+- If two non-ambiguous service resources share a base name and one is named
+  `<base>-ui` while the other is named `<base>-api`, the builder may emit a
+  `calls` edge from the UI service to the API service with no evidence and
+  fixture-level confidence. This is a current-corpus convention, not a general
+  ownership or dependency rule.
+- Change records may infer a `writes-to` database edge only when the change has
+  a service entity, a summary token that names a database operation represented
+  in the current fixtures, and a database resource whose service name or stem is
+  present in that summary. The current `VACUUM` bridge is intentionally narrow.
+  Future fixtures should prefer structured change attributes for database
+  targets and operation kind.
+- Prior incident records may infer a current `writes-to` edge only from a
+  structured signature with a service trigger and database `primary_entity`.
+  The prior incident record itself is evidence for the inferred edge; it is not
+  causal proof for the current incident.
+- A span with `peer.service` that does not match a local service resource may
+  derive an `external-api` dependency. The current `charge` operation-name check
+  only assigns the fixture-specific `role: payment-provider` attribute and
+  should be replaced by structured dependency role attributes when new fixtures
+  need this behavior.
+- Retry relationship attributes currently accept the
+  `checkout.retry.max_attempts` and `checkout.retry.backoff` resource attribute
+  names because the current retry fixture uses that namespace. New retry
+  namespaces must be explicitly added or normalized before they are treated as
+  first-class comparison attributes.
+
+Phase 4 comparison must surface all extra derived entities and relationships,
+including relationships between gold entity ids that are not present in gold, so
+these accepted bridge rules cannot silently over-fire on future fixtures.
+
 ## Fixture Comparison Contract
 
 The topic should add a comparison helper, for example:

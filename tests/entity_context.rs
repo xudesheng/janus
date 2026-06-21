@@ -1,7 +1,8 @@
 use janus::{
     entity_context::{
-        EntityKind, RelationshipType, ResolvedEntity, ResolvedRelationship, relationship_store_key,
-        resolve_entities, resolve_relationships,
+        EntityAlternative, EntityKind, RelationshipIdentity, RelationshipType, ResolvedEntity,
+        ResolvedRelationship, compare_entity_context, relationship_store_key, resolve_entities,
+        resolve_relationships,
     },
     evidence::UnitInterval,
     fixture_validation::{FixtureCase, FixtureCorpus, FixtureSelector},
@@ -263,6 +264,157 @@ fn relationship_builder_derives_every_current_fixture_gold_relationship() {
 }
 
 #[test]
+fn comparison_accepts_current_fixture_gold_contract() {
+    let corpus = FixtureCorpus::load(repo_root()).unwrap();
+
+    for case in &corpus.cases {
+        let store = HotContextStore::load_fixture_case(case).unwrap();
+        let derived_entities = resolve_entities(&store);
+        let derived_relationships = resolve_relationships(&store, &derived_entities);
+        let expected_entities: Vec<ResolvedEntity> =
+            serde_json::from_value(case.expected["entities"].clone()).unwrap();
+        let expected_relationships: Vec<ResolvedRelationship> =
+            serde_json::from_value(case.expected["relationships"].clone()).unwrap();
+
+        let comparison = compare_entity_context(
+            &expected_entities,
+            &expected_relationships,
+            &derived_entities,
+            &derived_relationships,
+        );
+
+        assert!(
+            !comparison.has_expected_mismatches(),
+            "derived entity context mismatched expected gold for {}:\n{comparison:#?}",
+            case.registry_entry.id
+        );
+    }
+}
+
+#[test]
+fn comparison_reports_extra_entities_and_relationships_between_gold_entities() {
+    let expected_entities = vec![
+        test_entity("service:a", EntityKind::Service, 0.99),
+        test_entity("service:b", EntityKind::Service, 0.99),
+    ];
+    let expected_relationships = Vec::new();
+    let mut derived_entities = expected_entities.clone();
+    derived_entities.push(test_entity("instance:a-1", EntityKind::Instance, 0.98));
+    let derived_relationships = vec![test_relationship(
+        "service:a",
+        RelationshipType::Calls,
+        "service:b",
+        0.98,
+    )];
+
+    let comparison = compare_entity_context(
+        &expected_entities,
+        &expected_relationships,
+        &derived_entities,
+        &derived_relationships,
+    );
+
+    assert!(!comparison.has_expected_mismatches());
+    assert_eq!(comparison.extra_entities, vec!["instance:a-1"]);
+    assert_eq!(
+        comparison.extra_relationships,
+        vec![RelationshipIdentity {
+            src: "service:a".to_string(),
+            relationship_type: RelationshipType::Calls,
+            dst: "service:b".to_string(),
+        }]
+    );
+}
+
+#[test]
+fn comparison_checks_confidence_discriminators_and_alternatives() {
+    let mut expected = test_entity("service:payments@stable", EntityKind::Service, 0.95);
+    expected.discriminators.insert(
+        "service.instance.id".to_string(),
+        json!(["payments-7a", "payments-7b"]),
+    );
+    expected
+        .discriminators
+        .insert("rollout".to_string(), json!("stable"));
+    expected.alternatives.push(EntityAlternative {
+        id: "service:payments@canary".to_string(),
+        reason: Some("same service.name".to_string()),
+        confidence: Some(UnitInterval(0.05)),
+    });
+
+    let mut actual = expected.clone();
+    actual.confidence = UnitInterval(0.70);
+    actual.discriminators.insert(
+        "service.instance.id".to_string(),
+        json!(["payments-7b", "payments-7a"]),
+    );
+    actual
+        .discriminators
+        .insert("rollout".to_string(), json!("canary"));
+    actual.alternatives[0].confidence = Some(UnitInterval(0.30));
+
+    let comparison = compare_entity_context(&[expected], &[], &[actual], &[]);
+
+    assert_eq!(comparison.entity_confidence_mismatches.len(), 1);
+    assert_eq!(comparison.entity_discriminator_mismatches.len(), 1);
+    assert_eq!(
+        comparison.entity_discriminator_mismatches[0].field,
+        "discriminators.rollout"
+    );
+    assert_eq!(comparison.entity_alternative_mismatches.len(), 1);
+    assert_eq!(
+        comparison.entity_alternative_mismatches[0].field,
+        "alternatives.service:payments@canary.confidence"
+    );
+}
+
+#[test]
+fn comparison_checks_unresolved_markers_and_relationship_details() {
+    let mut expected_entity = test_entity("service:payments@unresolved", EntityKind::Service, 0.40);
+    expected_entity.unresolved = true;
+    expected_entity.missing_attributes = vec![
+        "service.version".to_string(),
+        "service.instance.id".to_string(),
+    ];
+    expected_entity.estimated_share = Some(UnitInterval(0.18));
+    let mut actual_entity = expected_entity.clone();
+    actual_entity.unresolved = false;
+    actual_entity.missing_attributes = vec!["service.version".to_string()];
+    actual_entity.estimated_share = None;
+
+    let mut expected_relationship = test_relationship(
+        "service:checkout",
+        RelationshipType::ReadsFrom,
+        "db:orders-pg",
+        0.97,
+    );
+    expected_relationship.evidence = vec!["trace:t-0001".to_string()];
+    expected_relationship
+        .attributes
+        .insert("role".to_string(), json!("primary"));
+    let mut actual_relationship = expected_relationship.clone();
+    actual_relationship.confidence = UnitInterval(0.80);
+    actual_relationship.evidence.clear();
+    actual_relationship
+        .attributes
+        .insert("role".to_string(), json!("replica"));
+
+    let comparison = compare_entity_context(
+        &[expected_entity],
+        &[expected_relationship],
+        &[actual_entity],
+        &[actual_relationship],
+    );
+
+    assert_eq!(comparison.entity_unresolved_mismatches.len(), 1);
+    assert_eq!(comparison.entity_missing_attribute_mismatches.len(), 1);
+    assert_eq!(comparison.entity_estimated_share_mismatches.len(), 1);
+    assert_eq!(comparison.relationship_confidence_mismatches.len(), 1);
+    assert_eq!(comparison.missing_relationship_evidence.len(), 1);
+    assert_eq!(comparison.relationship_attribute_mismatches.len(), 1);
+}
+
+#[test]
 fn relationship_builder_preserves_retry_and_cache_fallback_attributes() {
     let retry_store =
         HotContextStore::load_fixture_case(fixture_case("retry-storm-amplification")).unwrap();
@@ -433,6 +585,36 @@ fn relationship<'a>(
                 && relationship.dst == dst
         })
         .expect("relationship should exist")
+}
+
+fn test_entity(id: &str, kind: EntityKind, confidence: f64) -> ResolvedEntity {
+    ResolvedEntity {
+        id: id.to_string(),
+        kind,
+        from: Vec::new(),
+        confidence: UnitInterval(confidence),
+        discriminators: BTreeMap::new(),
+        alternatives: Vec::new(),
+        unresolved: false,
+        missing_attributes: Vec::new(),
+        estimated_share: None,
+    }
+}
+
+fn test_relationship(
+    src: &str,
+    relationship_type: RelationshipType,
+    dst: &str,
+    confidence: f64,
+) -> ResolvedRelationship {
+    ResolvedRelationship {
+        src: src.to_string(),
+        relationship_type,
+        dst: dst.to_string(),
+        confidence: UnitInterval(confidence),
+        evidence: Vec::new(),
+        attributes: BTreeMap::new(),
+    }
 }
 
 fn repo_root() -> &'static Path {

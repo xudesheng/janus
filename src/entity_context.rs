@@ -49,6 +49,8 @@ pub struct ResolvedRelationship {
     pub attributes: BTreeMap<String, Value>,
 }
 
+pub const ENTITY_CONTEXT_CONFIDENCE_TOLERANCE: f64 = 0.05;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum EntityKind {
@@ -98,6 +100,90 @@ impl RelationshipType {
             Self::SharesResourceWith => "shares-resource-with",
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct EntityContextComparison {
+    pub missing_entities: Vec<String>,
+    pub extra_entities: Vec<String>,
+    pub entity_kind_mismatches: Vec<EntityKindMismatch>,
+    pub entity_confidence_mismatches: Vec<EntityConfidenceMismatch>,
+    pub entity_source_mismatches: Vec<EntityFieldMismatch>,
+    pub entity_discriminator_mismatches: Vec<EntityFieldMismatch>,
+    pub entity_alternative_mismatches: Vec<EntityFieldMismatch>,
+    pub entity_unresolved_mismatches: Vec<EntityFieldMismatch>,
+    pub entity_missing_attribute_mismatches: Vec<EntityFieldMismatch>,
+    pub entity_estimated_share_mismatches: Vec<EntityConfidenceMismatch>,
+    pub missing_relationships: Vec<RelationshipIdentity>,
+    pub extra_relationships: Vec<RelationshipIdentity>,
+    pub relationship_confidence_mismatches: Vec<RelationshipConfidenceMismatch>,
+    pub missing_relationship_evidence: Vec<RelationshipFieldMismatch>,
+    pub relationship_attribute_mismatches: Vec<RelationshipFieldMismatch>,
+}
+
+impl EntityContextComparison {
+    pub fn has_expected_mismatches(&self) -> bool {
+        !self.missing_entities.is_empty()
+            || !self.entity_kind_mismatches.is_empty()
+            || !self.entity_confidence_mismatches.is_empty()
+            || !self.entity_source_mismatches.is_empty()
+            || !self.entity_discriminator_mismatches.is_empty()
+            || !self.entity_alternative_mismatches.is_empty()
+            || !self.entity_unresolved_mismatches.is_empty()
+            || !self.entity_missing_attribute_mismatches.is_empty()
+            || !self.entity_estimated_share_mismatches.is_empty()
+            || !self.missing_relationships.is_empty()
+            || !self.relationship_confidence_mismatches.is_empty()
+            || !self.missing_relationship_evidence.is_empty()
+            || !self.relationship_attribute_mismatches.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EntityKindMismatch {
+    pub id: String,
+    pub expected: EntityKind,
+    pub actual: EntityKind,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EntityConfidenceMismatch {
+    pub id: String,
+    pub field: String,
+    pub expected: Option<UnitInterval>,
+    pub actual: Option<UnitInterval>,
+    pub tolerance: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EntityFieldMismatch {
+    pub id: String,
+    pub field: String,
+    pub expected: Value,
+    pub actual: Option<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RelationshipIdentity {
+    pub src: String,
+    pub relationship_type: RelationshipType,
+    pub dst: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RelationshipConfidenceMismatch {
+    pub relationship: RelationshipIdentity,
+    pub expected: UnitInterval,
+    pub actual: UnitInterval,
+    pub tolerance: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RelationshipFieldMismatch {
+    pub relationship: RelationshipIdentity,
+    pub field: String,
+    pub expected: Value,
+    pub actual: Option<Value>,
 }
 
 pub fn resolve_entities(store: &HotContextStore) -> Vec<ResolvedEntity> {
@@ -180,6 +266,381 @@ pub fn resolve_relationships(
 
 pub fn relationship_store_key(src: &str, relationship_type: RelationshipType, dst: &str) -> String {
     format!("relationship:{src}|{}|{dst}", relationship_type.as_str())
+}
+
+pub fn compare_entity_context(
+    expected_entities: &[ResolvedEntity],
+    expected_relationships: &[ResolvedRelationship],
+    derived_entities: &[ResolvedEntity],
+    derived_relationships: &[ResolvedRelationship],
+) -> EntityContextComparison {
+    let expected_entity_by_id = expected_entities
+        .iter()
+        .map(|entity| (entity.id.as_str(), entity))
+        .collect::<BTreeMap<_, _>>();
+    let derived_entity_by_id = derived_entities
+        .iter()
+        .map(|entity| (entity.id.as_str(), entity))
+        .collect::<BTreeMap<_, _>>();
+    let expected_relationship_by_id = expected_relationships
+        .iter()
+        .map(|relationship| (RelationshipIdentity::from(relationship), relationship))
+        .collect::<BTreeMap<_, _>>();
+    let derived_relationship_by_id = derived_relationships
+        .iter()
+        .map(|relationship| (RelationshipIdentity::from(relationship), relationship))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut comparison = EntityContextComparison::default();
+
+    for expected in expected_entities {
+        let Some(actual) = derived_entity_by_id.get(expected.id.as_str()) else {
+            comparison.missing_entities.push(expected.id.clone());
+            continue;
+        };
+
+        compare_entity(expected, actual, &mut comparison);
+    }
+
+    comparison.extra_entities = derived_entity_by_id
+        .keys()
+        .filter(|id| !expected_entity_by_id.contains_key(**id))
+        .map(|id| (*id).to_string())
+        .collect();
+
+    for expected in expected_relationships {
+        let identity = RelationshipIdentity::from(expected);
+        let Some(actual) = derived_relationship_by_id.get(&identity) else {
+            comparison.missing_relationships.push(identity);
+            continue;
+        };
+
+        compare_relationship(expected, actual, &identity, &mut comparison);
+    }
+
+    comparison.extra_relationships = derived_relationship_by_id
+        .keys()
+        .filter(|identity| !expected_relationship_by_id.contains_key(*identity))
+        .cloned()
+        .collect();
+
+    comparison
+}
+
+impl From<&ResolvedRelationship> for RelationshipIdentity {
+    fn from(relationship: &ResolvedRelationship) -> Self {
+        Self {
+            src: relationship.src.clone(),
+            relationship_type: relationship.relationship_type,
+            dst: relationship.dst.clone(),
+        }
+    }
+}
+
+fn compare_entity(
+    expected: &ResolvedEntity,
+    actual: &ResolvedEntity,
+    comparison: &mut EntityContextComparison,
+) {
+    if actual.kind != expected.kind {
+        comparison.entity_kind_mismatches.push(EntityKindMismatch {
+            id: expected.id.clone(),
+            expected: expected.kind,
+            actual: actual.kind,
+        });
+    }
+
+    if !within_confidence_tolerance(expected.confidence, actual.confidence) {
+        comparison
+            .entity_confidence_mismatches
+            .push(EntityConfidenceMismatch {
+                id: expected.id.clone(),
+                field: "confidence".to_string(),
+                expected: Some(expected.confidence),
+                actual: Some(actual.confidence),
+                tolerance: ENTITY_CONTEXT_CONFIDENCE_TOLERANCE,
+            });
+    }
+
+    if !is_subset(&expected.from, &actual.from) {
+        comparison
+            .entity_source_mismatches
+            .push(EntityFieldMismatch {
+                id: expected.id.clone(),
+                field: "from".to_string(),
+                expected: string_array_value(&expected.from),
+                actual: Some(string_array_value(&actual.from)),
+            });
+    }
+
+    for (key, expected_value) in &expected.discriminators {
+        match actual.discriminators.get(key) {
+            Some(actual_value) if json_values_equivalent(expected_value, actual_value) => {}
+            actual_value => comparison
+                .entity_discriminator_mismatches
+                .push(EntityFieldMismatch {
+                    id: expected.id.clone(),
+                    field: format!("discriminators.{key}"),
+                    expected: expected_value.clone(),
+                    actual: actual_value.cloned(),
+                }),
+        }
+    }
+
+    for expected_alternative in &expected.alternatives {
+        match actual
+            .alternatives
+            .iter()
+            .find(|alternative| alternative.id == expected_alternative.id)
+        {
+            Some(actual_alternative) => compare_alternative(
+                &expected.id,
+                expected_alternative,
+                actual_alternative,
+                comparison,
+            ),
+            None => comparison
+                .entity_alternative_mismatches
+                .push(EntityFieldMismatch {
+                    id: expected.id.clone(),
+                    field: format!("alternatives.{}", expected_alternative.id),
+                    expected: alternative_value(expected_alternative),
+                    actual: None,
+                }),
+        }
+    }
+
+    if expected.unresolved != actual.unresolved {
+        comparison
+            .entity_unresolved_mismatches
+            .push(EntityFieldMismatch {
+                id: expected.id.clone(),
+                field: "unresolved".to_string(),
+                expected: Value::Bool(expected.unresolved),
+                actual: Some(Value::Bool(actual.unresolved)),
+            });
+    }
+
+    if string_set(&expected.missing_attributes) != string_set(&actual.missing_attributes) {
+        comparison
+            .entity_missing_attribute_mismatches
+            .push(EntityFieldMismatch {
+                id: expected.id.clone(),
+                field: "missing_attributes".to_string(),
+                expected: string_array_value(&expected.missing_attributes),
+                actual: Some(string_array_value(&actual.missing_attributes)),
+            });
+    }
+
+    match (expected.estimated_share, actual.estimated_share) {
+        (Some(expected_share), Some(actual_share)) => {
+            if !within_confidence_tolerance(expected_share, actual_share) {
+                comparison
+                    .entity_estimated_share_mismatches
+                    .push(EntityConfidenceMismatch {
+                        id: expected.id.clone(),
+                        field: "estimated_share".to_string(),
+                        expected: Some(expected_share),
+                        actual: Some(actual_share),
+                        tolerance: ENTITY_CONTEXT_CONFIDENCE_TOLERANCE,
+                    });
+            }
+        }
+        (Some(expected_share), None) => {
+            comparison
+                .entity_estimated_share_mismatches
+                .push(EntityConfidenceMismatch {
+                    id: expected.id.clone(),
+                    field: "estimated_share".to_string(),
+                    expected: Some(expected_share),
+                    actual: None,
+                    tolerance: ENTITY_CONTEXT_CONFIDENCE_TOLERANCE,
+                })
+        }
+        (None, Some(actual_share)) => {
+            comparison
+                .entity_estimated_share_mismatches
+                .push(EntityConfidenceMismatch {
+                    id: expected.id.clone(),
+                    field: "estimated_share".to_string(),
+                    expected: None,
+                    actual: Some(actual_share),
+                    tolerance: ENTITY_CONTEXT_CONFIDENCE_TOLERANCE,
+                })
+        }
+        (None, None) => {}
+    }
+}
+
+fn compare_alternative(
+    entity_id: &str,
+    expected: &EntityAlternative,
+    actual: &EntityAlternative,
+    comparison: &mut EntityContextComparison,
+) {
+    if expected.reason != actual.reason {
+        comparison
+            .entity_alternative_mismatches
+            .push(EntityFieldMismatch {
+                id: entity_id.to_string(),
+                field: format!("alternatives.{}.reason", expected.id),
+                expected: optional_string_value(expected.reason.as_deref()),
+                actual: Some(optional_string_value(actual.reason.as_deref())),
+            });
+    }
+
+    match (expected.confidence, actual.confidence) {
+        (Some(expected_confidence), Some(actual_confidence)) => {
+            if !within_confidence_tolerance(expected_confidence, actual_confidence) {
+                comparison
+                    .entity_alternative_mismatches
+                    .push(EntityFieldMismatch {
+                        id: entity_id.to_string(),
+                        field: format!("alternatives.{}.confidence", expected.id),
+                        expected: Value::from(expected_confidence.0),
+                        actual: Some(Value::from(actual_confidence.0)),
+                    });
+            }
+        }
+        (Some(expected_confidence), None) => {
+            comparison
+                .entity_alternative_mismatches
+                .push(EntityFieldMismatch {
+                    id: entity_id.to_string(),
+                    field: format!("alternatives.{}.confidence", expected.id),
+                    expected: Value::from(expected_confidence.0),
+                    actual: None,
+                })
+        }
+        (None, Some(actual_confidence)) => {
+            comparison
+                .entity_alternative_mismatches
+                .push(EntityFieldMismatch {
+                    id: entity_id.to_string(),
+                    field: format!("alternatives.{}.confidence", expected.id),
+                    expected: Value::Null,
+                    actual: Some(Value::from(actual_confidence.0)),
+                })
+        }
+        (None, None) => {}
+    }
+}
+
+fn compare_relationship(
+    expected: &ResolvedRelationship,
+    actual: &ResolvedRelationship,
+    identity: &RelationshipIdentity,
+    comparison: &mut EntityContextComparison,
+) {
+    if !within_confidence_tolerance(expected.confidence, actual.confidence) {
+        comparison
+            .relationship_confidence_mismatches
+            .push(RelationshipConfidenceMismatch {
+                relationship: identity.clone(),
+                expected: expected.confidence,
+                actual: actual.confidence,
+                tolerance: ENTITY_CONTEXT_CONFIDENCE_TOLERANCE,
+            });
+    }
+
+    if !is_subset(&expected.evidence, &actual.evidence) {
+        comparison
+            .missing_relationship_evidence
+            .push(RelationshipFieldMismatch {
+                relationship: identity.clone(),
+                field: "evidence".to_string(),
+                expected: string_array_value(&expected.evidence),
+                actual: Some(string_array_value(&actual.evidence)),
+            });
+    }
+
+    for (key, expected_value) in &expected.attributes {
+        match actual.attributes.get(key) {
+            Some(actual_value) if json_values_equivalent(expected_value, actual_value) => {}
+            actual_value => {
+                comparison
+                    .relationship_attribute_mismatches
+                    .push(RelationshipFieldMismatch {
+                        relationship: identity.clone(),
+                        field: format!("attributes.{key}"),
+                        expected: expected_value.clone(),
+                        actual: actual_value.cloned(),
+                    })
+            }
+        }
+    }
+}
+
+fn within_confidence_tolerance(expected: UnitInterval, actual: UnitInterval) -> bool {
+    (expected.0 - actual.0).abs() <= ENTITY_CONTEXT_CONFIDENCE_TOLERANCE + 1e-9
+}
+
+fn is_subset(expected_subset: &[String], actual: &[String]) -> bool {
+    let actual = string_set(actual);
+    expected_subset
+        .iter()
+        .all(|expected| actual.contains(expected.as_str()))
+}
+
+fn string_set(values: &[String]) -> BTreeSet<&str> {
+    values.iter().map(String::as_str).collect()
+}
+
+fn string_array_value(values: &[String]) -> Value {
+    Value::Array(
+        string_set(values)
+            .into_iter()
+            .map(|value| Value::String(value.to_string()))
+            .collect(),
+    )
+}
+
+fn optional_string_value(value: Option<&str>) -> Value {
+    value
+        .map(|value| Value::String(value.to_string()))
+        .unwrap_or(Value::Null)
+}
+
+fn alternative_value(alternative: &EntityAlternative) -> Value {
+    let mut value = Map::new();
+    value.insert("id".to_string(), Value::String(alternative.id.clone()));
+    if let Some(reason) = &alternative.reason {
+        value.insert("reason".to_string(), Value::String(reason.clone()));
+    }
+    if let Some(confidence) = alternative.confidence {
+        value.insert("confidence".to_string(), Value::from(confidence.0));
+    }
+    Value::Object(value)
+}
+
+fn json_values_equivalent(expected: &Value, actual: &Value) -> bool {
+    match (expected, actual) {
+        (Value::Array(expected_values), Value::Array(actual_values)) => {
+            json_value_set(expected_values) == json_value_set(actual_values)
+        }
+        _ => expected == actual,
+    }
+}
+
+fn json_value_set(values: &[Value]) -> BTreeSet<String> {
+    values.iter().map(canonical_json).collect()
+}
+
+fn canonical_json(value: &Value) -> String {
+    match value {
+        Value::Array(values) => {
+            let items = values.iter().map(canonical_json).collect::<Vec<_>>();
+            format!("[{}]", items.join(","))
+        }
+        Value::Object(map) => {
+            let items = map
+                .iter()
+                .map(|(key, value)| format!("{key}:{}", canonical_json(value)))
+                .collect::<BTreeSet<_>>();
+            format!("{{{}}}", items.into_iter().collect::<Vec<_>>().join(","))
+        }
+        _ => serde_json::to_string(value).expect("json value should serialize"),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1515,15 +1976,22 @@ fn insert_external_api_from_span(
         return;
     }
 
-    insert_or_merge(
-        entities,
-        resolved_entity(
-            format!("external-api:{peer_service}"),
-            EntityKind::ExternalApi,
-            vec![format!("trace:{}", record.key.as_str())],
-            UnitInterval(0.90),
-        ),
+    let mut entity = resolved_entity(
+        format!("external-api:{peer_service}"),
+        EntityKind::ExternalApi,
+        vec![format!("trace:{}", record.key.as_str())],
+        UnitInterval(0.90),
     );
+    entity
+        .discriminators
+        .insert("peer.service".to_string(), json!(peer_service));
+    if let Some(server_address) = str_attr(attributes, "server.address") {
+        entity
+            .discriminators
+            .insert("server.address".to_string(), json!(server_address));
+    }
+
+    insert_or_merge(entities, entity);
 }
 
 fn insert_record_entity_hint(
