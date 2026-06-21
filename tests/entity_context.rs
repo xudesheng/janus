@@ -1,10 +1,11 @@
 use janus::{
     entity_context::{
         EntityKind, RelationshipType, ResolvedEntity, ResolvedRelationship, relationship_store_key,
+        resolve_entities,
     },
     evidence::UnitInterval,
     fixture_validation::{FixtureCase, FixtureCorpus, FixtureSelector},
-    hot_context_store::{HotContextStore, StoredRecordKind},
+    hot_context_store::{HotContextStore, SourceKey, StoredRecord, StoredRecordKind},
 };
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::Path};
@@ -53,6 +54,44 @@ fn ambiguous_fixture_relationships_deserialize_into_phase1_model() {
 }
 
 #[test]
+fn all_current_fixture_entity_and_relationship_gold_deserializes() {
+    let corpus = FixtureCorpus::load(repo_root()).unwrap();
+
+    for case in &corpus.cases {
+        serde_json::from_value::<Vec<ResolvedEntity>>(case.expected["entities"].clone())
+            .unwrap_or_else(|error| {
+                panic!(
+                    "failed to deserialize expected entities for {}: {error}",
+                    case.registry_entry.id
+                )
+            });
+        serde_json::from_value::<Vec<ResolvedRelationship>>(case.expected["relationships"].clone())
+            .unwrap_or_else(|error| {
+                panic!(
+                    "failed to deserialize expected relationships for {}: {error}",
+                    case.registry_entry.id
+                )
+            });
+    }
+
+    let deploy_entities: Vec<ResolvedEntity> =
+        serde_json::from_value(fixture_case("deploy-bad-rollout").expected["entities"].clone())
+            .unwrap();
+    assert_eq!(
+        entity(&deploy_entities, "db:orders-pg").kind,
+        EntityKind::Database
+    );
+
+    let traffic_entities: Vec<ResolvedEntity> =
+        serde_json::from_value(fixture_case("traffic-shift-hotspot").expected["entities"].clone())
+            .unwrap();
+    assert_eq!(
+        entity(&traffic_entities, "shard:orders-shard-3").kind,
+        EntityKind::Partition
+    );
+}
+
+#[test]
 fn relationship_model_serializes_to_fixture_shape_and_store_key() {
     let mut attributes = BTreeMap::new();
     attributes.insert("role".to_string(), json!("primary"));
@@ -76,6 +115,118 @@ fn relationship_model_serializes_to_fixture_shape_and_store_key() {
             "db:orders-pg"
         ),
         "relationship:service:checkout|reads-from|db:orders-pg"
+    );
+}
+
+#[test]
+fn resolver_keeps_ambiguous_payments_identities_separate() {
+    let case = fixture_case("ambiguous-entity-resolution");
+    let store = HotContextStore::load_fixture_case(case).unwrap();
+    let entities = resolve_entities(&store);
+
+    let canary = entity(&entities, "service:payments@canary");
+    assert_eq!(canary.kind, EntityKind::Service);
+    assert_eq!(canary.from, vec!["res:payments-canary"]);
+    assert_eq!(canary.confidence, UnitInterval(0.96));
+    assert_eq!(canary.discriminators["service.version"], json!("5.0.0-rc1"));
+    assert_eq!(
+        canary.discriminators["service.instance.id"],
+        json!("payments-canary-001")
+    );
+    assert_eq!(canary.discriminators["rollout"], json!("canary"));
+    assert!(canary.alternatives.iter().any(|alternative| {
+        alternative.id == "service:payments@stable"
+            && alternative.reason.as_deref() == Some("same service.name")
+            && alternative.confidence == Some(UnitInterval(0.04))
+    }));
+
+    let stable = entity(&entities, "service:payments@stable");
+    assert_eq!(
+        stable.from,
+        vec!["res:payments-stable-a", "res:payments-stable-b"]
+    );
+    assert_eq!(stable.confidence, UnitInterval(0.95));
+    assert_eq!(stable.discriminators["service.version"], json!("4.3.2"));
+    assert_eq!(
+        stable.discriminators["service.instance.id"],
+        json!(["payments-7a", "payments-7b"])
+    );
+
+    let unresolved = entity(&entities, "service:payments@unresolved");
+    assert!(unresolved.unresolved);
+    assert_eq!(unresolved.confidence, UnitInterval(0.40));
+    assert_eq!(
+        unresolved.missing_attributes,
+        vec!["service.version", "service.instance.id"]
+    );
+    assert_eq!(unresolved.estimated_share, Some(UnitInterval(0.18)));
+    assert!(unresolved.alternatives.iter().any(|alternative| {
+        alternative.id == "service:payments@canary"
+            && alternative.confidence == Some(UnitInterval(0.50))
+    }));
+    assert!(unresolved.alternatives.iter().any(|alternative| {
+        alternative.id == "service:payments@stable"
+            && alternative.confidence == Some(UnitInterval(0.50))
+    }));
+
+    assert!(
+        !entities
+            .iter()
+            .any(|entity| entity.id == "service:payments"),
+        "the resolver must not emit the blended service.name aggregate"
+    );
+}
+
+#[test]
+fn resolver_derives_every_current_fixture_gold_entity_id_and_kind() {
+    let corpus = FixtureCorpus::load(repo_root()).unwrap();
+
+    for case in &corpus.cases {
+        let store = HotContextStore::load_fixture_case(case).unwrap();
+        let derived = resolve_entities(&store);
+        let expected: Vec<ResolvedEntity> =
+            serde_json::from_value(case.expected["entities"].clone()).unwrap();
+
+        for expected_entity in expected {
+            let actual = derived
+                .iter()
+                .find(|entity| entity.id == expected_entity.id)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "resolver missed expected entity {} for {}",
+                        expected_entity.id, case.registry_entry.id
+                    )
+                });
+            assert_eq!(
+                actual.kind, expected_entity.kind,
+                "resolver produced wrong kind for {} in {}",
+                expected_entity.id, case.registry_entry.id
+            );
+        }
+    }
+}
+
+#[test]
+fn resolver_ignores_derived_gold_entity_records() {
+    let mut store = HotContextStore::new();
+    store
+        .insert_record(StoredRecord {
+            key: SourceKey::new("service:gold-only"),
+            kind: StoredRecordKind::Entity,
+            time_window: None,
+            entities: vec!["service:gold-only".to_string()],
+            payload: json!({
+                "id": "service:gold-only",
+                "kind": "service",
+                "from": ["res:missing"],
+                "confidence": 0.99
+            }),
+        })
+        .unwrap();
+
+    assert!(
+        resolve_entities(&store).is_empty(),
+        "resolver must derive from raw source records, not expected/gold entity records"
     );
 }
 

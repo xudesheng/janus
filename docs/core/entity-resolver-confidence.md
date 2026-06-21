@@ -191,20 +191,24 @@ resolution and fixture comparison.
 
 ## Entity Identity Rules
 
-Entity ids should follow the fixture convention:
+Entity ids should follow the fixture id-prefix convention:
 
 ```text
-{kind}:{name}
-{kind}:{name}@{variant}
+{id-prefix}:{name}
+{id-prefix}:{name}@{variant}
 ```
 
-Minimum supported kinds:
+The id prefix is not always identical to the entity kind. The resolver must
+emit both fields correctly because fixture comparison checks exact id and exact
+kind.
+
+Minimum supported kind values:
 
 - `service`;
 - `route`;
 - `instance`;
 - `pod`;
-- `db`;
+- `database`;
 - `queue`;
 - `cache`;
 - `external-api`;
@@ -213,7 +217,26 @@ Minimum supported kinds:
 - `deployment`;
 - `host`;
 - `container`;
-- `shard`.
+- `partition`.
+
+Current id-prefix mapping:
+
+| Kind | Accepted id prefixes |
+|---|---|
+| `service` | `service:` |
+| `route` | `route:` |
+| `instance` | `instance:` |
+| `pod` | `pod:` |
+| `database` | `db:` |
+| `queue` | `queue:` |
+| `cache` | `cache:`, `infra:`, or `db:` when the fixture models the cache that way |
+| `external-api` | `external-api:` |
+| `tenant` | `tenant:` |
+| `infra` | `infra:` |
+| `deployment` | `deployment:` |
+| `host` | `host:` |
+| `container` | `container:` |
+| `partition` | `shard:` |
 
 The first slice does not need perfect semantic-convention coverage. It does need
 deterministic rules for the current fixtures.
@@ -281,10 +304,10 @@ the fixture already treats the value as a route.
 Database, queue, cache, and external API identities should come from resource or
 span attributes when present:
 
-- database names or systems -> `db:<name>`;
+- database resources -> `db:<name>` with kind `database`;
 - queue names -> `queue:<name>`;
-- cache or redis-like resources -> `cache:<name>` or `infra:<name>` when the
-  fixture already uses `infra`;
+- cache or redis-like resources -> `cache:<name>`, `infra:<name>`, or
+  `db:<name>` with kind `cache` when the fixture models the cache that way;
 - external service or provider names -> `external-api:<name>`.
 
 When a span only has an operation name such as `stripe.charge`, use a
