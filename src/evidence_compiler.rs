@@ -1,6 +1,6 @@
 use crate::{
     derived_context::{DerivedContext, TimelineMarker, WindowDelta},
-    entity_context::ResolvedRelationship,
+    entity_context::{RelationshipType, ResolvedRelationship},
     evidence::{
         EvidenceBundle, EvidenceDirection, EvidenceFreshness, EvidenceItem, EvidenceKind,
         SourceRef, SourceRefs, SourceSignal, TimeWindow, UnitInterval,
@@ -218,7 +218,7 @@ pub fn generate_evidence_candidates(
     push_missing_data_candidates(input, &mut candidates)?;
     push_counter_evidence_candidates(input, &mut candidates)?;
 
-    Ok(candidates)
+    score_evidence_candidates(input, candidates)
 }
 
 pub fn load_expected_compilation(
@@ -306,6 +306,1087 @@ pub fn apply_compiler_token_estimates(
     bundle.budget.tokens_used = tokens_used;
 
     Ok(())
+}
+
+pub fn score_evidence_candidates(
+    input: EvidenceCompilerInput<'_>,
+    candidates: Vec<EvidenceCandidate>,
+) -> Result<Vec<EvidenceCandidate>, EvidenceCompileError> {
+    let mut scored = Vec::with_capacity(candidates.len());
+
+    for mut candidate in candidates {
+        apply_evidence_strength_score(input, &mut candidate);
+        candidate.item.token_cost = estimate_evidence_item_tokens(&candidate.item)?;
+        scored.push(candidate);
+    }
+
+    Ok(scored)
+}
+
+pub fn rank_suspected_causes_from_candidates(
+    input: EvidenceCompilerInput<'_>,
+    candidates: &[EvidenceCandidate],
+) -> Vec<SuspectedCause> {
+    let relationships = resolved_relationships(input.store);
+    let mut suspects = BTreeMap::<String, SuspectDraft>::new();
+
+    for candidate in candidates {
+        match candidate.item.direction {
+            EvidenceDirection::Supports => {
+                for entity in causal_entities_for_candidate(candidate, &relationships) {
+                    let multiplier = entity_causal_multiplier(candidate, entity.as_str());
+                    let contribution =
+                        candidate.item.strength.0 * support_weight(candidate) * multiplier;
+                    if contribution <= 0.0 {
+                        continue;
+                    }
+
+                    let suspect = suspects
+                        .entry(entity.clone())
+                        .or_insert_with(|| SuspectDraft::new(entity));
+                    suspect.support_score += contribution;
+                    suspect.supporting.push(candidate.candidate_id.clone());
+                    suspect.add_reasons(reason_tokens_for_candidate(input, candidate));
+                }
+            }
+            EvidenceDirection::Weakens | EvidenceDirection::Contradicts => {
+                for entity in causal_entities_for_candidate(candidate, &relationships) {
+                    let contribution = candidate.item.strength.0 * counter_weight(candidate);
+                    if contribution <= 0.0 {
+                        continue;
+                    }
+
+                    let suspect = suspects
+                        .entry(entity.clone())
+                        .or_insert_with(|| SuspectDraft::new(entity));
+                    suspect.counter_score += contribution;
+                    suspect.counter.push(candidate.candidate_id.clone());
+                    suspect.add_reasons(reason_tokens_for_candidate(input, candidate));
+                }
+            }
+            EvidenceDirection::Neutral => {}
+        }
+
+        if candidate.source == EvidenceCandidateSource::MissingData {
+            add_under_determined_suspect(&mut suspects, candidate);
+        }
+    }
+
+    roll_up_runtime_child_support(&relationships, &mut suspects);
+
+    let mut ranked = suspects
+        .into_values()
+        .filter(|suspect| suspect.is_material())
+        .map(SuspectDraft::into_suspected_cause)
+        .collect::<Vec<_>>();
+
+    ranked.sort_by(|left, right| {
+        right
+            .score
+            .0
+            .total_cmp(&left.score.0)
+            .then_with(|| left.entity.cmp(&right.entity))
+    });
+
+    for (index, cause) in ranked.iter_mut().enumerate() {
+        cause.rank = (index + 1) as u32;
+    }
+
+    ranked
+}
+
+#[derive(Debug, Clone)]
+struct SuspectDraft {
+    entity: String,
+    support_score: f64,
+    counter_score: f64,
+    reasons: BTreeSet<String>,
+    supporting: Vec<String>,
+    counter: Vec<String>,
+}
+
+impl SuspectDraft {
+    fn new(entity: String) -> Self {
+        Self {
+            entity,
+            support_score: 0.0,
+            counter_score: 0.0,
+            reasons: BTreeSet::new(),
+            supporting: Vec::new(),
+            counter: Vec::new(),
+        }
+    }
+
+    fn add_reasons(&mut self, reasons: Vec<String>) {
+        self.reasons.extend(reasons);
+    }
+
+    fn is_material(&self) -> bool {
+        self.entity == "under-determined"
+            || self.support_score >= 0.20
+            || self.counter_score >= 0.45
+    }
+
+    fn into_suspected_cause(mut self) -> SuspectedCause {
+        self.supporting = dedupe_stable(self.supporting);
+        self.counter = dedupe_stable(self.counter);
+
+        let score = causal_suspicion_score(self.support_score, self.counter_score);
+        let reasons = self.reasons.into_iter().collect::<Vec<_>>();
+        let note = if self.entity == "under-determined" {
+            Some("telemetry gaps make a confident concrete cause unsafe".to_string())
+        } else if score.0 < 0.20 && !self.counter.is_empty() {
+            Some(format!(
+                "{} is retained as a false-causality risk, not a likely cause",
+                self.entity
+            ))
+        } else {
+            None
+        };
+        let trap_note = if self.entity != "under-determined"
+            && self.counter_score >= self.support_score.max(0.20)
+        {
+            Some(format!(
+                "{} has stronger counter-evidence than causal support; downgrade the suspect",
+                self.entity
+            ))
+        } else {
+            None
+        };
+
+        SuspectedCause {
+            rank: 0,
+            entity: self.entity.clone(),
+            hypothesis: format!(
+                "{} is a plausible cause based on {}.",
+                self.entity,
+                if reasons.is_empty() {
+                    "available evidence".to_string()
+                } else {
+                    reasons.join(", ")
+                }
+            ),
+            score,
+            reasons,
+            supporting: self.supporting,
+            counter: self.counter,
+            note,
+            trap_note,
+        }
+    }
+}
+
+fn apply_evidence_strength_score(
+    input: EvidenceCompilerInput<'_>,
+    candidate: &mut EvidenceCandidate,
+) {
+    let source_ref_quality = source_ref_quality(input.store, &candidate.item);
+    candidate
+        .item
+        .confidence
+        .insert("source_ref_quality".to_string(), source_ref_quality);
+
+    match candidate.source {
+        EvidenceCandidateSource::MetricAnomaly => {
+            apply_metric_anomaly_strength(input, candidate, source_ref_quality);
+        }
+        EvidenceCandidateSource::LogPattern => {
+            apply_log_pattern_strength(input, candidate, source_ref_quality);
+        }
+        EvidenceCandidateSource::ChangeEvent | EvidenceCandidateSource::CounterEvidence
+            if candidate.item.kind == EvidenceKind::ChangeEvent
+                || has_source_signal(&candidate.item, SourceSignal::Change) =>
+        {
+            apply_change_strength(input, candidate, source_ref_quality);
+        }
+        EvidenceCandidateSource::TraceExemplar => {
+            apply_trace_strength(candidate, source_ref_quality);
+        }
+        EvidenceCandidateSource::DependencyEdge => {
+            apply_dependency_strength(input, candidate, source_ref_quality);
+        }
+        EvidenceCandidateSource::PreviousIncident => {
+            apply_previous_incident_strength(input, candidate, source_ref_quality);
+        }
+        EvidenceCandidateSource::MissingData => {
+            apply_missing_data_strength(candidate, source_ref_quality);
+        }
+        EvidenceCandidateSource::CounterEvidence => {
+            apply_counter_evidence_strength(candidate, source_ref_quality);
+        }
+        EvidenceCandidateSource::ChangeEvent => {
+            apply_change_strength(input, candidate, source_ref_quality);
+        }
+    }
+}
+
+fn apply_metric_anomaly_strength(
+    input: EvidenceCompilerInput<'_>,
+    candidate: &mut EvidenceCandidate,
+    source_ref_quality: UnitInterval,
+) {
+    let detector = anomaly_window_for_candidate(input, candidate)
+        .map(|window| window.detector_confidence)
+        .unwrap_or(UnitInterval(0.50));
+    let magnitude = anomaly_window_for_candidate(input, candidate)
+        .map(anomaly_magnitude_strength)
+        .unwrap_or(UnitInterval(0.50));
+    let coverage = if has_source_signal(&candidate.item, SourceSignal::Metric)
+        && has_source_signal(&candidate.item, SourceSignal::AnomalyWindow)
+    {
+        UnitInterval(1.0)
+    } else {
+        UnitInterval(0.70)
+    };
+
+    candidate
+        .item
+        .confidence
+        .insert("detector".to_string(), detector);
+    candidate
+        .item
+        .confidence
+        .insert("magnitude".to_string(), magnitude);
+    candidate
+        .item
+        .confidence
+        .insert("coverage".to_string(), coverage);
+
+    if detector.0 < 0.40 || note_contains(&candidate.item, "no anomaly") {
+        candidate.item.direction = EvidenceDirection::Weakens;
+        candidate.item.kind = EvidenceKind::CounterEvidence;
+    }
+
+    candidate.item.strength = weighted_unit_interval(&[
+        (detector, 0.35),
+        (magnitude, 0.25),
+        (coverage, 0.20),
+        (source_ref_quality, 0.20),
+    ]);
+}
+
+fn apply_log_pattern_strength(
+    input: EvidenceCompilerInput<'_>,
+    candidate: &mut EvidenceCandidate,
+    source_ref_quality: UnitInterval,
+) {
+    let pattern = log_pattern_for_candidate(input, candidate);
+    let severity = pattern
+        .map(|pattern| severity_strength(pattern.severity.as_str()))
+        .unwrap_or(UnitInterval(0.65));
+    let volume = pattern
+        .map(|pattern| UnitInterval((pattern.count as f64 / 3.0).clamp(0.30, 1.0)))
+        .unwrap_or(UnitInterval(0.50));
+    let exemplar_quality = if candidate.item.source_refs.iter().any(|source_ref| {
+        matches!(source_ref.signal, SourceSignal::Log) && !source_ref.r#ref.trim().is_empty()
+    }) {
+        UnitInterval(1.0)
+    } else {
+        UnitInterval(0.60)
+    };
+
+    candidate
+        .item
+        .confidence
+        .insert("severity".to_string(), severity);
+    candidate
+        .item
+        .confidence
+        .insert("volume".to_string(), volume);
+    candidate
+        .item
+        .confidence
+        .insert("exemplar_quality".to_string(), exemplar_quality);
+
+    candidate.item.strength = weighted_unit_interval(&[
+        (severity, 0.35),
+        (volume, 0.25),
+        (exemplar_quality, 0.20),
+        (source_ref_quality, 0.20),
+    ]);
+}
+
+fn apply_change_strength(
+    input: EvidenceCompilerInput<'_>,
+    candidate: &mut EvidenceCandidate,
+    source_ref_quality: UnitInterval,
+) {
+    let time_alignment = change_time_alignment(input, candidate);
+    let entity_specificity = if candidate.item.entities.is_empty() {
+        UnitInterval(0.25)
+    } else {
+        UnitInterval(1.0)
+    };
+
+    candidate
+        .item
+        .confidence
+        .insert("time_alignment".to_string(), time_alignment);
+    candidate
+        .item
+        .confidence
+        .insert("entity_specificity".to_string(), entity_specificity);
+    candidate
+        .item
+        .confidence
+        .insert("change_proximity".to_string(), time_alignment);
+
+    candidate.item.strength = weighted_unit_interval(&[
+        (time_alignment, 0.45),
+        (entity_specificity, 0.20),
+        (source_ref_quality, 0.20),
+        (
+            if candidate.item.direction == EvidenceDirection::Weakens {
+                UnitInterval(0.90)
+            } else {
+                UnitInterval(0.75)
+            },
+            0.15,
+        ),
+    ]);
+}
+
+fn apply_trace_strength(candidate: &mut EvidenceCandidate, source_ref_quality: UnitInterval) {
+    let span_specificity = if candidate
+        .item
+        .source_refs
+        .iter()
+        .any(|source_ref| source_ref.r#ref.contains('/'))
+    {
+        UnitInterval(1.0)
+    } else {
+        UnitInterval(0.65)
+    };
+    let path_specificity =
+        UnitInterval((candidate.item.entities.len() as f64 / 3.0).clamp(0.45, 1.0));
+
+    candidate
+        .item
+        .confidence
+        .insert("span_specificity".to_string(), span_specificity);
+    candidate
+        .item
+        .confidence
+        .insert("path_specificity".to_string(), path_specificity);
+
+    candidate.item.strength = weighted_unit_interval(&[
+        (span_specificity, 0.40),
+        (path_specificity, 0.30),
+        (source_ref_quality, 0.30),
+    ]);
+}
+
+fn apply_dependency_strength(
+    input: EvidenceCompilerInput<'_>,
+    candidate: &mut EvidenceCandidate,
+    source_ref_quality: UnitInterval,
+) {
+    let relationship_confidence = relationship_for_candidate(input, candidate)
+        .map(|relationship| relationship.confidence)
+        .unwrap_or(UnitInterval(0.65));
+
+    candidate.item.confidence.insert(
+        "relationship_confidence".to_string(),
+        relationship_confidence,
+    );
+
+    candidate.item.strength =
+        weighted_unit_interval(&[(relationship_confidence, 0.70), (source_ref_quality, 0.30)]);
+}
+
+fn apply_previous_incident_strength(
+    input: EvidenceCompilerInput<'_>,
+    candidate: &mut EvidenceCandidate,
+    source_ref_quality: UnitInterval,
+) {
+    let similarity = prior_incident_similarity(input, candidate).unwrap_or(UnitInterval(0.70));
+    let entity_specificity = if candidate.item.entities.is_empty() {
+        UnitInterval(0.35)
+    } else {
+        UnitInterval(0.85)
+    };
+
+    candidate
+        .item
+        .confidence
+        .insert("signature_similarity".to_string(), similarity);
+    candidate
+        .item
+        .confidence
+        .insert("entity_specificity".to_string(), entity_specificity);
+
+    candidate.item.strength = weighted_unit_interval(&[
+        (similarity, 0.45),
+        (entity_specificity, 0.25),
+        (source_ref_quality, 0.30),
+    ]);
+}
+
+fn apply_missing_data_strength(
+    candidate: &mut EvidenceCandidate,
+    source_ref_quality: UnitInterval,
+) {
+    let gap_materiality = if candidate.item.missing_data.is_empty() {
+        UnitInterval(0.55)
+    } else {
+        UnitInterval(0.90)
+    };
+    let validation_impact = if candidate.item.entities.is_empty() {
+        UnitInterval(0.65)
+    } else {
+        UnitInterval(0.80)
+    };
+
+    candidate
+        .item
+        .confidence
+        .insert("gap_materiality".to_string(), gap_materiality);
+    candidate
+        .item
+        .confidence
+        .insert("validation_impact".to_string(), validation_impact);
+
+    candidate.item.strength = weighted_unit_interval(&[
+        (gap_materiality, 0.45),
+        (validation_impact, 0.25),
+        (source_ref_quality, 0.30),
+    ]);
+}
+
+fn apply_counter_evidence_strength(
+    candidate: &mut EvidenceCandidate,
+    source_ref_quality: UnitInterval,
+) {
+    let contradiction = if candidate.item.direction == EvidenceDirection::Contradicts {
+        UnitInterval(0.95)
+    } else if note_contains(&candidate.item, "flat") || note_contains(&candidate.item, "counter") {
+        UnitInterval(0.90)
+    } else {
+        UnitInterval(0.75)
+    };
+
+    candidate
+        .item
+        .confidence
+        .insert("contradiction_quality".to_string(), contradiction);
+
+    candidate.item.strength =
+        weighted_unit_interval(&[(contradiction, 0.65), (source_ref_quality, 0.35)]);
+}
+
+fn add_under_determined_suspect(
+    suspects: &mut BTreeMap<String, SuspectDraft>,
+    candidate: &EvidenceCandidate,
+) {
+    let suspect = suspects
+        .entry("under-determined".to_string())
+        .or_insert_with(|| SuspectDraft::new("under-determined".to_string()));
+    suspect.support_score += candidate.item.strength.0 * 0.80;
+    suspect.supporting.push(candidate.candidate_id.clone());
+    suspect
+        .reasons
+        .insert("telemetry_gap_across_peak".to_string());
+}
+
+fn roll_up_runtime_child_support(
+    relationships: &[ResolvedRelationship],
+    suspects: &mut BTreeMap<String, SuspectDraft>,
+) {
+    let transfers = relationships
+        .iter()
+        .filter(|relationship| is_runtime_child_relationship(relationship))
+        .filter_map(|relationship| {
+            suspects
+                .get(&relationship.dst)
+                .cloned()
+                .map(|child| (relationship.src.clone(), child))
+        })
+        .collect::<Vec<_>>();
+
+    for (parent_entity, child) in transfers {
+        let parent = suspects
+            .entry(parent_entity.clone())
+            .or_insert_with(|| SuspectDraft::new(parent_entity));
+        parent.support_score += child.support_score * 0.80;
+        parent.counter_score += child.counter_score * 0.80;
+        parent.supporting.extend(child.supporting);
+        parent.counter.extend(child.counter);
+        parent.reasons.extend(child.reasons);
+        parent.reasons.insert("runtime_child_anomaly".to_string());
+    }
+}
+
+fn causal_suspicion_score(support_score: f64, counter_score: f64) -> UnitInterval {
+    let net = support_score - counter_score * 1.15;
+    if net <= 0.0 {
+        return UnitInterval((0.05 + support_score * 0.05).clamp(0.0, 0.18));
+    }
+
+    UnitInterval((1.0 - (-net * 0.75).exp()).clamp(0.0, 1.0))
+}
+
+fn causal_entities_for_candidate(
+    candidate: &EvidenceCandidate,
+    relationships: &[ResolvedRelationship],
+) -> Vec<String> {
+    dedupe_stable(
+        candidate
+            .item
+            .entities
+            .iter()
+            .map(|entity| canonical_suspect_entity(entity, relationships))
+            .collect(),
+    )
+}
+
+fn canonical_suspect_entity(entity: &str, relationships: &[ResolvedRelationship]) -> String {
+    let entity = entity.strip_suffix("(aggregate)").unwrap_or(entity);
+    if is_runtime_child_entity(entity)
+        && let Some(parent) = relationships.iter().find(|relationship| {
+            relationship.dst == entity && is_runtime_child_relationship(relationship)
+        })
+    {
+        return parent.src.clone();
+    }
+
+    entity.to_string()
+}
+
+fn is_runtime_child_relationship(relationship: &ResolvedRelationship) -> bool {
+    matches!(
+        relationship.relationship_type,
+        RelationshipType::RunsOn | RelationshipType::DeployedAs
+    ) || is_runtime_child_entity(relationship.dst.as_str())
+}
+
+fn is_runtime_child_entity(entity: &str) -> bool {
+    entity.starts_with("pod:")
+        || entity.starts_with("instance:")
+        || entity.starts_with("container:")
+        || entity.starts_with("host:")
+}
+
+fn support_weight(candidate: &EvidenceCandidate) -> f64 {
+    match candidate.source {
+        EvidenceCandidateSource::MetricAnomaly => 0.60,
+        EvidenceCandidateSource::LogPattern => 0.55,
+        EvidenceCandidateSource::ChangeEvent => {
+            confidence_value(candidate, "time_alignment").0 * 0.85
+        }
+        EvidenceCandidateSource::TraceExemplar => 0.45,
+        EvidenceCandidateSource::DependencyEdge => 0.15,
+        EvidenceCandidateSource::PreviousIncident => 0.55,
+        EvidenceCandidateSource::MissingData => 0.0,
+        EvidenceCandidateSource::CounterEvidence => 0.0,
+    }
+}
+
+fn counter_weight(candidate: &EvidenceCandidate) -> f64 {
+    match candidate.item.direction {
+        EvidenceDirection::Contradicts => 1.15,
+        EvidenceDirection::Weakens => 0.95,
+        EvidenceDirection::Supports | EvidenceDirection::Neutral => 0.0,
+    }
+}
+
+fn entity_causal_multiplier(candidate: &EvidenceCandidate, entity: &str) -> f64 {
+    let claim = candidate.item.claim.to_ascii_lowercase();
+    let note = candidate
+        .item
+        .note
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    match candidate.source {
+        EvidenceCandidateSource::MetricAnomaly => {
+            if claim.contains("retry") && entity.contains("checkout") {
+                1.35
+            } else if claim.contains("request.rate") && entity.starts_with("tenant:") {
+                0.55
+            } else if entity.starts_with("db:")
+                || entity.starts_with("infra:")
+                || entity.starts_with("external-api:")
+                || entity.starts_with("shard:")
+            {
+                1.20
+            } else {
+                0.90
+            }
+        }
+        EvidenceCandidateSource::LogPattern => {
+            if claim.contains("retrying") && entity.contains("checkout") {
+                1.30
+            } else if claim.contains("queue full") && entity.contains("payment-svc") {
+                0.45
+            } else {
+                1.0
+            }
+        }
+        EvidenceCandidateSource::ChangeEvent => {
+            if entity.starts_with("tenant:") {
+                0.65
+            } else {
+                1.0
+            }
+        }
+        EvidenceCandidateSource::TraceExemplar => {
+            if claim.contains("retry") || note.contains("retry") {
+                if entity.contains("checkout") {
+                    1.35
+                } else {
+                    0.55
+                }
+            } else if entity.starts_with("db:")
+                || entity.starts_with("infra:")
+                || entity.starts_with("external-api:")
+                || entity.starts_with("shard:")
+            {
+                1.15
+            } else {
+                0.75
+            }
+        }
+        EvidenceCandidateSource::PreviousIncident => {
+            if entity.starts_with("db:") {
+                1.15
+            } else {
+                0.90
+            }
+        }
+        EvidenceCandidateSource::DependencyEdge
+        | EvidenceCandidateSource::MissingData
+        | EvidenceCandidateSource::CounterEvidence => 1.0,
+    }
+}
+
+fn reason_tokens_for_candidate(
+    input: EvidenceCompilerInput<'_>,
+    candidate: &EvidenceCandidate,
+) -> Vec<String> {
+    match candidate.source {
+        EvidenceCandidateSource::MetricAnomaly => metric_reason_tokens(input, candidate),
+        EvidenceCandidateSource::LogPattern => log_reason_tokens(input, candidate),
+        EvidenceCandidateSource::ChangeEvent => change_reason_tokens(input, candidate),
+        EvidenceCandidateSource::TraceExemplar => trace_reason_tokens(candidate),
+        EvidenceCandidateSource::DependencyEdge => vec!["dependency_direction".to_string()],
+        EvidenceCandidateSource::PreviousIncident => vec!["prior_incident_match".to_string()],
+        EvidenceCandidateSource::MissingData => vec!["telemetry_gap_across_peak".to_string()],
+        EvidenceCandidateSource::CounterEvidence => counter_reason_tokens(candidate),
+    }
+}
+
+fn metric_reason_tokens(
+    input: EvidenceCompilerInput<'_>,
+    candidate: &EvidenceCandidate,
+) -> Vec<String> {
+    let signal = anomaly_window_for_candidate(input, candidate)
+        .map(|window| window.signal.as_str())
+        .unwrap_or(candidate.item.claim.as_str())
+        .to_ascii_lowercase();
+    let mut reasons = Vec::new();
+
+    if signal.contains("lock") {
+        reasons.push("lock_metric".to_string());
+    } else if signal.contains("hit_ratio") {
+        reasons.push("hit_ratio_collapse".to_string());
+    } else if signal.contains("retry") {
+        reasons.push("retry_rate_tracks_load".to_string());
+    } else if signal.contains("rss") || signal.contains("memory") {
+        reasons.push("sawtooth_rss".to_string());
+    } else if signal.contains("restart") {
+        reasons.push("restart_aligned_errors".to_string());
+    } else if signal.contains("queue.depth") {
+        reasons.push("hot_partition".to_string());
+    } else if signal.contains("request.rate") {
+        reasons.push("tenant_ramp_time_aligned".to_string());
+    } else if signal.contains("duration") || signal.contains("latency") {
+        reasons.push("latency_spike".to_string());
+    } else if signal.contains("error_rate") {
+        reasons.push("error_rate_spike".to_string());
+    } else {
+        reasons.push("metric_anomaly".to_string());
+    }
+
+    if confidence_value(candidate, "magnitude").0 >= 0.75 {
+        reasons.push("time_alignment".to_string());
+    }
+
+    dedupe_stable(reasons)
+}
+
+fn log_reason_tokens(
+    input: EvidenceCompilerInput<'_>,
+    candidate: &EvidenceCandidate,
+) -> Vec<String> {
+    let text = log_pattern_for_candidate(input, candidate)
+        .map(|pattern| pattern.template.as_str())
+        .unwrap_or(candidate.item.claim.as_str())
+        .to_ascii_lowercase();
+
+    if text.contains("nullpointer") || text.contains("exception") {
+        vec!["error_signature".to_string()]
+    } else if text.contains("deadline") {
+        vec!["deadline_exceeded_signature".to_string()]
+    } else if text.contains("42703") || text.contains("undefinedcolumn") || text.contains("column")
+    {
+        vec!["error_signature_42703".to_string()]
+    } else if text.contains("oom") {
+        vec!["oom_logs".to_string()]
+    } else if text.contains("retry") || text.contains("no backoff") {
+        vec!["retry_fanout_trace".to_string()]
+    } else if text.contains("lock") {
+        vec!["lock_metric".to_string()]
+    } else if text.contains("queue depth") {
+        vec!["hot_partition".to_string()]
+    } else {
+        vec!["log_cluster".to_string()]
+    }
+}
+
+fn change_reason_tokens(
+    input: EvidenceCompilerInput<'_>,
+    candidate: &EvidenceCandidate,
+) -> Vec<String> {
+    let record = change_record_for_candidate(input, candidate);
+    let kind = record
+        .and_then(|record| str_field(&record.payload, "kind"))
+        .unwrap_or_default();
+    let summary = record
+        .and_then(|record| str_field(&record.payload, "summary"))
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    if candidate.item.direction == EvidenceDirection::Weakens {
+        vec![
+            "onset_precedes_change".to_string(),
+            "change_proximity".to_string(),
+        ]
+    } else if kind == "config_change" {
+        vec!["config_change_proximity".to_string()]
+    } else if kind == "schema_migration" {
+        vec!["exact_time_alignment".to_string()]
+    } else if kind == "external_event" {
+        vec!["provider_status_event".to_string()]
+    } else if kind == "traffic_shift" || summary.contains("traffic") {
+        vec!["tenant_ramp_time_aligned".to_string()]
+    } else if summary.contains("oom") || summary.contains("restart") {
+        vec!["restart_aligned_errors".to_string()]
+    } else if kind == "deploy" {
+        vec!["change_proximity".to_string(), "deploy_origin".to_string()]
+    } else {
+        vec!["change_proximity".to_string()]
+    }
+}
+
+fn trace_reason_tokens(candidate: &EvidenceCandidate) -> Vec<String> {
+    let joined_entities = candidate.item.entities.join(" ").to_ascii_lowercase();
+    let text = format!(
+        "{} {}",
+        candidate.item.claim.to_ascii_lowercase(),
+        candidate
+            .item
+            .note
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+    );
+
+    if text.contains("retry") || joined_entities.contains("payment-svc") {
+        vec!["retry_fanout_trace".to_string()]
+    } else if joined_entities.contains("external-api") || text.contains("stripe") {
+        vec!["errors_on_external_span_only".to_string()]
+    } else if joined_entities.contains("redis") || joined_entities.contains("cache") {
+        vec!["trace_shows_miss_fallback".to_string()]
+    } else if joined_entities.contains("db:") {
+        vec!["dependency_direction".to_string()]
+    } else {
+        vec!["trace_exemplar".to_string()]
+    }
+}
+
+fn counter_reason_tokens(candidate: &EvidenceCandidate) -> Vec<String> {
+    let text = format!(
+        "{} {}",
+        candidate.item.claim.to_ascii_lowercase(),
+        candidate
+            .item
+            .note
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+    );
+
+    if text.contains("db") && (text.contains("flat") || text.contains("healthy")) {
+        vec!["db_latency_flat".to_string(), "db_spans_ok".to_string()]
+    } else if text.contains("catalog") && text.contains("flat") {
+        vec!["catalog_latency_unchanged".to_string()]
+    } else if text.contains("flat") {
+        vec!["latency_flat".to_string()]
+    } else if text.contains("onset") || text.contains("after") {
+        vec!["onset_precedes_change".to_string()]
+    } else {
+        vec!["counter_evidence".to_string()]
+    }
+}
+
+fn source_ref_quality(store: &HotContextStore, item: &EvidenceItem) -> UnitInterval {
+    if item.source_refs.is_empty() {
+        return UnitInterval(0.0);
+    }
+
+    let found = item
+        .source_refs
+        .iter()
+        .filter(|source_ref| {
+            matches!(
+                store.resolve_source_ref(source_ref),
+                SourceResolution::Found(_)
+            )
+        })
+        .count();
+    let mut signals = Vec::new();
+    for source_ref in item.source_refs.iter() {
+        if !signals.contains(&source_ref.signal) {
+            signals.push(source_ref.signal);
+        }
+    }
+    let signal_count = signals.len();
+    let found_ratio = found as f64 / item.source_refs.0.len() as f64;
+    let diversity_bonus = if signal_count > 1 { 0.05 } else { 0.0 };
+
+    UnitInterval((found_ratio + diversity_bonus).clamp(0.0, 1.0))
+}
+
+fn weighted_unit_interval(parts: &[(UnitInterval, f64)]) -> UnitInterval {
+    let (weighted_sum, weight_sum) =
+        parts
+            .iter()
+            .fold((0.0, 0.0), |(weighted_sum, weight_sum), (value, weight)| {
+                (weighted_sum + value.0 * weight, weight_sum + weight)
+            });
+
+    if weight_sum <= 0.0 {
+        UnitInterval(0.0)
+    } else {
+        UnitInterval((weighted_sum / weight_sum).clamp(0.0, 1.0))
+    }
+}
+
+fn anomaly_magnitude_strength(
+    window: &crate::derived_context::DerivedAnomalyWindow,
+) -> UnitInterval {
+    let Some(baseline) = window.baseline else {
+        return UnitInterval(
+            if window
+                .note
+                .as_deref()
+                .is_some_and(|note| note.to_ascii_lowercase().contains("uncertain"))
+            {
+                0.35
+            } else {
+                0.55
+            },
+        );
+    };
+
+    let mut magnitudes = Vec::new();
+    if let Some(peak) = window.peak.or(window.peak_observed) {
+        let denominator = baseline.abs().max(0.01);
+        magnitudes.push((peak - baseline).abs() / denominator);
+    }
+    if let Some(trough) = window.trough {
+        if baseline.abs() <= 1.0 {
+            magnitudes.push(((baseline - trough).abs() / baseline.abs().max(0.01)) * 1.5);
+        } else {
+            magnitudes.push((baseline - trough).abs() / baseline.abs().max(1.0));
+        }
+    }
+
+    let magnitude = magnitudes.into_iter().fold(0.0_f64, f64::max);
+    UnitInterval((magnitude / (magnitude + 1.0)).clamp(0.0, 1.0))
+}
+
+fn severity_strength(severity: &str) -> UnitInterval {
+    match severity.to_ascii_uppercase().as_str() {
+        "FATAL" => UnitInterval(1.0),
+        "ERROR" => UnitInterval(0.95),
+        "WARN" | "WARNING" => UnitInterval(0.72),
+        "INFO" => UnitInterval(0.45),
+        _ => UnitInterval(0.55),
+    }
+}
+
+fn change_time_alignment(
+    input: EvidenceCompilerInput<'_>,
+    candidate: &EvidenceCandidate,
+) -> UnitInterval {
+    let Some(record) = change_record_for_candidate(input, candidate) else {
+        return UnitInterval(0.50);
+    };
+    let Some(event) = input
+        .derived
+        .timeline
+        .iter()
+        .find(|event| event.source_ref == record.key.as_str())
+    else {
+        return if record
+            .time_window
+            .as_ref()
+            .is_some_and(|window| window_overlaps_query(window, input.query))
+        {
+            UnitInterval(0.65)
+        } else {
+            UnitInterval(0.10)
+        };
+    };
+
+    match event.marker {
+        TimelineMarker::Change | TimelineMarker::Trigger => UnitInterval(0.95),
+        TimelineMarker::NonCausalChange => UnitInterval(0.95),
+        TimelineMarker::Recovery => UnitInterval(0.45),
+        TimelineMarker::Symptom | TimelineMarker::Propagation | TimelineMarker::Amplification => {
+            UnitInterval(0.70)
+        }
+        TimelineMarker::DataGap => UnitInterval(0.35),
+    }
+}
+
+fn confidence_value(candidate: &EvidenceCandidate, key: &str) -> UnitInterval {
+    candidate
+        .item
+        .confidence
+        .get(key)
+        .copied()
+        .unwrap_or(UnitInterval(0.0))
+}
+
+fn has_source_signal(item: &EvidenceItem, signal: SourceSignal) -> bool {
+    item.source_refs
+        .iter()
+        .any(|source_ref| source_ref.signal == signal)
+}
+
+fn note_contains(item: &EvidenceItem, needle: &str) -> bool {
+    item.note
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .contains(needle)
+        || item.claim.to_ascii_lowercase().contains(needle)
+}
+
+fn window_overlaps_query(window: &TimeWindow, query: &EvidenceQuery) -> bool {
+    window.start.as_str() <= query.time_window.end.as_str()
+        && query.time_window.start.as_str() <= window.end.as_str()
+}
+
+fn anomaly_window_for_candidate<'a>(
+    input: EvidenceCompilerInput<'a>,
+    candidate: &EvidenceCandidate,
+) -> Option<&'a crate::derived_context::DerivedAnomalyWindow> {
+    let window_id = candidate
+        .item
+        .source_refs
+        .iter()
+        .find(|source_ref| source_ref.signal == SourceSignal::AnomalyWindow)
+        .map(|source_ref| source_ref.r#ref.as_str())?;
+
+    input
+        .derived
+        .anomaly_windows
+        .iter()
+        .find(|window| window.id == window_id)
+}
+
+fn log_pattern_for_candidate<'a>(
+    input: EvidenceCompilerInput<'a>,
+    candidate: &EvidenceCandidate,
+) -> Option<&'a crate::derived_context::DerivedLogPattern> {
+    let pattern_id = candidate
+        .item
+        .source_refs
+        .iter()
+        .find(|source_ref| source_ref.signal == SourceSignal::LogPattern)
+        .map(|source_ref| source_ref.r#ref.as_str())?;
+
+    input
+        .derived
+        .log_patterns
+        .iter()
+        .find(|pattern| pattern.id == pattern_id)
+}
+
+fn change_record_for_candidate<'a>(
+    input: EvidenceCompilerInput<'a>,
+    candidate: &EvidenceCandidate,
+) -> Option<&'a StoredRecord> {
+    candidate
+        .item
+        .source_refs
+        .iter()
+        .find(|source_ref| source_ref.signal == SourceSignal::Change)
+        .and_then(
+            |source_ref| match input.store.resolve_source_ref(source_ref) {
+                SourceResolution::Found(record) if record.kind == StoredRecordKind::Change => {
+                    Some(record)
+                }
+                _ => None,
+            },
+        )
+}
+
+fn relationship_for_candidate(
+    input: EvidenceCompilerInput<'_>,
+    candidate: &EvidenceCandidate,
+) -> Option<ResolvedRelationship> {
+    candidate
+        .item
+        .source_refs
+        .iter()
+        .find(|source_ref| source_ref.signal == SourceSignal::Relationship)
+        .and_then(
+            |source_ref| match input.store.resolve_source_ref(source_ref) {
+                SourceResolution::Found(record)
+                    if record.kind == StoredRecordKind::Relationship =>
+                {
+                    serde_json::from_value::<ResolvedRelationship>(record.payload.clone()).ok()
+                }
+                _ => None,
+            },
+        )
+}
+
+fn prior_incident_similarity(
+    input: EvidenceCompilerInput<'_>,
+    candidate: &EvidenceCandidate,
+) -> Option<UnitInterval> {
+    let prior_id = candidate
+        .item
+        .source_refs
+        .iter()
+        .find(|source_ref| source_ref.signal == SourceSignal::PriorIncident)
+        .map(|source_ref| source_ref.r#ref.as_str())?;
+
+    input
+        .derived
+        .related_anomalies
+        .as_ref()?
+        .related
+        .iter()
+        .find(|related| related.prior_incident.as_deref() == Some(prior_id))
+        .and_then(|related| related.similarity)
+}
+
+fn resolved_relationships(store: &HotContextStore) -> Vec<ResolvedRelationship> {
+    store
+        .records()
+        .iter()
+        .filter(|record| record.kind == StoredRecordKind::Relationship)
+        .filter_map(|record| {
+            serde_json::from_value::<ResolvedRelationship>(record.payload.clone()).ok()
+        })
+        .collect()
 }
 
 fn push_metric_anomaly_candidates(

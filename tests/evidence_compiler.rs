@@ -5,6 +5,7 @@ use janus::{
         apply_compiler_token_estimates, canonical_evidence_item_payload_json_bytes,
         compare_compiled_evidence, compare_compiled_evidence_for_case,
         estimate_evidence_item_tokens, generate_evidence_candidates, load_expected_compilation,
+        rank_suspected_causes_from_candidates, score_evidence_candidates,
     },
     fixture_simulator::{plan_fixture_replay, replay_plan_into_store},
     fixture_validation::{FixtureCorpus, FixtureSelector},
@@ -278,6 +279,112 @@ fn generates_source_backed_candidates_for_current_corpus() {
 }
 
 #[test]
+fn scored_metric_strength_is_not_detector_confidence_copy() {
+    let case = fixture_case("deploy-bad-rollout");
+    let (query, store, derived, candidates) = scored_candidates_for_case(&case);
+    let rescored = score_evidence_candidates(
+        EvidenceCompilerInput {
+            query: &query,
+            store: &store,
+            derived: &derived,
+        },
+        candidates,
+    )
+    .unwrap();
+
+    let metric = rescored
+        .iter()
+        .find(|candidate| {
+            candidate.source == EvidenceCandidateSource::MetricAnomaly
+                && candidate.item.confidence.contains_key("detector")
+        })
+        .expect("deploy-bad-rollout should have a metric anomaly candidate");
+    let detector = metric.item.confidence["detector"];
+
+    assert!(
+        (metric.item.strength.0 - detector.0).abs() > 1e-9,
+        "metric strength must combine dimensions, not copy confidence.detector"
+    );
+    assert!(metric.item.confidence.contains_key("magnitude"));
+    assert!(metric.item.confidence.contains_key("coverage"));
+    assert!(metric.item.confidence.contains_key("source_ref_quality"));
+}
+
+#[test]
+fn suspected_cause_ranking_downgrades_false_deploy_with_counter_evidence() {
+    let case = fixture_case("coincidental-deploy-trap");
+    let (query, store, derived, candidates) = scored_candidates_for_case(&case);
+    let causes = rank_suspected_causes_from_candidates(
+        EvidenceCompilerInput {
+            query: &query,
+            store: &store,
+            derived: &derived,
+        },
+        &candidates,
+    );
+
+    let redis = causes
+        .iter()
+        .find(|cause| cause.entity == "infra:redis-cache")
+        .expect("redis-cache should be ranked as a plausible cause");
+    let search_ui = causes
+        .iter()
+        .find(|cause| cause.entity == "service:search-ui")
+        .expect("coincidental search-ui deploy should remain inspectable");
+
+    assert!(
+        redis.rank < search_ui.rank,
+        "actual cache failure should outrank the coincidental deploy: {causes:#?}"
+    );
+    assert!(redis.score.0 > search_ui.score.0);
+    assert!(
+        !search_ui.counter.is_empty(),
+        "false deploy should carry explicit counter-evidence"
+    );
+    assert!(
+        search_ui.trap_note.is_some(),
+        "false deploy should be marked as a false-causality trap"
+    );
+}
+
+#[test]
+fn missing_data_ranking_surfaces_under_determined_uncertainty() {
+    let case = fixture_case("missing-data-gap");
+    let (query, store, derived, candidates) = scored_candidates_for_case(&case);
+    let causes = rank_suspected_causes_from_candidates(
+        EvidenceCompilerInput {
+            query: &query,
+            store: &store,
+            derived: &derived,
+        },
+        &candidates,
+    );
+
+    let under_determined = causes
+        .iter()
+        .find(|cause| cause.entity == "under-determined")
+        .expect("missing-data fixture should surface an uncertainty suspect");
+
+    assert!(
+        under_determined
+            .reasons
+            .iter()
+            .any(|reason| reason == "telemetry_gap_across_peak")
+    );
+    assert!(!under_determined.supporting.is_empty());
+
+    if let Some(concrete) = causes
+        .iter()
+        .find(|cause| cause.entity == "db:inventory-pg")
+    {
+        assert!(
+            under_determined.score.0 > concrete.score.0,
+            "under-determined should be less confident than a source-backed concrete cause only when the data gap is not material"
+        );
+    }
+}
+
+#[test]
 fn runtime_input_excludes_expected_artifacts() {
     let case = fixture_case("deploy-bad-rollout");
     let query = query_for_case(&case);
@@ -311,6 +418,27 @@ fn fixture_case(id: &str) -> janus::fixture_validation::FixtureCase {
 fn raw_fixture_store(case: &janus::fixture_validation::FixtureCase) -> HotContextStore {
     let plan = plan_fixture_replay(case).unwrap();
     replay_plan_into_store(&plan).unwrap()
+}
+
+fn scored_candidates_for_case(
+    case: &janus::fixture_validation::FixtureCase,
+) -> (
+    EvidenceQuery,
+    HotContextStore,
+    janus::derived_context::DerivedContext,
+    Vec<janus::evidence_compiler::EvidenceCandidate>,
+) {
+    let query = query_for_case(case);
+    let mut store = raw_fixture_store(case);
+    let derived = derive_and_insert_context(case, &mut store).unwrap();
+    let candidates = generate_evidence_candidates(EvidenceCompilerInput {
+        query: &query,
+        store: &store,
+        derived: &derived,
+    })
+    .unwrap();
+
+    (query, store, derived, candidates)
 }
 
 fn query_for_case(case: &janus::fixture_validation::FixtureCase) -> EvidenceQuery {

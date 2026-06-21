@@ -254,6 +254,12 @@ use internal ids such as `cand-001` and are not public selected bundle items.
 Later selection slices must assign the final selected `ev-N` ids and recompute
 estimator-owned token fields for that final selected output.
 
+After Slice 3, `generate_evidence_candidates` returns generated candidates with
+compiler-owned evidence-strength scores applied. `score_evidence_candidates` is
+also exposed as an internal helper so tests and later slices can rescore a
+candidate set explicitly. The ids remain internal `cand-*` ids; this is still
+not final bundle selection.
+
 ### Metric Anomaly Evidence
 
 Inputs:
@@ -427,6 +433,20 @@ The compiler should store causal dimensions in `confidence` maps or suspected
 cause records, but it must not overwrite `EvidenceItem.strength` with a root-
 cause probability.
 
+Slice 3 implements evidence-strength scoring before suspected-cause ranking.
+Candidate `strength` is computed from source-specific dimensions such as
+`source_ref_quality`, `magnitude`, `coverage`, `severity`, `volume`,
+`exemplar_quality`, `span_specificity`, `time_alignment`,
+`relationship_confidence`, `signature_similarity`, `gap_materiality`, and
+`contradiction_quality`. For metric anomalies, `confidence.detector` is retained
+as a separate detector dimension and is not copied into `strength`.
+
+Slice 3 also introduces causal suspicion scoring for suspected causes. This
+score is computed from linked supporting evidence, counter-evidence penalties,
+source-family causal weights, runtime-child rollups such as `pod:` to owning
+`service:`, and material missing-data uncertainty. It is deliberately separate
+from any individual evidence item's `strength`.
+
 ## Suspected Causes
 
 `expected.suspected_causes` already exists in the fixture corpus. This topic
@@ -464,6 +484,14 @@ Minimum behavior:
   gaps make diagnosis under-determined;
 - insert or expose suspected causes as inspectable store records, even before
   MCP exposes `rank_suspected_causes`.
+
+Slice 3 exposes `rank_suspected_causes_from_candidates(input, candidates)` as an
+internal helper. It ranks suspected causes from generated candidate ids, links
+supporting and counter evidence with `cand-*` ids, emits deterministic reason
+category tokens, lowers suspects whose counter score dominates support, and
+emits an `under-determined` suspect when missing-data candidates materially
+weaken diagnosis. It does not yet rewrite links to selected `ev-*` ids because
+token-budget selection is Slice 4.
 
 ## Next Checks
 
@@ -703,6 +731,9 @@ Recommended slices:
    integration.
 3. Scoring and suspected causes: add evidence-strength dimensions, causal
    suspicion scoring, false-causality penalties, and suspected cause ranking.
+   This slice keeps `cand-*` ids and does not perform final token-budget
+   selection, selected `ev-N` assignment, next-check generation, store
+   insertion, or `get_evidence_bundle` integration.
 4. Token budget selection: compute deterministic token costs, select whole
    items under `max_items` and `max_tokens`, report dropped candidates, and
    enforce counter-evidence requirements.
