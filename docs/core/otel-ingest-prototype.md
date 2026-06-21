@@ -241,8 +241,10 @@ Metric-series `<entity>` is derived exactly as follows:
 2. If `service.name` is absent but a deterministic resource key can be derived,
    use that resource key as the low-quality entity fallback and count the record
    as accepted with a low-quality entity hint.
-3. If neither a service entity nor a deterministic resource key can be produced,
-   reject the metric point because its source key would not be stable.
+3. If the resource has no stable attributes, derive a deterministic
+   position-scoped resource key from the OTLP envelope path, mark the hint as
+   missing-quality, and count the record accordingly. This keeps same-file
+   source refs stable and avoids collapsing unrelated anonymous resources.
 
 Data-point attributes do not override the resource service entity in this topic.
 They are preserved for later entity resolution.
@@ -264,16 +266,21 @@ Minimum rules:
   the service entity;
 - span names, routes, hosts, pods, containers, databases, queues, and peer
   services should be preserved as attributes for later entity resolution;
-- when the adapter cannot identify a service entity, it should leave the record
-  unresolved and count the missing hint.
+- when the adapter cannot identify a service entity, it should attach the
+  deterministic resource-key fallback as a synthetic entity and count the hint
+  as low-quality or missing-quality. This is not a high-confidence service
+  identity.
 
 Do not invent high-confidence relationships in this topic. Relationship
 building belongs to `entity-resolver-confidence` or a later derived-context
 topic.
 
 Resource-derived service entities are the only high-quality entity hints in
-this topic. Resource-key fallbacks are low-quality hints. Unresolved or
-low-quality entity cases must be counted in the ingest summary.
+this topic. Resource-key fallbacks are low-quality hints when based on resource
+attributes and missing-quality hints when based only on envelope position. The
+summary counters count accepted stored records that directly carry a low-quality
+or missing-quality entity hint; deduped resources and metric-series updates do
+not double-count.
 
 ## Error And Partial-Ingest Behavior
 

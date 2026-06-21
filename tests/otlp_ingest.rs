@@ -101,13 +101,87 @@ fn resource_key_fallback_is_low_quality_but_resolvable() {
         .find(|source_ref| source_ref.starts_with("process.cpu.utilization@resource:attrs:"))
         .expect("fallback metric source ref should exist");
 
-    assert!(result.summary.low_quality_entity_hints > 0);
+    assert_eq!(result.summary.low_quality_entity_hints, 2);
     assert!(matches!(
         result
             .store
             .resolve_source_ref(&source_ref(SourceSignal::Metric, fallback_metric)),
         SourceResolution::Found(_)
     ));
+}
+
+#[test]
+fn low_quality_entity_hint_count_tracks_stored_records_not_envelopes() {
+    let input = json!({
+        "resourceSpans": [
+            {
+                "resource": low_quality_resource(),
+                "scopeSpans": [
+                    {
+                        "spans": [
+                            {
+                                "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+                                "spanId": "00f067aa0ba902b7",
+                                "startTimeUnixNano": "1780312980000000000",
+                                "endTimeUnixNano": "1780312980900000000"
+                            }
+                        ]
+                    }
+                ]
+            }
+        ],
+        "resourceMetrics": [
+            {
+                "resource": low_quality_resource(),
+                "scopeMetrics": [
+                    {
+                        "metrics": [
+                            {
+                                "name": "worker.queue.depth",
+                                "gauge": {
+                                    "dataPoints": [
+                                        {
+                                            "timeUnixNano": "1780312980000000000",
+                                            "asInt": "3"
+                                        }
+                                    ]
+                                }
+                            }
+                        ]
+                    }
+                ]
+            }
+        ],
+        "resourceLogs": [
+            {
+                "resource": low_quality_resource(),
+                "scopeLogs": [
+                    {
+                        "logRecords": [
+                            {
+                                "timeUnixNano": "1780312980000000000",
+                                "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+                                "spanId": "00f067aa0ba902b7",
+                                "body": {
+                                    "stringValue": "worker queue depth rising"
+                                }
+                            }
+                        ]
+                    }
+                ]
+            }
+        ]
+    });
+
+    let result = ingest_otlp_json_value("multi-signal-low-quality.otlp.json", &input);
+
+    assert!(!result.summary.has_errors(), "{:?}", result.summary.errors);
+    assert_eq!(result.summary.accepted.resources, 1);
+    assert_eq!(result.summary.accepted.spans, 1);
+    assert_eq!(result.summary.accepted.metric_points, 1);
+    assert_eq!(result.summary.accepted.logs, 1);
+    assert_eq!(result.summary.low_quality_entity_hints, 4);
+    assert_eq!(result.summary.missing_entity_hints, 0);
 }
 
 #[test]
@@ -197,6 +271,17 @@ fn sample_json() -> Value {
 
 fn sample_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/otel/deploy-bad-rollout.otlp.json")
+}
+
+fn low_quality_resource() -> Value {
+    json!({
+        "attributes": [
+            {
+                "key": "host.name",
+                "value": { "stringValue": "worker-a" }
+            }
+        ]
+    })
 }
 
 fn source_ref(signal: SourceSignal, raw_ref: &str) -> SourceRef {

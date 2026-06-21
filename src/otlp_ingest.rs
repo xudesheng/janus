@@ -87,9 +87,15 @@ enum EntityHintQuality {
 #[derive(Debug, Clone)]
 struct ResourceContext {
     key: String,
-    entity: Option<String>,
+    entity: String,
     quality: EntityHintQuality,
     signature: String,
+    payload: Value,
+}
+
+#[derive(Debug)]
+struct ResourceEvent {
+    quality: EntityHintQuality,
     payload: Value,
 }
 
@@ -97,6 +103,7 @@ struct ResourceContext {
 struct NormalizedEvent {
     signal: OtlpSignal,
     source_key: String,
+    entity_hint_quality: Option<EntityHintQuality>,
     event: HotIngestEvent,
 }
 
@@ -109,11 +116,13 @@ struct EventApplyState<'a> {
     inserted_records: &'a mut usize,
     updated_records: &'a mut usize,
     duplicate_source_keys: &'a mut usize,
+    low_quality_entity_hints: &'a mut usize,
+    missing_entity_hints: &'a mut usize,
 }
 
 #[derive(Debug, Default)]
 struct OtlpAdapter {
-    resources: BTreeMap<String, Value>,
+    resources: BTreeMap<String, ResourceEvent>,
     resource_signatures: BTreeMap<String, String>,
     traces: BTreeMap<String, TraceDraft>,
     events: Vec<NormalizedEvent>,
@@ -288,13 +297,16 @@ impl OtlpAdapter {
                 inserted_records: &mut inserted_records,
                 updated_records: &mut updated_records,
                 duplicate_source_keys: &mut duplicate_source_keys,
+                low_quality_entity_hints: &mut self.low_quality_entity_hints,
+                missing_entity_hints: &mut self.missing_entity_hints,
             };
 
             for (key, payload) in self.resources {
                 apply_state.apply(NormalizedEvent {
                     signal: OtlpSignal::Resource,
                     source_key: key,
-                    event: HotIngestEvent::Resource(payload),
+                    entity_hint_quality: Some(payload.quality),
+                    event: HotIngestEvent::Resource(payload.payload),
                 });
             }
 
@@ -310,6 +322,7 @@ impl OtlpAdapter {
                 apply_state.apply(NormalizedEvent {
                     signal: OtlpSignal::Trace,
                     source_key: trace_id,
+                    entity_hint_quality: None,
                     event: HotIngestEvent::Trace(payload),
                 });
             }
@@ -414,6 +427,7 @@ impl OtlpAdapter {
                         self.events.push(NormalizedEvent {
                             signal: OtlpSignal::Span,
                             source_key: format!("{trace_id}/{span_id}"),
+                            entity_hint_quality: Some(resource_context.quality),
                             event: HotIngestEvent::Span {
                                 trace_id,
                                 payload: span_payload,
@@ -540,6 +554,7 @@ impl OtlpAdapter {
                         self.events.push(NormalizedEvent {
                             signal: OtlpSignal::Log,
                             source_key,
+                            entity_hint_quality: Some(resource_context.quality),
                             event: HotIngestEvent::Log(log_payload),
                         });
                     }
@@ -561,7 +576,7 @@ impl OtlpAdapter {
         let start = self.required_time(input, span, path, "startTimeUnixNano", OtlpSignal::Span)?;
         let end = self.required_time(input, span, path, "endTimeUnixNano", OtlpSignal::Span)?;
         let attributes = self.attributes(input, span, path, OtlpSignal::Span)?;
-        let entity = self.entity_hint(input, resource, OtlpSignal::Span);
+        let entity = self.entity_hint(resource);
         let mut payload = Map::new();
 
         payload.insert("trace_id".to_string(), Value::String(trace_id.clone()));
@@ -576,9 +591,11 @@ impl OtlpAdapter {
         payload.insert("start".to_string(), Value::String(start));
         payload.insert("end".to_string(), Value::String(end));
         payload.insert("resource".to_string(), Value::String(resource.key.clone()));
-        if let Some(entity) = entity {
-            payload.insert("entity".to_string(), Value::String(entity));
-        }
+        payload.insert("entity".to_string(), Value::String(entity));
+        payload.insert(
+            "entity_hint_quality".to_string(),
+            Value::String(entity_quality_name(resource.quality).to_string()),
+        );
         payload.insert("attributes".to_string(), Value::Object(attributes));
         payload.insert("instrumentation_scope".to_string(), scope.clone());
         insert_optional_value(&mut payload, span, "status");
@@ -602,15 +619,7 @@ impl OtlpAdapter {
         let Some(points) = self.metric_points(input, metric, path) else {
             return;
         };
-        let Some(entity) = self.entity_hint(input, resource, OtlpSignal::MetricPoint) else {
-            self.issue(
-                input,
-                path,
-                Some(OtlpSignal::MetricPoint),
-                "metric point cannot produce a stable entity for its source key",
-            );
-            return;
-        };
+        let entity = self.entity_hint(resource);
         let series = MetricSeriesKey::new(name.clone(), entity.clone());
 
         for (point_index, point) in points.points.iter().enumerate() {
@@ -651,6 +660,10 @@ impl OtlpAdapter {
             let mut payload = Map::new();
             payload.insert("name".to_string(), Value::String(name.clone()));
             payload.insert("entity".to_string(), Value::String(entity.clone()));
+            payload.insert(
+                "entity_hint_quality".to_string(),
+                Value::String(entity_quality_name(resource.quality).to_string()),
+            );
             insert_optional_string(&mut payload, metric, "unit");
             payload.insert(
                 "aggregation".to_string(),
@@ -663,6 +676,7 @@ impl OtlpAdapter {
             self.events.push(NormalizedEvent {
                 signal: OtlpSignal::MetricPoint,
                 source_key: format!("{}@{}", name, entity),
+                entity_hint_quality: Some(resource.quality),
                 event: HotIngestEvent::MetricPoint {
                     series: series.clone(),
                     payload: Value::Object(payload),
@@ -706,15 +720,17 @@ impl OtlpAdapter {
                 id
             }
         };
-        let entity = self.entity_hint(input, resource, OtlpSignal::Log);
+        let entity = self.entity_hint(resource);
         let mut payload = Map::new();
 
         payload.insert("id".to_string(), Value::String(id));
         payload.insert("t".to_string(), Value::String(time));
         payload.insert("resource".to_string(), Value::String(resource.key.clone()));
-        if let Some(entity) = entity {
-            payload.insert("entity".to_string(), Value::String(entity));
-        }
+        payload.insert("entity".to_string(), Value::String(entity));
+        payload.insert(
+            "entity_hint_quality".to_string(),
+            Value::String(entity_quality_name(resource.quality).to_string()),
+        );
         if let Some(trace_id) = trace_id {
             payload.insert("trace_id".to_string(), Value::String(trace_id));
         }
@@ -757,17 +773,17 @@ impl OtlpAdapter {
         let (key, entity, quality) = match (service_name, service_instance) {
             (Some(service_name), Some(service_instance)) => (
                 format!("resource:{service_name}@{service_instance}"),
-                Some(format!("service:{service_name}")),
+                format!("service:{service_name}"),
                 EntityHintQuality::High,
             ),
             (Some(service_name), None) => (
                 format!("resource:{service_name}"),
-                Some(format!("service:{service_name}")),
+                format!("service:{service_name}"),
                 EntityHintQuality::High,
             ),
             (None, _) if attributes.is_empty() => {
                 let key = format!("resource:attrs:{:016x}", stable_hash(path));
-                (key.clone(), Some(key), EntityHintQuality::Missing)
+                (key.clone(), key, EntityHintQuality::Missing)
             }
             (None, _) => {
                 let canonical = if attributes.is_empty() {
@@ -776,15 +792,13 @@ impl OtlpAdapter {
                     canonical_attributes(&attributes)
                 };
                 let key = format!("resource:attrs:{:016x}", stable_hash(&canonical));
-                (key.clone(), Some(key), EntityHintQuality::Low)
+                (key.clone(), key, EntityHintQuality::Low)
             }
         };
         let mut payload = Map::new();
 
         payload.insert("id".to_string(), Value::String(key.clone()));
-        if let Some(entity) = &entity {
-            payload.insert("entity".to_string(), Value::String(entity.clone()));
-        }
+        payload.insert("entity".to_string(), Value::String(entity.clone()));
         payload.insert(
             "entity_hint_quality".to_string(),
             Value::String(entity_quality_name(quality).to_string()),
@@ -805,12 +819,6 @@ impl OtlpAdapter {
     }
 
     fn push_resource(&mut self, input: &str, resource: &ResourceContext, path: &str) {
-        match resource.quality {
-            EntityHintQuality::High => {}
-            EntityHintQuality::Low => self.low_quality_entity_hints += 1,
-            EntityHintQuality::Missing => self.missing_entity_hints += 1,
-        }
-
         let signature = &resource.signature;
         match self.resource_signatures.get(&resource.key) {
             Some(existing) if existing == signature => {}
@@ -825,28 +833,18 @@ impl OtlpAdapter {
             None => {
                 self.resource_signatures
                     .insert(resource.key.clone(), signature.clone());
-                self.resources
-                    .insert(resource.key.clone(), resource.payload.clone());
+                self.resources.insert(
+                    resource.key.clone(),
+                    ResourceEvent {
+                        quality: resource.quality,
+                        payload: resource.payload.clone(),
+                    },
+                );
             }
         }
     }
 
-    fn entity_hint(
-        &mut self,
-        _input: &str,
-        resource: &ResourceContext,
-        signal: OtlpSignal,
-    ) -> Option<String> {
-        match resource.quality {
-            EntityHintQuality::High => {}
-            EntityHintQuality::Low => self.low_quality_entity_hints += 1,
-            EntityHintQuality::Missing => self.missing_entity_hints += 1,
-        }
-
-        if resource.entity.is_none() && matches!(signal, OtlpSignal::MetricPoint) {
-            self.missing_entity_hints += 1;
-        }
-
+    fn entity_hint(&self, resource: &ResourceContext) -> String {
         resource.entity.clone()
     }
 
@@ -1144,10 +1142,16 @@ impl EventApplyState<'_> {
     fn apply(&mut self, event: NormalizedEvent) {
         let signal = event.signal;
         let source_key = event.source_key;
+        let entity_hint_quality = event.entity_hint_quality;
 
         match self.store.ingest(event.event) {
             Ok(IngestOutcome::Inserted { .. }) => {
                 count_accepted(self.accepted, signal);
+                count_entity_hint_quality(
+                    self.low_quality_entity_hints,
+                    self.missing_entity_hints,
+                    entity_hint_quality,
+                );
                 *self.inserted_records += 1;
                 self.source_refs.insert(source_key);
             }
@@ -1172,6 +1176,18 @@ impl EventApplyState<'_> {
                 });
             }
         }
+    }
+}
+
+fn count_entity_hint_quality(
+    low_quality_entity_hints: &mut usize,
+    missing_entity_hints: &mut usize,
+    quality: Option<EntityHintQuality>,
+) {
+    match quality {
+        Some(EntityHintQuality::Low) => *low_quality_entity_hints += 1,
+        Some(EntityHintQuality::Missing) => *missing_entity_hints += 1,
+        Some(EntityHintQuality::High) | None => {}
     }
 }
 
