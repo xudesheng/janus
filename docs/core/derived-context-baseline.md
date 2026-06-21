@@ -69,6 +69,18 @@ Milestone 5B and whether the comparison contract below is strict enough. If a
 reviewer wants implementation in phases, their verdict must name the approved
 phase.
 
+The first review round should resolve these design decisions before any coding:
+
+- whether Milestone 5B should be approved as one whole implementation topic or
+  only phase by phase;
+- whether `non-causal-change` belongs in the Milestone 5B timeline output, or
+  should be held until the evidence compiler can classify nearby changes;
+- whether the derived provenance contract below is strong enough even where
+  current fixture gold shapes do not expose explicit `source_refs`;
+- whether stable natural-language timeline text is acceptable for the current
+  corpus, or whether the timeline payload should become more structured before
+  implementation.
+
 ## Scope
 
 In scope:
@@ -157,8 +169,7 @@ Exact Rust names are flexible. The required contract is:
 - every derived object is source-backed;
 - ids are deterministic for the same fixture input;
 - time ordering is stable;
-- source refs resolve through existing reference rules where the artifact shape
-  has a source field;
+- source refs resolve through existing reference rules;
 - confidence fields describe derivation quality, not causal confidence;
 - missing data reduces confidence or appears as a data-gap timeline marker.
 
@@ -176,6 +187,32 @@ struct WindowComparison {
     deltas: Vec<WindowDelta>,
 }
 ```
+
+### Provenance Contract
+
+Fixture gold shapes are the comparison target, but they are not always the full
+runtime shape Janus needs. The implementation may therefore carry additional
+provenance fields in derived outputs or store envelopes, as long as serialized
+comparison can still match the fixture artifacts.
+
+Minimum provenance expectations:
+
+- anomaly windows point back to the metric series and any telemetry gap records
+  that affected the window or confidence;
+- log patterns point back to representative log exemplar ids, and those
+  exemplar ids resolve through the hot store;
+- timeline events carry one scalar `source_ref` that resolves to the source or
+  derived artifact represented by the event;
+- related anomalies point back to the seed anomaly, related anomaly windows,
+  and relationship or prior-incident refs when those inputs explain the
+  relation label;
+- window comparisons point back to the compared metric series and selected
+  healthy/anomalous windows.
+
+If a fixture gold artifact lacks a provenance field, comparison should still
+verify provenance on the derived runtime object before projecting it into the
+fixture-compatible shape. A derived object without inspectable provenance is not
+acceptable just because the current gold JSON can be matched without it.
 
 ## Anomaly Windows
 
