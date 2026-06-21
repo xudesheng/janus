@@ -89,14 +89,14 @@ fn rejects_missing_or_unsafe_scenario_id() {
 #[test]
 fn rejects_budget_that_cannot_fit_gold_bundle() {
     let mut token_query = deploy_bad_rollout_query();
-    token_query.budget.max_tokens = 249;
+    token_query.budget.max_tokens = 585;
 
     let error = get_evidence_bundle(token_query).unwrap_err();
     assert!(matches!(
         error,
         GetEvidenceBundleError::UnsupportedBudget {
-            requested_max_tokens: 249,
-            required_tokens: 250,
+            requested_max_tokens: 585,
+            required_tokens: 586,
             ..
         }
     ));
@@ -137,7 +137,7 @@ fn serializes_returned_bundle_to_json() {
     let json = serde_json::to_value(&bundle).unwrap();
 
     assert_eq!(json["items"][0]["source_refs"][0]["signal"], "change");
-    assert_eq!(json["budget"]["tokens_used"], 250);
+    assert_eq!(json["budget"]["tokens_used"], 586);
 }
 
 #[test]
@@ -259,7 +259,7 @@ fn deploy_bad_rollout_query() -> EvidenceQuery {
         },
         budget: EvidenceQueryBudget {
             max_items: 5,
-            max_tokens: 250,
+            max_tokens: 586,
             min_counter_evidence_items: None,
             reserve_tokens_for_raw_refs: None,
         },
@@ -287,7 +287,7 @@ fn coincidental_deploy_trap_query() -> EvidenceQuery {
         },
         budget: EvidenceQueryBudget {
             max_items: 5,
-            max_tokens: 380,
+            max_tokens: 642,
             min_counter_evidence_items: None,
             reserve_tokens_for_raw_refs: None,
         },

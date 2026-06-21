@@ -242,6 +242,12 @@ as a compatibility path and removed or quarantined by the end of that slice.
 The compiler should generate a broad candidate set before ranking and budget
 selection. Candidate generation should be source-backed and deterministic.
 
+For V1, selected evidence item ids should follow the current fixture convention
+`ev-1`, `ev-2`, and so on, assigned after final selection in selected-output
+order. This keeps exact selected-id comparison meaningful without a fixture id
+migration. Internal candidate ids may use a separate deterministic scheme, but
+only selected `ev-N` ids are part of the public `EvidenceBundle` comparison.
+
 ### Metric Anomaly Evidence
 
 Inputs:
@@ -519,6 +525,10 @@ a deterministic token payload derived from the selected `EvidenceItem`:
 - `token_cost` omitted from the estimator payload to avoid self-reference;
 - deterministic number formatting from the chosen JSON serializer.
 
+The V1 serializer is `serde_json::to_vec` over the canonical estimator payload.
+Slice 1 tests must pin at least one payload byte count so token costs cannot
+drift silently under dependency or payload-shape changes.
+
 The exact estimator can change in a later reviewed round, but the V1 estimator
 must be:
 
@@ -614,20 +624,22 @@ Comparison mode must be explicit per field family:
   item ids and ordering, item kind, direction, freshness, privacy scope,
   source refs, missing-data entries, suspected-cause rank/entity/supporting ids
   and counter ids, and next-check ordering.
-- Set or ordered-structural: item `entities` and candidate reason lists, using
-  documented ordering when the compiler owns ordering and set comparison when
-  order is not semantically meaningful.
+- Set or ordered-structural: item `entities`, using documented ordering when
+  the compiler owns ordering and set comparison when order is not semantically
+  meaningful.
+- Exact category set: suspected-cause `reasons`, which are category tokens such
+  as `time_alignment` and `downstream_db_healthy`, not free-form prose.
 - Numeric tolerance: item `strength`, confidence dimensions, suspected-cause
   score, and other derived numeric confidence or score fields.
 - Estimator-owned exact after fixture migration: item `token_cost`,
   `EvidenceBudget.tokens_used`, and `EvidenceBudget.items_dropped`.
-- Text structural by default: `claim`, suspected-cause `hypothesis`, textual
-  `reasons`, `note`, `trap_note`, next-check `action`, `rationale`, and
-  `expected_signal` must be deterministic, non-empty where required, and
-  anchored to the compared entities, source refs, evidence ids, or reason/check
-  categories. They should not require verbatim equality with hand-authored gold
-  prose unless a later reviewed slice introduces compiler-owned templates and
-  migrates the fixtures to those templates.
+- Text structural by default: `claim`, suspected-cause `hypothesis`, `note`,
+  `trap_note`, next-check `action`, `rationale`, and `expected_signal` must be
+  deterministic, non-empty where required, and anchored to the compared
+  entities, source refs, evidence ids, or reason/check categories. They should
+  not require verbatim equality with hand-authored gold prose unless a later
+  reviewed slice introduces compiler-owned templates and migrates the fixtures
+  to those templates.
 
 The comparison must fail if:
 
