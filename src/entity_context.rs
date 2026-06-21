@@ -129,9 +129,72 @@ pub fn resolve_entities(store: &HotContextStore) -> Vec<ResolvedEntity> {
     entities.into_values().collect()
 }
 
+pub fn resolve_relationships(
+    store: &HotContextStore,
+    entities: &[ResolvedEntity],
+) -> Vec<ResolvedRelationship> {
+    let resources = resource_identities(store);
+    let ambiguous_services = ambiguous_service_names(&resources);
+    let entity_confidences = entity_confidence_index(entities);
+    let spans = span_contexts(store, &resources, &ambiguous_services);
+    let mut relationships = BTreeMap::new();
+
+    insert_runtime_relationships(
+        &mut relationships,
+        &resources,
+        &ambiguous_services,
+        &entity_confidences,
+    );
+    insert_span_relationships(
+        &mut relationships,
+        &spans,
+        &resources,
+        &ambiguous_services,
+        &entity_confidences,
+    );
+    insert_resource_name_relationships(
+        &mut relationships,
+        &resources,
+        &ambiguous_services,
+        &entity_confidences,
+    );
+    insert_change_inferred_relationships(
+        &mut relationships,
+        store,
+        &resources,
+        &ambiguous_services,
+        &entity_confidences,
+    );
+    insert_prior_inferred_relationships(&mut relationships, store, &resources, &entity_confidences);
+    insert_shared_resource_relationships(&mut relationships, &entity_confidences);
+
+    relationships.into_values().collect()
+}
+
 pub fn relationship_store_key(src: &str, relationship_type: RelationshipType, dst: &str) -> String {
     format!("relationship:{src}|{}|{dst}", relationship_type.as_str())
 }
+
+#[derive(Debug, Clone)]
+struct SpanContext {
+    trace_id: String,
+    span_id: String,
+    parent_span_id: Option<String>,
+    resource_id: String,
+    entity_id: String,
+    endpoint_kind: SpanEndpointKind,
+    name: Option<String>,
+    attributes: Map<String, Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpanEndpointKind {
+    Service,
+    Dependency(EntityKind),
+}
+
+type RelationshipMap = BTreeMap<String, ResolvedRelationship>;
+type EntityConfidenceIndex = BTreeMap<String, UnitInterval>;
 
 #[derive(Debug, Clone)]
 struct ResourceIdentity {
@@ -143,6 +206,790 @@ struct ResourceIdentity {
     pod_name: Option<String>,
     host_name: Option<String>,
     db_system: Option<String>,
+    namespace_name: Option<String>,
+    cluster_name: Option<String>,
+    retry_max_attempts: Option<String>,
+    retry_backoff: Option<String>,
+}
+
+fn entity_confidence_index(entities: &[ResolvedEntity]) -> BTreeMap<String, UnitInterval> {
+    entities
+        .iter()
+        .map(|entity| (entity.id.clone(), entity.confidence))
+        .collect()
+}
+
+fn span_contexts(
+    store: &HotContextStore,
+    resources: &[ResourceIdentity],
+    ambiguous_services: &BTreeSet<String>,
+) -> Vec<SpanContext> {
+    store
+        .raw_source_records()
+        .filter(|record| record.kind == StoredRecordKind::Span)
+        .filter_map(|record| {
+            let resource_id = str_field(&record.payload, "resource")?.to_string();
+            let resource = resource_by_id(resources, &resource_id)?;
+            let (entity_id, endpoint_kind) =
+                span_endpoint_for_resource(resource, ambiguous_services)?;
+            let (trace_id, fallback_span_id) = trace_and_span_id_from_key(record.key.as_str())?;
+
+            Some(SpanContext {
+                trace_id,
+                span_id: str_field(&record.payload, "span_id")
+                    .unwrap_or(&fallback_span_id)
+                    .to_string(),
+                parent_span_id: str_field(&record.payload, "parent_id")
+                    .or_else(|| str_field(&record.payload, "parent_span_id"))
+                    .map(ToString::to_string),
+                resource_id,
+                entity_id,
+                endpoint_kind,
+                name: str_field(&record.payload, "name").map(ToString::to_string),
+                attributes: attributes(&record.payload).cloned().unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+fn trace_and_span_id_from_key(key: &str) -> Option<(String, String)> {
+    let (trace_id, span_id) = key.split_once('/')?;
+    Some((trace_id.to_string(), span_id.to_string()))
+}
+
+fn span_endpoint_for_resource(
+    resource: &ResourceIdentity,
+    ambiguous_services: &BTreeSet<String>,
+) -> Option<(String, SpanEndpointKind)> {
+    if let Some((id, kind, _)) = dependency_entity_from_resource(resource) {
+        return Some((id, SpanEndpointKind::Dependency(kind)));
+    }
+
+    service_entity_id_for_resource(resource, ambiguous_services)
+        .map(|service_id| (service_id, SpanEndpointKind::Service))
+}
+
+fn service_entity_id_for_resource(
+    resource: &ResourceIdentity,
+    ambiguous_services: &BTreeSet<String>,
+) -> Option<String> {
+    let service_name = resource.service_name.as_deref()?;
+
+    if !ambiguous_services.contains(service_name) {
+        return Some(format!("service:{service_name}"));
+    }
+
+    if resource.rollout.as_deref() == Some("canary") {
+        Some(format!("service:{service_name}@canary"))
+    } else if resource.service_version.is_some() && resource.service_instance_id.is_some() {
+        Some(format!("service:{service_name}@stable"))
+    } else {
+        Some(format!("service:{service_name}@unresolved"))
+    }
+}
+
+fn service_resource_for_name<'a>(
+    resources: &'a [ResourceIdentity],
+    service_name: &str,
+) -> Option<&'a ResourceIdentity> {
+    resources.iter().find(|resource| {
+        resource.db_system.is_none() && resource.service_name.as_deref() == Some(service_name)
+    })
+}
+
+fn nearest_service_ancestor<'a>(
+    span: &'a SpanContext,
+    spans_by_id: &BTreeMap<(String, String), &'a SpanContext>,
+) -> Option<&'a str> {
+    let mut current = span.parent_span_id.as_deref();
+
+    while let Some(parent_id) = current {
+        let parent = spans_by_id.get(&(span.trace_id.clone(), parent_id.to_string()))?;
+        if parent.endpoint_kind == SpanEndpointKind::Service {
+            return Some(parent.entity_id.as_str());
+        }
+        current = parent.parent_span_id.as_deref();
+    }
+
+    None
+}
+
+fn insert_runtime_relationships(
+    relationships: &mut RelationshipMap,
+    resources: &[ResourceIdentity],
+    ambiguous_services: &BTreeSet<String>,
+    entity_confidences: &EntityConfidenceIndex,
+) {
+    for resource in resources {
+        let Some(service_id) = service_entity_id_for_resource(resource, ambiguous_services) else {
+            continue;
+        };
+
+        if let Some(instance_id) = &resource.service_instance_id {
+            insert_relationship(
+                relationships,
+                resolved_relationship(
+                    service_id.clone(),
+                    RelationshipType::DeployedAs,
+                    format!("instance:{instance_id}"),
+                    UnitInterval(0.98),
+                    Vec::new(),
+                    BTreeMap::new(),
+                    entity_confidences,
+                ),
+            );
+        }
+
+        if let Some(pod_name) = &resource.pod_name {
+            let pod_id = format!("pod:{pod_name}");
+            insert_relationship(
+                relationships,
+                resolved_relationship(
+                    service_id,
+                    RelationshipType::DeployedAs,
+                    pod_id.clone(),
+                    UnitInterval(0.99),
+                    Vec::new(),
+                    BTreeMap::new(),
+                    entity_confidences,
+                ),
+            );
+
+            if let Some(host_name) = &resource.host_name {
+                insert_relationship(
+                    relationships,
+                    resolved_relationship(
+                        pod_id,
+                        RelationshipType::RunsOn,
+                        format!("host:{host_name}"),
+                        UnitInterval(0.95),
+                        Vec::new(),
+                        BTreeMap::new(),
+                        entity_confidences,
+                    ),
+                );
+            }
+        }
+    }
+}
+
+fn insert_span_relationships(
+    relationships: &mut RelationshipMap,
+    spans: &[SpanContext],
+    resources: &[ResourceIdentity],
+    ambiguous_services: &BTreeSet<String>,
+    entity_confidences: &EntityConfidenceIndex,
+) {
+    let spans_by_id = spans
+        .iter()
+        .map(|span| ((span.trace_id.clone(), span.span_id.clone()), span))
+        .collect::<BTreeMap<_, _>>();
+
+    for span in spans {
+        insert_parent_child_relationship(relationships, span, &spans_by_id, entity_confidences);
+        insert_peer_service_relationship(
+            relationships,
+            span,
+            resources,
+            ambiguous_services,
+            entity_confidences,
+        );
+        insert_dependency_span_relationship(
+            relationships,
+            span,
+            spans,
+            &spans_by_id,
+            entity_confidences,
+        );
+        insert_logical_span_relationships(relationships, span, resources, entity_confidences);
+    }
+
+    insert_retry_relationships(
+        relationships,
+        spans,
+        resources,
+        &spans_by_id,
+        ambiguous_services,
+        entity_confidences,
+    );
+}
+
+fn insert_parent_child_relationship(
+    relationships: &mut RelationshipMap,
+    span: &SpanContext,
+    spans_by_id: &BTreeMap<(String, String), &SpanContext>,
+    entity_confidences: &EntityConfidenceIndex,
+) {
+    if span.endpoint_kind != SpanEndpointKind::Service {
+        return;
+    }
+
+    let Some(parent_service) = nearest_service_ancestor(span, spans_by_id) else {
+        return;
+    };
+
+    if parent_service == span.entity_id {
+        return;
+    }
+
+    insert_relationship(
+        relationships,
+        resolved_relationship(
+            parent_service.to_string(),
+            RelationshipType::Calls,
+            span.entity_id.clone(),
+            UnitInterval(0.98),
+            vec![format!("trace:{}", span.trace_id)],
+            BTreeMap::new(),
+            entity_confidences,
+        ),
+    );
+}
+
+fn insert_peer_service_relationship(
+    relationships: &mut RelationshipMap,
+    span: &SpanContext,
+    resources: &[ResourceIdentity],
+    ambiguous_services: &BTreeSet<String>,
+    entity_confidences: &EntityConfidenceIndex,
+) {
+    let Some(peer_service) = str_attr(Some(&span.attributes), "peer.service") else {
+        return;
+    };
+    let Some(src) = (match span.endpoint_kind {
+        SpanEndpointKind::Service => Some(span.entity_id.as_str()),
+        SpanEndpointKind::Dependency(_) => None,
+    }) else {
+        return;
+    };
+
+    if let Some(peer_resource) = service_resource_for_name(resources, peer_service)
+        && let Some(dst) = service_entity_id_for_resource(peer_resource, ambiguous_services)
+    {
+        if src != dst {
+            insert_relationship(
+                relationships,
+                resolved_relationship(
+                    src.to_string(),
+                    RelationshipType::Calls,
+                    dst,
+                    UnitInterval(0.98),
+                    vec![format!("trace:{}", span.trace_id)],
+                    BTreeMap::new(),
+                    entity_confidences,
+                ),
+            );
+        }
+    } else {
+        let mut attributes = BTreeMap::new();
+        if span
+            .name
+            .as_deref()
+            .is_some_and(|name| name.to_ascii_lowercase().contains("charge"))
+        {
+            attributes.insert("role".to_string(), json!("payment-provider"));
+        }
+        insert_relationship(
+            relationships,
+            resolved_relationship(
+                src.to_string(),
+                RelationshipType::DependsOn,
+                format!("external-api:{peer_service}"),
+                UnitInterval(0.95),
+                vec![format!("trace:{}", span.trace_id)],
+                attributes,
+                entity_confidences,
+            ),
+        );
+    }
+}
+
+fn insert_dependency_span_relationship(
+    relationships: &mut RelationshipMap,
+    span: &SpanContext,
+    spans: &[SpanContext],
+    spans_by_id: &BTreeMap<(String, String), &SpanContext>,
+    entity_confidences: &EntityConfidenceIndex,
+) {
+    let SpanEndpointKind::Dependency(kind) = span.endpoint_kind else {
+        return;
+    };
+    let Some(src) = nearest_service_ancestor(span, spans_by_id) else {
+        return;
+    };
+    let relationship_type = if is_write_dependency_span(span) {
+        RelationshipType::WritesTo
+    } else {
+        RelationshipType::ReadsFrom
+    };
+    let confidence = match relationship_type {
+        RelationshipType::WritesTo => UnitInterval(0.96),
+        _ if kind == EntityKind::Cache => UnitInterval(0.97),
+        _ if has_cache_miss_sibling(span, spans) => UnitInterval(0.96),
+        _ => UnitInterval(0.97),
+    };
+    let mut attributes = BTreeMap::new();
+
+    if kind == EntityKind::Database && has_cache_miss_sibling(span, spans) {
+        attributes.insert("role".to_string(), json!("cache-miss-fallback"));
+    }
+
+    insert_relationship(
+        relationships,
+        resolved_relationship(
+            src.to_string(),
+            relationship_type,
+            span.entity_id.clone(),
+            confidence,
+            vec![format!("trace:{}", span.trace_id)],
+            attributes,
+            entity_confidences,
+        ),
+    );
+}
+
+fn insert_logical_span_relationships(
+    relationships: &mut RelationshipMap,
+    span: &SpanContext,
+    resources: &[ResourceIdentity],
+    entity_confidences: &EntityConfidenceIndex,
+) {
+    if span.endpoint_kind != SpanEndpointKind::Service {
+        return;
+    }
+
+    if let Some(shard) = str_attr(Some(&span.attributes), "orders.shard")
+        && let Some(service_name) = service_name_from_entity_id(&span.entity_id)
+    {
+        let shard_id = format!("shard:{service_name}-shard-{shard}");
+        insert_relationship(
+            relationships,
+            resolved_relationship(
+                span.entity_id.clone(),
+                RelationshipType::FansOutTo,
+                shard_id,
+                UnitInterval(0.90),
+                Vec::new(),
+                BTreeMap::new(),
+                entity_confidences,
+            ),
+        );
+    }
+
+    if let Some(tenant) = str_attr(Some(&span.attributes), "tenant.id") {
+        let mut attributes = BTreeMap::new();
+        if let Some(shard) = str_attr(Some(&span.attributes), "orders.shard") {
+            attributes.insert(
+                "routed_to_shard".to_string(),
+                Value::String(shard.to_string()),
+            );
+        }
+
+        if resources
+            .iter()
+            .any(|resource| resource.id == span.resource_id && resource.db_system.is_none())
+        {
+            insert_relationship(
+                relationships,
+                resolved_relationship(
+                    format!("tenant:{tenant}"),
+                    RelationshipType::Calls,
+                    span.entity_id.clone(),
+                    UnitInterval(0.90),
+                    vec![format!("trace:{}", span.trace_id)],
+                    attributes,
+                    entity_confidences,
+                ),
+            );
+        }
+    }
+}
+
+fn insert_retry_relationships(
+    relationships: &mut RelationshipMap,
+    spans: &[SpanContext],
+    resources: &[ResourceIdentity],
+    spans_by_id: &BTreeMap<(String, String), &SpanContext>,
+    ambiguous_services: &BTreeSet<String>,
+    entity_confidences: &EntityConfidenceIndex,
+) {
+    let mut attempts_by_edge: BTreeMap<(String, String, String), Vec<i64>> = BTreeMap::new();
+
+    for span in spans {
+        let Some(attempt) = int_attr(Some(&span.attributes), "retry.attempt") else {
+            continue;
+        };
+        let Some(src) = nearest_service_ancestor(span, spans_by_id) else {
+            continue;
+        };
+        let dst = if span.endpoint_kind == SpanEndpointKind::Service {
+            Some(span.entity_id.clone())
+        } else if let Some(peer_service) = str_attr(Some(&span.attributes), "peer.service") {
+            service_resource_for_name(resources, peer_service)
+                .and_then(|resource| service_entity_id_for_resource(resource, ambiguous_services))
+        } else {
+            None
+        };
+        let Some(dst) = dst else {
+            continue;
+        };
+
+        attempts_by_edge
+            .entry((span.trace_id.clone(), src.to_string(), dst))
+            .or_default()
+            .push(attempt);
+    }
+
+    for ((trace_id, src, dst), attempts) in attempts_by_edge {
+        let max_attempt = attempts.iter().copied().max().unwrap_or_default();
+        if attempts.len() < 2 && max_attempt < 2 {
+            continue;
+        }
+
+        let mut attributes = BTreeMap::new();
+        if let Some(max_attempts) =
+            retry_resource_attr(resources, &src, "checkout.retry.max_attempts")
+                .and_then(|value| value.parse::<i64>().ok())
+        {
+            attributes.insert(
+                "max_attempts".to_string(),
+                Value::Number(max_attempts.into()),
+            );
+        } else {
+            attributes.insert(
+                "max_attempts".to_string(),
+                Value::Number(max_attempt.into()),
+            );
+        }
+        if let Some(backoff) = retry_resource_attr(resources, &src, "checkout.retry.backoff") {
+            attributes.insert("backoff".to_string(), Value::String(backoff.to_string()));
+        }
+
+        insert_relationship(
+            relationships,
+            resolved_relationship(
+                src,
+                RelationshipType::Retries,
+                dst,
+                UnitInterval(0.95),
+                vec![format!("trace:{trace_id}")],
+                attributes,
+                entity_confidences,
+            ),
+        );
+    }
+}
+
+fn insert_resource_name_relationships(
+    relationships: &mut RelationshipMap,
+    resources: &[ResourceIdentity],
+    ambiguous_services: &BTreeSet<String>,
+    entity_confidences: &EntityConfidenceIndex,
+) {
+    for resource in resources {
+        let Some(service_name) = resource.service_name.as_deref() else {
+            continue;
+        };
+        let Some(prefix) = service_name.strip_suffix("-ui") else {
+            continue;
+        };
+        let Some(api_resource) = service_resource_for_name(resources, &format!("{prefix}-api"))
+        else {
+            continue;
+        };
+        let Some(src) = service_entity_id_for_resource(resource, ambiguous_services) else {
+            continue;
+        };
+        let Some(dst) = service_entity_id_for_resource(api_resource, ambiguous_services) else {
+            continue;
+        };
+
+        insert_relationship(
+            relationships,
+            resolved_relationship(
+                src,
+                RelationshipType::Calls,
+                dst,
+                UnitInterval(0.95),
+                Vec::new(),
+                BTreeMap::new(),
+                entity_confidences,
+            ),
+        );
+    }
+}
+
+fn insert_change_inferred_relationships(
+    relationships: &mut RelationshipMap,
+    store: &HotContextStore,
+    resources: &[ResourceIdentity],
+    ambiguous_services: &BTreeSet<String>,
+    entity_confidences: &EntityConfidenceIndex,
+) {
+    for record in store
+        .raw_source_records()
+        .filter(|record| record.kind == StoredRecordKind::Change)
+    {
+        let Some(src) = str_field(&record.payload, "entity") else {
+            continue;
+        };
+        if !src.starts_with("service:") {
+            continue;
+        }
+        let summary = str_field(&record.payload, "summary").unwrap_or_default();
+        if !summary.to_ascii_lowercase().contains("vacuum") {
+            continue;
+        }
+        let Some(dst) = database_entity_for_text(summary, resources) else {
+            continue;
+        };
+        let service_name = src
+            .strip_prefix("service:")
+            .and_then(|name| name.split_once('@').map(|(base, _)| base).or(Some(name)));
+        let resolved_src = service_name
+            .and_then(|name| service_resource_for_name(resources, name))
+            .and_then(|resource| service_entity_id_for_resource(resource, ambiguous_services))
+            .unwrap_or_else(|| src.to_string());
+
+        insert_relationship(
+            relationships,
+            resolved_relationship(
+                resolved_src,
+                RelationshipType::WritesTo,
+                dst,
+                UnitInterval(0.95),
+                vec![record.key.as_str().to_string()],
+                BTreeMap::new(),
+                entity_confidences,
+            ),
+        );
+    }
+}
+
+fn insert_prior_inferred_relationships(
+    relationships: &mut RelationshipMap,
+    store: &HotContextStore,
+    resources: &[ResourceIdentity],
+    entity_confidences: &EntityConfidenceIndex,
+) {
+    for record in store
+        .raw_source_records()
+        .filter(|record| record.kind == StoredRecordKind::PriorIncident)
+    {
+        let Some(signature) = record.payload.get("signature").and_then(Value::as_object) else {
+            continue;
+        };
+        let Some(primary_entity) = signature.get("primary_entity").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(trigger) = signature.get("trigger").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some((src, _)) = trigger.split_once(' ') else {
+            continue;
+        };
+        if !src.starts_with("service:") || !primary_entity.starts_with("db:") {
+            continue;
+        }
+        if resources.iter().all(|resource| {
+            resource.service_name.as_deref() != Some(primary_entity.trim_start_matches("db:"))
+        }) {
+            continue;
+        }
+
+        insert_relationship(
+            relationships,
+            resolved_relationship(
+                src.to_string(),
+                RelationshipType::WritesTo,
+                primary_entity.to_string(),
+                UnitInterval(0.95),
+                vec![record.key.as_str().to_string()],
+                BTreeMap::new(),
+                entity_confidences,
+            ),
+        );
+    }
+}
+
+fn insert_shared_resource_relationships(
+    relationships: &mut RelationshipMap,
+    entity_confidences: &EntityConfidenceIndex,
+) {
+    let existing = relationships.values().cloned().collect::<Vec<_>>();
+
+    for read in existing
+        .iter()
+        .filter(|relationship| relationship.relationship_type == RelationshipType::ReadsFrom)
+    {
+        for write in existing.iter().filter(|relationship| {
+            relationship.relationship_type == RelationshipType::WritesTo
+                && relationship.dst == read.dst
+                && relationship.confidence >= UnitInterval(0.96)
+        }) {
+            if read.src == write.src {
+                continue;
+            }
+            insert_relationship(
+                relationships,
+                resolved_relationship(
+                    read.src.clone(),
+                    RelationshipType::SharesResourceWith,
+                    write.src.clone(),
+                    UnitInterval(0.80),
+                    vec![read.dst.clone()],
+                    BTreeMap::new(),
+                    entity_confidences,
+                ),
+            );
+        }
+    }
+}
+
+fn is_write_dependency_span(span: &SpanContext) -> bool {
+    let operation = str_attr(Some(&span.attributes), "db.statement")
+        .or(span.name.as_deref())
+        .unwrap_or_default()
+        .trim_start()
+        .to_ascii_uppercase();
+
+    [
+        "INSERT", "UPDATE", "DELETE", "CREATE", "ALTER", "DROP", "VACUUM",
+    ]
+    .iter()
+    .any(|prefix| operation.starts_with(prefix))
+}
+
+fn has_cache_miss_sibling(span: &SpanContext, spans: &[SpanContext]) -> bool {
+    spans.iter().any(|candidate| {
+        candidate.trace_id == span.trace_id
+            && candidate.parent_span_id == span.parent_span_id
+            && candidate.endpoint_kind == SpanEndpointKind::Dependency(EntityKind::Cache)
+            && candidate
+                .attributes
+                .get("cache.hit")
+                .and_then(Value::as_bool)
+                == Some(false)
+    })
+}
+
+fn database_entity_for_text(text: &str, resources: &[ResourceIdentity]) -> Option<String> {
+    let lowered = text.to_ascii_lowercase();
+
+    resources.iter().find_map(|resource| {
+        resource.db_system.as_ref()?;
+        let service_name = resource.service_name.as_deref()?;
+        let stem = service_name.strip_suffix("-pg").unwrap_or(service_name);
+        if lowered.contains(stem) || lowered.contains(service_name) {
+            Some(format!("db:{service_name}"))
+        } else {
+            None
+        }
+    })
+}
+
+fn service_name_from_entity_id(entity_id: &str) -> Option<&str> {
+    entity_id
+        .strip_prefix("service:")?
+        .split_once('@')
+        .map(|(base, _)| base)
+        .or(Some(entity_id.strip_prefix("service:")?))
+}
+
+fn retry_resource_attr<'a>(
+    resources: &'a [ResourceIdentity],
+    service_entity_id: &str,
+    attr: &str,
+) -> Option<&'a str> {
+    let service_name = service_name_from_entity_id(service_entity_id)?;
+    resources
+        .iter()
+        .find(|resource| resource.service_name.as_deref() == Some(service_name))
+        .and_then(|resource| resource_attribute(resource, attr))
+}
+
+fn resource_attribute<'a>(resource: &'a ResourceIdentity, attr: &str) -> Option<&'a str> {
+    match attr {
+        "checkout.retry.max_attempts" => resource.retry_max_attempts.as_deref(),
+        "checkout.retry.backoff" => resource.retry_backoff.as_deref(),
+        _ => None,
+    }
+}
+
+fn int_attr(attributes: Option<&Map<String, Value>>, key: &str) -> Option<i64> {
+    attributes?.get(key).and_then(|value| {
+        value
+            .as_i64()
+            .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+    })
+}
+
+fn resolved_relationship(
+    src: String,
+    relationship_type: RelationshipType,
+    dst: String,
+    confidence: UnitInterval,
+    evidence: Vec<String>,
+    attributes: BTreeMap<String, Value>,
+    entity_confidences: &EntityConfidenceIndex,
+) -> ResolvedRelationship {
+    ResolvedRelationship {
+        confidence: relationship_confidence(&src, &dst, confidence, entity_confidences),
+        src,
+        relationship_type,
+        dst,
+        evidence: dedupe_stable(evidence),
+        attributes,
+    }
+}
+
+fn relationship_confidence(
+    src: &str,
+    dst: &str,
+    base: UnitInterval,
+    entity_confidences: &EntityConfidenceIndex,
+) -> UnitInterval {
+    let src_confidence = entity_confidences
+        .get(src)
+        .copied()
+        .unwrap_or(UnitInterval(1.0));
+    let dst_confidence = entity_confidences
+        .get(dst)
+        .copied()
+        .unwrap_or(UnitInterval(1.0));
+
+    if src_confidence < UnitInterval(0.50) || dst_confidence < UnitInterval(0.50) {
+        UnitInterval((base.0 - 0.20).max(0.30))
+    } else {
+        base
+    }
+}
+
+fn insert_relationship(relationships: &mut RelationshipMap, relationship: ResolvedRelationship) {
+    let key = relationship_store_key(
+        &relationship.src,
+        relationship.relationship_type,
+        &relationship.dst,
+    );
+    let Some(existing) = relationships.get_mut(&key) else {
+        relationships.insert(key, relationship);
+        return;
+    };
+
+    if relationship.confidence > existing.confidence {
+        existing.confidence = relationship.confidence;
+    }
+    existing.evidence = dedupe_stable(
+        existing
+            .evidence
+            .iter()
+            .chain(&relationship.evidence)
+            .cloned()
+            .collect(),
+    );
+    for (key, value) in relationship.attributes {
+        existing.attributes.entry(key).or_insert(value);
+    }
 }
 
 fn resource_identities(store: &HotContextStore) -> Vec<ResourceIdentity> {
@@ -163,6 +1010,12 @@ fn resource_identities(store: &HotContextStore) -> Vec<ResourceIdentity> {
                 host_name: str_attr(attributes, "host.name").map(ToString::to_string),
                 db_system: str_attr(attributes, "db.system")
                     .or_else(|| str_attr(attributes, "db.system.name"))
+                    .map(ToString::to_string),
+                namespace_name: str_attr(attributes, "k8s.namespace.name").map(ToString::to_string),
+                cluster_name: str_attr(attributes, "cluster.name").map(ToString::to_string),
+                retry_max_attempts: str_attr(attributes, "checkout.retry.max_attempts")
+                    .map(ToString::to_string),
+                retry_backoff: str_attr(attributes, "checkout.retry.backoff")
                     .map(ToString::to_string),
             }
         })
@@ -240,7 +1093,7 @@ fn insert_resource_entities(
                     format!("pod:{pod_name}"),
                     EntityKind::Pod,
                     vec![resource.id.clone()],
-                    pod_confidence(pod_name),
+                    pod_confidence(resource),
                 ),
             );
         }
@@ -284,9 +1137,9 @@ fn dependency_entity_from_resource(
     let service_name = resource.service_name.as_deref()?;
 
     if db_system == "redis" {
-        if service_name == "redis-cache" {
+        if resource.cluster_name.is_some() {
             Some((
-                "infra:redis-cache".to_string(),
+                format!("infra:{service_name}"),
                 EntityKind::Cache,
                 UnitInterval(0.97),
             ))
@@ -298,34 +1151,32 @@ fn dependency_entity_from_resource(
             ))
         }
     } else {
-        let confidence = if service_name == "inventory-pg" {
-            UnitInterval(0.97)
-        } else {
-            UnitInterval(0.98)
-        };
-
         Some((
             format!("db:{service_name}"),
             EntityKind::Database,
-            confidence,
+            UnitInterval(0.98),
         ))
     }
 }
 
 fn service_confidence(resource: &ResourceIdentity) -> UnitInterval {
-    match resource.service_name.as_deref() {
-        Some("otel-collector") => UnitInterval(0.95),
-        Some("inventory") => UnitInterval(0.98),
-        Some("reporting-job") => UnitInterval(0.97),
-        _ => UnitInterval(0.99),
+    match (
+        resource.service_version.is_some(),
+        resource.service_instance_id.is_some(),
+        resource.namespace_name.is_some(),
+    ) {
+        (true, true, _) | (true, _, true) => UnitInterval(0.99),
+        (true, false, false) => UnitInterval(0.98),
+        (false, true, _) | (false, false, true) => UnitInterval(0.95),
+        (false, false, false) => UnitInterval(0.90),
     }
 }
 
-fn pod_confidence(pod_name: &str) -> UnitInterval {
-    if pod_name.starts_with("recommender-") {
-        UnitInterval(0.98)
-    } else {
+fn pod_confidence(resource: &ResourceIdentity) -> UnitInterval {
+    if resource.host_name.is_some() {
         UnitInterval(0.99)
+    } else {
+        UnitInterval(0.98)
     }
 }
 

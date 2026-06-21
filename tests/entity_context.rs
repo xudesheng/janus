@@ -1,7 +1,7 @@
 use janus::{
     entity_context::{
         EntityKind, RelationshipType, ResolvedEntity, ResolvedRelationship, relationship_store_key,
-        resolve_entities,
+        resolve_entities, resolve_relationships,
     },
     evidence::UnitInterval,
     fixture_validation::{FixtureCase, FixtureCorpus, FixtureSelector},
@@ -207,6 +207,116 @@ fn resolver_derives_every_current_fixture_gold_entity_id_and_kind() {
 }
 
 #[test]
+fn relationship_builder_derives_every_current_fixture_gold_relationship() {
+    let corpus = FixtureCorpus::load(repo_root()).unwrap();
+
+    for case in &corpus.cases {
+        let store = HotContextStore::load_fixture_case(case).unwrap();
+        let entities = resolve_entities(&store);
+        let derived = resolve_relationships(&store, &entities);
+        let expected: Vec<ResolvedRelationship> =
+            serde_json::from_value(case.expected["relationships"].clone()).unwrap();
+
+        for expected_relationship in expected {
+            let actual = derived
+                .iter()
+                .find(|relationship| {
+                    relationship.src == expected_relationship.src
+                        && relationship.relationship_type == expected_relationship.relationship_type
+                        && relationship.dst == expected_relationship.dst
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "relationship builder missed expected relationship {} {} {} for {}",
+                        expected_relationship.src,
+                        expected_relationship.relationship_type.as_str(),
+                        expected_relationship.dst,
+                        case.registry_entry.id
+                    )
+                });
+
+            for evidence in &expected_relationship.evidence {
+                assert!(
+                    actual.evidence.contains(evidence),
+                    "relationship {} {} {} in {} is missing expected evidence {}",
+                    expected_relationship.src,
+                    expected_relationship.relationship_type.as_str(),
+                    expected_relationship.dst,
+                    case.registry_entry.id,
+                    evidence
+                );
+            }
+            for (key, value) in &expected_relationship.attributes {
+                assert_eq!(
+                    actual.attributes.get(key),
+                    Some(value),
+                    "relationship {} {} {} in {} has wrong attribute {}",
+                    expected_relationship.src,
+                    expected_relationship.relationship_type.as_str(),
+                    expected_relationship.dst,
+                    case.registry_entry.id,
+                    key
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn relationship_builder_preserves_retry_and_cache_fallback_attributes() {
+    let retry_store =
+        HotContextStore::load_fixture_case(fixture_case("retry-storm-amplification")).unwrap();
+    let retry_entities = resolve_entities(&retry_store);
+    let retry_relationships = resolve_relationships(&retry_store, &retry_entities);
+    let retry = relationship(
+        &retry_relationships,
+        "service:checkout",
+        RelationshipType::Retries,
+        "service:payment-svc",
+    );
+    assert_eq!(retry.evidence, vec!["trace:t-2001"]);
+    assert_eq!(retry.attributes["max_attempts"], json!(5));
+    assert_eq!(retry.attributes["backoff"], json!("none"));
+
+    let cache_store =
+        HotContextStore::load_fixture_case(fixture_case("coincidental-deploy-trap")).unwrap();
+    let cache_entities = resolve_entities(&cache_store);
+    let cache_relationships = resolve_relationships(&cache_store, &cache_entities);
+    let fallback = relationship(
+        &cache_relationships,
+        "service:search-api",
+        RelationshipType::ReadsFrom,
+        "db:catalog-pg",
+    );
+    assert_eq!(fallback.evidence, vec!["trace:t-3001"]);
+    assert_eq!(fallback.attributes["role"], json!("cache-miss-fallback"));
+}
+
+#[test]
+fn relationship_builder_ignores_derived_gold_relationship_records() {
+    let mut store = HotContextStore::new();
+    store
+        .insert_record(StoredRecord {
+            key: SourceKey::new("relationship:gold-only"),
+            kind: StoredRecordKind::Relationship,
+            time_window: None,
+            entities: vec!["service:source".to_string(), "service:target".to_string()],
+            payload: json!({
+                "src": "service:source",
+                "type": "calls",
+                "dst": "service:target",
+                "confidence": 0.99
+            }),
+        })
+        .unwrap();
+
+    assert!(
+        resolve_relationships(&store, &[]).is_empty(),
+        "relationship builder must derive from raw source records, not expected/gold relationship records"
+    );
+}
+
+#[test]
 fn resolver_ignores_derived_gold_entity_records() {
     let mut store = HotContextStore::new();
     store
@@ -307,6 +417,22 @@ fn entity<'a>(entities: &'a [ResolvedEntity], id: &str) -> &'a ResolvedEntity {
         .iter()
         .find(|entity| entity.id == id)
         .expect("entity should exist")
+}
+
+fn relationship<'a>(
+    relationships: &'a [ResolvedRelationship],
+    src: &str,
+    relationship_type: RelationshipType,
+    dst: &str,
+) -> &'a ResolvedRelationship {
+    relationships
+        .iter()
+        .find(|relationship| {
+            relationship.src == src
+                && relationship.relationship_type == relationship_type
+                && relationship.dst == dst
+        })
+        .expect("relationship should exist")
 }
 
 fn repo_root() -> &'static Path {
