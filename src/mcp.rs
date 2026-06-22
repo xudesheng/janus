@@ -2,7 +2,9 @@ use crate::{
     evidence::{EvidenceBundle, TimeWindow},
     query::{
         EvidenceQuery, EvidenceQueryBudget, EvidenceQueryIntent, FreshnessPreference,
-        GetEvidenceBundleError, get_evidence_bundle,
+        GetEvidenceBundleError, REQUIREMENT_COUNTER_EVIDENCE, REQUIREMENT_HOT_CONTEXT_ENTITIES,
+        REQUIREMENT_HOT_CONTEXT_TIME_WINDOW, REQUIREMENT_HOT_CONTEXT_TIME_WINDOW_ENTITIES,
+        REQUIREMENT_RAW_REFS, default_require_raw_refs, get_evidence_bundle,
     },
 };
 use schemars::{JsonSchema, schema::RootSchema, schema_for};
@@ -135,7 +137,7 @@ pub fn tool_error_from_get_evidence_bundle(error: GetEvidenceBundleError) -> Too
             code: ToolErrorCode::ContextUnavailable,
             message,
             path: None,
-            requirement: Some(requirement.to_string()),
+            requirement: None,
         },
         GetEvidenceBundleError::UnsatisfiedRequirement {
             requirement,
@@ -231,14 +233,19 @@ fn invalid_arguments_error(error: serde_json::Error) -> ToolError {
     }
 }
 
-fn default_require_raw_refs() -> bool {
-    true
-}
-
 fn is_context_requirement(requirement: &str) -> bool {
     matches!(
         requirement,
-        "hot_context_time_window" | "hot_context_entities" | "hot_context_time_window_entities"
+        REQUIREMENT_HOT_CONTEXT_TIME_WINDOW
+            | REQUIREMENT_HOT_CONTEXT_ENTITIES
+            | REQUIREMENT_HOT_CONTEXT_TIME_WINDOW_ENTITIES
+    )
+}
+
+pub fn is_public_evidence_requirement(requirement: &str) -> bool {
+    matches!(
+        requirement,
+        REQUIREMENT_COUNTER_EVIDENCE | REQUIREMENT_RAW_REFS
     )
 }
 

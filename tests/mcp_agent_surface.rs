@@ -172,7 +172,49 @@ fn hot_context_requirement_maps_to_context_unavailable() {
     let error = call_get_evidence_bundle(arguments).unwrap_err();
 
     assert_eq!(error.code, ToolErrorCode::ContextUnavailable);
-    assert_eq!(error.requirement.as_deref(), Some("hot_context_entities"));
+    assert_eq!(error.requirement, None);
+}
+
+#[test]
+fn hot_context_time_window_requirement_maps_to_context_unavailable() {
+    let mut arguments = deploy_bad_rollout_tool_arguments();
+    arguments["time_window"] = json!({
+        "start": "2026-06-01T13:00:00Z",
+        "end": "2026-06-01T13:01:00Z"
+    });
+
+    let error = call_get_evidence_bundle(arguments).unwrap_err();
+
+    assert_eq!(error.code, ToolErrorCode::ContextUnavailable);
+    assert_eq!(error.requirement, None);
+}
+
+#[test]
+fn hot_context_time_and_entity_requirement_maps_to_context_unavailable() {
+    let mut arguments = deploy_bad_rollout_tool_arguments();
+    arguments["time_window"] = json!({
+        "start": "2026-06-01T14:03:20Z",
+        "end": "2026-06-01T14:03:22Z"
+    });
+    arguments["entities"] = json!(["res:api-gateway"]);
+
+    let error = call_get_evidence_bundle(arguments).unwrap_err();
+
+    assert_eq!(error.code, ToolErrorCode::ContextUnavailable);
+    assert_eq!(error.requirement, None);
+}
+
+#[test]
+fn unsupported_budget_maps_to_tool_budget_error() {
+    let error = tool_error_from_get_evidence_bundle(GetEvidenceBundleError::UnsupportedBudget {
+        requested_max_items: 1,
+        required_items: 2,
+        requested_max_tokens: 1,
+        required_tokens: 2,
+    });
+
+    assert_eq!(error.code, ToolErrorCode::BudgetUnsatisfied);
+    assert_eq!(error.path.as_deref(), Some("budget"));
 }
 
 fn deploy_bad_rollout_tool_input() -> GetEvidenceBundleToolInput {
