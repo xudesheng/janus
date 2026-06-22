@@ -45,3 +45,85 @@ Repository checks performed:
 - The covered formal design-doc change was committed and pushed first as `8a94365 docs: reconcile mcp agent surface schema guidance`.
 
 <!-- Reviewer appends below; the Implementor must not edit past this line. -->
+
+## Review (by Claude)
+
+### Direction Verdict
+
+Continue — and I now **agree with the design unconditionally**. Both review-1
+blockers (B1, B2) and both nits are resolved in the formal doc; I have no remaining
+design findings. From this reviewer's standpoint the design gate is closed and
+implementation may begin **phase-by-phase** (MCP schema artifacts -> transport-
+independent handler -> stdio surface -> smoke test). The full gate still requires
+every other active reviewer (notably the User) to record agreement; I can only
+close my own.
+
+This is a convergence round: it left no design defect open and the milestone's
+*implementation* artifact does not yet exist, so under "Round Termination" the next
+round should be the **first implementation round (phase 1)**, not another
+design-only round and not a stop.
+
+### Verification Of The Round-1 Fixes
+
+I checked each against `docs/core/mcp-agent-surface.md` at the baseline tree, not
+just the response summary:
+
+- **B1 (duplicated schema-validation guidance) — resolved.** The formerly
+  contradictory paragraph (lines 298-302) no longer permits "the chosen local
+  validator"; it now defers to the strict contract above it and explicitly says
+  "do not add a weaker local-validator-only acceptance path." Exactly one strict
+  validator contract now stands (lines 270-281). Good.
+- **B2 (`EvidenceQuery` reuse trap) — resolved.** Lines 262-268 now forbid
+  generating the V1 input schema by blindly exporting `EvidenceQuery` (whose
+  `scenario_id` is `Option<String>`, `src/query.rs:28`), require a distinct
+  tool-input type / generation override / post-generation transform, and require a
+  test asserting root `required` includes `scenario_id`. That closes the path back
+  to the optionality F3 removed.
+- **Nit 1 (stale `scenario_id` wording) — resolved.** Lines 167-170 now state the
+  first implementation *uses* the fixture/demo selector and labels it temporary,
+  consistent with the required-in-V1 paragraph below it.
+- **Nit 2 (server-side error collapse) — resolved.** Lines 378-383 now state all
+  server-side faults collapse to `internal_error` unless the selector is invalid
+  or unknown, explicitly including fixture corpus loading and invalid fixture
+  bundles. The mapping from all 12 `GetEvidenceBundleError` variants
+  (`src/query.rs:76-108`) is now total with no implicit cases.
+
+### Answers To This Round's Review Focus
+
+1. Yes — the Schema Strategy now has a single strict validator contract; the B1
+   contradiction is gone. 2. Yes — the B2 guard (distinct type/override/transform +
+   a `required`-includes-`scenario_id` test) is enough to stop phase 1 from emitting
+   an optional `scenario_id`. 3. Yes — both nits are resolved. 4. Yes — from my
+   standpoint implementation may begin phase-by-phase after this round, starting
+   with the MCP schema artifacts and the transport-independent handler, once all
+   active reviewers have agreed.
+
+### Guidance For The First Implementation Round
+
+Not blockers — just what I will look for when reviewing phase 1, drawn straight
+from the design's own Tests and DoD so there are no surprises:
+
+- the committed `schemas/mcp/get-evidence-bundle.input.schema.json` lists
+  `scenario_id` in root `required` (the B2 assertion), declares draft-07 via
+  `$schema`, has an object root, and every array declares `items`;
+- the committed-vs-freshly-generated diff test exists so the agent contract cannot
+  drift from the Rust types;
+- the strict validator chosen for the acceptance test is named and justified as
+  representative (the `jsonschema` crate in draft-07 mode satisfies this);
+- the handler maps every `GetEvidenceBundleError` variant to a stable tool error
+  code with no `internal_error` leakage of Rust debug strings, including the
+  `requirement_unsatisfied{requirement}` cases for both `counter_evidence` and
+  `raw_refs`.
+
+### Process / Framework Check
+
+- Baseline SHA `8a94365` points to the pushed formal-doc commit (`docs: reconcile
+  mcp agent surface schema guidance`), the pre-review-document tree, not to the
+  review-2 commit `7723ec5`; frozen and correct.
+- Covered formal-doc change pushed first, review-2 as its own commit after.
+  Compliant.
+- Header carries milestone / critical-path / progress / deferred; `## Verification`
+  records "no code verification this round" for a design-only round. Compliant.
+- This review leaves no actionable design feedback, but the milestone's
+  implementation artifact is unbuilt, so the loop continues into implementation
+  rather than stopping.
