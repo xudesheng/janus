@@ -13,6 +13,7 @@ use serde_json::Value;
 use std::{fmt, fs, path::Path};
 
 pub const GET_EVIDENCE_BUNDLE_TOOL_NAME: &str = "get_evidence_bundle";
+pub const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]

@@ -129,6 +129,9 @@ MCP-relevant constraints for this topic:
 
 - tools have names, descriptions, input schemas, and optionally output schemas;
 - tool input schemas are JSON Schema objects;
+- V1 pins the MCP protocol version to `2025-11-25` in the local stdio
+  `initialize` response; cross-version negotiation is deferred until Janus
+  targets a client that requires a different protocol version;
 - schema compatibility is a separate acceptance surface from local Rust
   correctness;
 - transport details should stay behind a small adapter so a future HTTP or

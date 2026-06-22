@@ -1,14 +1,12 @@
 use janus::mcp::{
-    GET_EVIDENCE_BUNDLE_TOOL_NAME, call_get_evidence_bundle, get_evidence_bundle_tool_definition,
+    GET_EVIDENCE_BUNDLE_TOOL_NAME, MCP_PROTOCOL_VERSION, call_get_evidence_bundle,
+    get_evidence_bundle_tool_definition,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
 
-const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
-
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct JsonRpcRequest {
     jsonrpc: String,
     #[serde(default)]
@@ -19,7 +17,6 @@ struct JsonRpcRequest {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ToolCallParams {
     name: String,
     #[serde(default)]
@@ -65,14 +62,30 @@ fn serve_stdio<R: BufRead, W: Write>(reader: R, mut writer: W) -> io::Result<()>
 }
 
 fn handle_line(line: &str) -> Option<JsonRpcResponse> {
-    match serde_json::from_str::<JsonRpcRequest>(line) {
-        Ok(request) => handle_request(request),
-        Err(error) => Some(error_response(
-            Value::Null,
-            -32700,
-            format!("parse error: {error}"),
-        )),
-    }
+    let value = match serde_json::from_str::<Value>(line) {
+        Ok(value) => value,
+        Err(error) => {
+            return Some(error_response(
+                Value::Null,
+                -32700,
+                format!("parse error: {error}"),
+            ));
+        }
+    };
+    let id = value.get("id").cloned().unwrap_or(Value::Null);
+
+    let request = match serde_json::from_value::<JsonRpcRequest>(value) {
+        Ok(request) => request,
+        Err(error) => {
+            return Some(error_response(
+                id,
+                -32600,
+                format!("invalid request: {error}"),
+            ));
+        }
+    };
+
+    handle_request(request)
 }
 
 fn handle_request(request: JsonRpcRequest) -> Option<JsonRpcResponse> {
