@@ -76,6 +76,22 @@ Reviewers should explicitly decide:
 - whether output should expose only `EvidenceBundle` first, or include
   `suspected_causes` and `next_checks` from the compiler result.
 
+After review 0, the proposed V1 direction is:
+
+- expose only `get_evidence_bundle` in the first agent-facing surface;
+- make stdio MCP the completion target;
+- allow a protocol-shaped command only as an intermediate implementation slice;
+- require `scenario_id` in the V1 tool input schema while labeling it as a
+  temporary fixture/demo selector;
+- reserve `context_selector` as the production replacement concept for
+  selecting live or persisted Janus context;
+- return only `{ "bundle": EvidenceBundle }` in V1;
+- defer public `suspected_causes` and `next_checks` fields until reviewers
+  approve the extra schema surface.
+
+These choices are still subject to final reviewer agreement. The design gate is
+closed only when every active reviewer agrees in their `Direction Verdict`.
+
 ## Scope
 
 In scope:
@@ -153,19 +169,30 @@ selector because the current compiled path still uses fixture replay to build a
 fresh store. The schema must label it as a demo selector, not the long-term
 production query mechanism.
 
-Minimum input fields:
+For V1, `scenario_id` is required in the MCP tool input schema because the
+current runtime cannot answer without fixture-backed context selection. Marking
+it optional at the agent boundary would make the tool schema misleading. The
+schema description should state that `scenario_id` is temporary and will be
+replaced by a production context selector once Janus has a live or persisted
+context-selection path. The reserved production concept name is
+`context_selector`.
 
+Minimum V1 required input fields:
+
+- `scenario_id`;
 - `intent.question` and/or `intent.hypothesis`;
 - `time_window.start`;
 - `time_window.end`;
 - `budget.max_items`;
-- `budget.max_tokens`;
-- optional `scenario_id`;
-- optional `entities`;
-- optional `require_counter_evidence`;
-- optional `require_raw_refs`;
-- optional `freshness`;
-- optional `privacy_scope`.
+- `budget.max_tokens`.
+
+Minimum V1 optional input fields:
+
+- `entities`;
+- `require_counter_evidence`;
+- `require_raw_refs`;
+- `freshness`;
+- `privacy_scope`.
 
 Minimum output:
 
@@ -179,7 +206,9 @@ Minimum output:
 
 The output envelope allows future metadata without changing the Evidence IR
 shape. The `bundle` field should be exactly the current `EvidenceBundle`
-contract.
+contract. In MCP tool-call results, the envelope should be returned as
+structured content, with the same serialized JSON also available as text content
+when needed for client compatibility.
 
 ## Optional Companion Outputs
 
@@ -205,6 +234,10 @@ duplicating query logic or re-running compilation inconsistently. The output
 schemas for `suspected_causes` and `next_checks` must be generated or tested
 with the same strictness as Evidence IR.
 
+Because the compiler already produces `suspected_causes` and `next_checks`, a
+future optional slice should be a surfacing and schema decision, not a second
+compiler path.
+
 Do not expose separate `rank_suspected_causes` or `suggest_next_checks` tools
 until reviewers approve that the schema and runtime paths are mature enough.
 
@@ -229,6 +262,19 @@ schemas/mcp/
 The tool input schema can reuse `EvidenceQuery` but should be committed as a
 tool-facing artifact so compatibility tests can validate it independently.
 
+V1 MCP-facing schemas should explicitly declare draft-07 with `$schema`, matching
+the repository's current `schemars` output. The implementation should not rely
+only on Janus's Rust deserialization or ad hoc schema inspection. It should
+validate committed MCP schemas with the Rust `jsonschema` crate in draft-07 mode
+or an equivalent strict JSON Schema validator, and the review should justify the
+chosen validator as representative of the MCP/tool-use clients Janus expects to
+serve.
+
+The concrete migration trigger for JSON Schema 2020-12 is an MCP client,
+tool-use runtime, or strict validator that rejects Janus's explicit draft-07
+tool schemas or requires 2020-12-only features. Until then, V1 should keep the
+dialect narrow, explicit, and tested instead of migrating all project schemas.
+
 Schema requirements:
 
 - the tool input schema root is `type: object`;
@@ -236,10 +282,12 @@ Schema requirements:
 - required fields are explicit;
 - enum values are explicit;
 - integer budgets have positive minimums;
-- `scenario_id` is optional in schema but required by the current fixture-backed
-  runtime until a live context selector exists;
+- `scenario_id` is required in the V1 MCP tool input schema and clearly
+  described as a temporary fixture/demo selector;
 - the output schema declares the `bundle` object and its nested arrays;
 - schema generation is repeatable and tested;
+- committed `schemas/mcp/` artifacts are diffed against freshly generated output
+  in tests or CI;
 - strict validators should not need to infer array item types.
 
 The repository currently generates draft-07 schemas through `schemars`. MCP
@@ -254,6 +302,11 @@ should not migrate all project schemas just to expose one tool. Instead:
 ## Runtime Surface
 
 The first runtime should be small and local. Acceptable implementation shapes:
+
+Review 0 feedback makes stdio MCP the proposed completion target. A
+protocol-shaped command is acceptable only as an intermediate implementation
+slice for deterministic schema and handler tests. The topic is not complete
+with a command-only surface unless reviewers explicitly change this bar.
 
 ### Option A: stdio MCP server
 
@@ -287,10 +340,11 @@ Minimum behavior:
 - call the same Rust handler;
 - support deterministic tests without a long-running process.
 
-Option B is acceptable as a first slice only if the design explicitly records
-what remains before a real MCP stdio server. The topic is complete only when an
-external agent can call Janus through an MCP-compatible or reviewer-approved
-MCP-shaped local surface.
+Option B is acceptable as a first slice only if the implementation records what
+remains before a real MCP stdio server. It does not satisfy the topic Definition
+Of Done by itself. The topic is complete only when an external agent can call
+Janus through a stdio MCP-compatible local surface unless reviewers explicitly
+change this completion bar in a later design round.
 
 ## Error Model
 
@@ -304,7 +358,9 @@ Suggested error categories:
 - `fixture_not_found`: current demo selector does not match a known fixture;
 - `context_unavailable`: query time/entity selectors match no hot context;
 - `budget_unsatisfied`: requested budget cannot fit required evidence;
-- `counter_evidence_unsatisfied`: requested counter-evidence cannot be selected;
+- `requirement_unsatisfied`: a requested evidence requirement cannot be
+  satisfied, with a stable `requirement` field such as `counter_evidence` or
+  `raw_refs`;
 - `source_ref_unresolved`: compiled evidence has an unresolved source ref;
 - `internal_error`: unexpected store, replay, derivation, or compiler failure.
 
@@ -313,8 +369,15 @@ Each error should include:
 - stable machine-readable code;
 - human-readable message;
 - optional path or field;
+- optional requirement name when `code` is `requirement_unsatisfied`;
 - no panic/debug backtrace;
 - no root-cause prose.
+
+Server-side fixture replay, hot-store, derivation, evidence compiler,
+missing-fixture-bundle, and fixture-bundle-parse failures should collapse to
+`internal_error` unless the request selector itself is invalid or points to an
+unknown fixture. That keeps tool errors actionable for agents without leaking
+Janus internals as public API.
 
 ## Demo Path
 
@@ -339,8 +402,8 @@ Relationship to simulator and OTel ingest:
 - fixture simulator remains the deterministic replay path used by the current
   compiled query;
 - OTLP JSON ingest remains a local input adapter, not the MCP surface itself;
-- a later live-ingest topic can replace `scenario_id` with a context selector
-  over persisted or in-memory live data;
+- a later live-ingest topic can replace V1's required `scenario_id` with
+  `context_selector` over persisted or in-memory live data;
 - this topic proves that once data is in Janus, an agent can call a stable tool
   and receive evidence.
 
@@ -372,15 +435,21 @@ Add tests that prove:
 - the tool input schema root is an object;
 - every array schema declares `items`;
 - generated or committed MCP-facing schemas match the Rust types;
+- committed MCP-facing schemas validate under the explicitly chosen strict
+  draft-07 JSON Schema validator;
 - `get_evidence_bundle` tool arguments deserialize into `EvidenceQuery`;
 - invalid tool arguments produce a stable `invalid_request` error;
 - invalid `scenario_id` produces a stable selector error;
 - budget and counter-evidence failures map to stable tool errors;
+- raw-ref requirement failures map to a stable tool error;
 - a valid fixture-backed tool call returns an output envelope with a valid
   `EvidenceBundle`;
 - source refs in returned evidence remain resolvable through the existing query
   path;
-- the local server or command can list the tool and execute one smoke-test call.
+- a stdio MCP server can complete an `initialize`, `tools/list`, and
+  `tools/call` smoke exchange for `get_evidence_bundle`;
+- a protocol-shaped command, if implemented first, lists the same tool
+  definition and calls the same handler as the stdio server.
 
 Existing verification should continue to pass:
 
@@ -398,10 +467,14 @@ This topic is complete when:
 - `get_evidence_bundle` is exposed through a reviewed agent-facing tool surface;
 - tool input and output schemas are committed or generated repeatably;
 - schema tests cover strict tool-validator concerns, including array `items`;
-- a local agent-compatible or reviewer-approved MCP-shaped invocation can call
-  Janus and receive structured Evidence IR JSON;
+- a local stdio MCP server can handle a real `initialize`, `tools/list`, and
+  `tools/call` exchange and return structured Evidence IR JSON;
+- a protocol-shaped command alone is not sufficient for topic completion unless
+  a later review explicitly changes the completion bar;
 - tool errors use stable categories instead of raw Rust debug output;
-- `scenario_id` is clearly documented as a temporary fixture/demo selector;
+- `scenario_id` is required in the V1 tool schema and clearly documented as a
+  temporary fixture/demo selector, with `context_selector` reserved as its
+  production replacement concept;
 - no new OTel protocol, persistence layer, dashboard, warm memory, mitigation
   execution, or RCA prose generator is introduced;
 - `cargo fmt`, `cargo test`, `cargo clippy --all-targets --all-features`, and
@@ -415,10 +488,12 @@ Reviewers should focus on:
    `evidence-compiler-ranking`, given that simulator and OTel JSON ingest are
    already complete.
 2. Whether the first surface should expose only `get_evidence_bundle`.
-3. Whether a stdio MCP server is required for the first implementation, or a
-   protocol-shaped command is enough for the first reviewed slice.
+3. Whether stdio MCP as the completion target and command-only as an
+   intermediate slice is the right runtime bar.
 4. Whether the schema strategy is strict enough for external tool validators
    without forcing a broad schema-dialect migration.
-5. Whether `scenario_id` is acceptable as a temporary demo selector.
+5. Whether required-in-V1 `scenario_id` is acceptable as a temporary demo
+   selector and whether `context_selector` is the right reserved replacement
+   concept.
 6. Whether the surface returns inspectable evidence and avoids becoming an RCA
    prose API.
