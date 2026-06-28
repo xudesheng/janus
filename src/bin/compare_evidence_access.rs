@@ -1,5 +1,5 @@
 use janus::comparative_eval::{
-    EvalBudget, EvalFixtureSelector, build_empty_comparative_eval_report, format_text_report,
+    EvalBudget, EvalFixtureSelector, format_text_report, load_comparative_eval_report_with_janus,
 };
 use std::{
     env, fs,
@@ -90,12 +90,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let repo_sha = current_repo_sha(root);
-    let report = build_empty_comparative_eval_report(
-        &janus::fixture_validation::FixtureCorpus::load(root)?,
-        &selector,
-        budget,
-        repo_sha,
-    )?;
+    let report = load_comparative_eval_report_with_janus(root, &selector, budget, repo_sha)?;
     let json = serde_json::to_string_pretty(&report)?;
 
     if let Some(parent) = output.parent()
