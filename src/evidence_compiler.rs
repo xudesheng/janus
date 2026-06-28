@@ -235,8 +235,12 @@ pub fn compile_evidence(
         store,
         derived,
     };
-    let candidates = generate_evidence_candidates(input)?;
-    let suspected_causes = rank_suspected_causes_from_candidates(input, &candidates);
+    let mut candidates = generate_evidence_candidates(input)?;
+    let mut suspected_causes = rank_suspected_causes_from_candidates(input, &candidates);
+    if required_counter_evidence_count(query) > 0 {
+        push_structural_counter_evidence_candidates(input, &mut candidates, &suspected_causes)?;
+        suspected_causes = rank_suspected_causes_from_candidates(input, &candidates);
+    }
     let mut compilation = select_evidence_compilation(input, candidates, suspected_causes)?;
 
     compilation.next_checks =
@@ -2708,6 +2712,91 @@ fn push_counter_evidence_candidates(
                 privacy_scope: privacy_scope(input.query),
                 confidence: BTreeMap::new(),
                 note: delta.note.clone(),
+            },
+        )?;
+    }
+
+    Ok(())
+}
+
+fn push_structural_counter_evidence_candidates(
+    input: EvidenceCompilerInput<'_>,
+    candidates: &mut Vec<EvidenceCandidate>,
+    suspected_causes: &[SuspectedCause],
+) -> Result<(), EvidenceCompileError> {
+    let existing_counter_entities = candidates
+        .iter()
+        .filter(|candidate| is_counter_evidence_candidate(candidate))
+        .flat_map(|candidate| candidate.item.entities.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let source_refs_by_candidate_id = candidates
+        .iter()
+        .map(|candidate| {
+            (
+                candidate.candidate_id.clone(),
+                candidate
+                    .item
+                    .source_refs
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    for cause in suspected_causes {
+        if cause.entity == "under-determined"
+            || existing_counter_entities.contains(&cause.entity)
+            || (cause.counter.is_empty()
+                && (cause.rank == 1 || cause.supporting.is_empty() || cause.score.0 >= 0.60))
+        {
+            continue;
+        }
+
+        let mut source_refs = Vec::new();
+        let counter_source_ids = if cause.counter.is_empty() {
+            &cause.supporting
+        } else {
+            &cause.counter
+        };
+        for candidate_id in counter_source_ids {
+            if let Some(candidate_refs) = source_refs_by_candidate_id.get(candidate_id) {
+                for source_ref in candidate_refs {
+                    if !source_refs.contains(source_ref) {
+                        source_refs.push(source_ref.clone());
+                    }
+                }
+            }
+        }
+
+        if source_refs.is_empty() {
+            continue;
+        }
+
+        let reasons = if cause.reasons.is_empty() {
+            "available structural evidence".to_string()
+        } else {
+            cause.reasons.join(", ")
+        };
+        let mut confidence = BTreeMap::new();
+        confidence.insert("structural_counter".to_string(), UnitInterval(0.80));
+
+        push_candidate(
+            candidates,
+            EvidenceCandidateSource::CounterEvidence,
+            EvidenceItemDraft {
+                claim: format!("{} is weakened as a cause by {}.", cause.entity, reasons),
+                kind: EvidenceKind::CounterEvidence,
+                direction: EvidenceDirection::Weakens,
+                strength: UnitInterval(0.78),
+                time_window: input.query.time_window.clone(),
+                entities: vec![cause.entity.clone()],
+                source_refs,
+                freshness: EvidenceFreshness::Settled,
+                missing_data: Vec::new(),
+                privacy_scope: privacy_scope(input.query),
+                confidence,
+                note: cause.trap_note.clone().or_else(|| cause.note.clone()),
             },
         )?;
     }

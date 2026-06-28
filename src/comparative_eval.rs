@@ -8,7 +8,7 @@ use crate::{
         EvidenceQuery, EvidenceQueryBudget, EvidenceQueryIntent, FreshnessPreference,
         GetEvidenceBundleError, get_evidence_bundle,
     },
-    references::{metric_series_ref, source_signal_name},
+    references::{ReferenceIndex, metric_series_ref, source_signal_name},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -68,6 +68,48 @@ pub enum EvalMetricRole {
 pub struct EvalMetricDefinition {
     pub metric: EvalMetric,
     pub role: EvalMetricRole,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvalMetricScore {
+    pub score: f64,
+    pub max_score: f64,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub details: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvalPathScores {
+    pub suspicious_entity_accuracy: EvalMetricScore,
+    pub false_causality_risk: EvalMetricScore,
+    pub missing_data_awareness: EvalMetricScore,
+    pub auditability: EvalMetricScore,
+    pub token_efficiency: EvalMetricScore,
+    pub timeline_quality: EvalMetricScore,
+    pub required_average: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvalScoreDelta {
+    pub suspicious_entity_accuracy: f64,
+    pub false_causality_risk: f64,
+    pub missing_data_awareness: f64,
+    pub auditability: f64,
+    pub token_efficiency: f64,
+    pub timeline_quality: f64,
+    pub required_average: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvalScenarioComparison {
+    pub janus: EvalPathScores,
+    pub raw: EvalPathScores,
+    pub delta: EvalScoreDelta,
+    pub required_winner: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -220,6 +262,44 @@ struct RawCandidateRecord {
     sort_time: String,
     sort_id: String,
     record: RawContextRecord,
+}
+
+#[derive(Debug, Default)]
+struct EvalScoreAccumulator {
+    janus: EvalPathScoreTotals,
+    raw: EvalPathScoreTotals,
+    delta: EvalScoreDeltaTotals,
+    trap_delta: EvalScoreDeltaTotals,
+    janus_scenario_wins: usize,
+    raw_scenario_wins: usize,
+    scenario_ties: usize,
+    trap_janus_wins: usize,
+    trap_raw_wins: usize,
+    trap_ties: usize,
+}
+
+#[derive(Debug, Default)]
+struct EvalPathScoreTotals {
+    count: usize,
+    suspicious_entity_accuracy: f64,
+    false_causality_risk: f64,
+    missing_data_awareness: f64,
+    auditability: f64,
+    token_efficiency: f64,
+    timeline_quality: f64,
+    required_average: f64,
+}
+
+#[derive(Debug, Default)]
+struct EvalScoreDeltaTotals {
+    count: usize,
+    suspicious_entity_accuracy: f64,
+    false_causality_risk: f64,
+    missing_data_awareness: f64,
+    auditability: f64,
+    token_efficiency: f64,
+    timeline_quality: f64,
+    required_average: f64,
 }
 
 #[derive(Debug)]
@@ -388,6 +468,7 @@ pub fn build_comparative_eval_report(
     let mut scenarios = Vec::new();
     let mut total_janus_tokens = 0u32;
     let mut total_raw_tokens = 0u32;
+    let mut score_accumulator = EvalScoreAccumulator::default();
 
     for case in &cases {
         let janus_submission = run_janus_eval_submission(case, budget.clone())?;
@@ -399,8 +480,22 @@ pub fn build_comparative_eval_report(
         let mut report = scenario_report(case);
         insert_submission(&mut report.janus, &janus_submission)?;
         insert_submission(&mut report.raw, &raw_submission)?;
+        let comparison = score_scenario(case, &janus_submission, &raw_submission);
+        insert_comparison(&mut report.comparison, &comparison)?;
+        score_accumulator.record(report.false_causality_trap, &comparison);
         scenarios.push(report);
     }
+
+    let mut janus_summary = access_summary(cases.len(), total_janus_tokens);
+    score_accumulator
+        .janus
+        .insert_averages(&mut janus_summary, "avg");
+    let mut raw_summary = access_summary(cases.len(), total_raw_tokens);
+    score_accumulator
+        .raw
+        .insert_averages(&mut raw_summary, "avg");
+    let delta_summary = score_accumulator.delta_summary();
+    let trap_summary = score_accumulator.false_causality_trap_summary();
 
     Ok(ComparativeEvalReport {
         schema_version: COMPARATIVE_EVAL_SCHEMA_VERSION.to_string(),
@@ -412,10 +507,10 @@ pub fn build_comparative_eval_report(
         metrics: metric_definitions(),
         summary: ComparativeEvalSummary {
             fixture_count: cases.len(),
-            janus: access_summary(cases.len(), total_janus_tokens),
-            raw: access_summary(cases.len(), total_raw_tokens),
-            delta: BTreeMap::new(),
-            false_causality_traps: BTreeMap::new(),
+            janus: janus_summary,
+            raw: raw_summary,
+            delta: delta_summary,
+            false_causality_traps: trap_summary,
         },
         scenarios,
     })
@@ -568,6 +663,18 @@ pub fn format_text_report(report: &ComparativeEvalReport) -> String {
         "metrics: {} required, {} report_only\n",
         required_metrics, report_only_metrics
     ));
+    if let (Some(janus_score), Some(raw_score), Some(delta_score)) = (
+        report.summary.janus.get("avg_required_score"),
+        report.summary.raw.get("avg_required_score"),
+        report.summary.delta.get("avg_required_score"),
+    ) {
+        output.push_str(&format!(
+            "required_avg: janus={}, raw={}, delta={}\n",
+            score_value_text(janus_score),
+            score_value_text(raw_score),
+            score_value_text(delta_score)
+        ));
+    }
     output.push_str("scenarios:\n");
 
     for scenario in &report.scenarios {
@@ -585,20 +692,49 @@ pub fn format_text_report(report: &ComparativeEvalReport) -> String {
             .and_then(Value::as_u64)
             .map(|tokens| format!(", raw_tokens={tokens}"))
             .unwrap_or_default();
+        let comparison = scenario_score_text(scenario);
 
         output.push_str(&format!(
-            "- {} v{} ({}, {}, trap={}{}{})\n",
+            "- {} v{} ({}, {}, trap={}{}{}{})\n",
             scenario.id,
             scenario.scenario_version,
             scenario.failure_class,
             scenario.difficulty,
             scenario.false_causality_trap,
             janus_tokens,
-            raw_tokens
+            raw_tokens,
+            comparison
         ));
     }
 
     output
+}
+
+fn score_value_text(value: &Value) -> String {
+    value
+        .as_f64()
+        .map(|score| format!("{score:.3}"))
+        .unwrap_or_else(|| value.to_string())
+}
+
+fn scenario_score_text(scenario: &ScenarioEvalReport) -> String {
+    let Some(scores) = scenario.comparison.get("scores") else {
+        return String::new();
+    };
+    let janus = scores
+        .pointer("/janus/required_average")
+        .map(score_value_text)
+        .unwrap_or_else(|| "?".to_string());
+    let raw = scores
+        .pointer("/raw/required_average")
+        .map(score_value_text)
+        .unwrap_or_else(|| "?".to_string());
+    let winner = scores
+        .get("required_winner")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+
+    format!(", janus_score={janus}, raw_score={raw}, winner={winner}")
 }
 
 fn selected_cases<'a>(
@@ -643,6 +779,17 @@ fn insert_submission(
     Ok(())
 }
 
+fn insert_comparison(
+    target: &mut BTreeMap<String, Value>,
+    comparison: &EvalScenarioComparison,
+) -> Result<(), ComparativeEvalError> {
+    target.insert(
+        "scores".to_string(),
+        serde_json::to_value(comparison).map_err(ComparativeEvalError::SerializePayload)?,
+    );
+    Ok(())
+}
+
 fn access_summary(submission_count: usize, measured_tokens: u32) -> BTreeMap<String, Value> {
     let mut summary = BTreeMap::new();
     summary.insert(
@@ -651,6 +798,762 @@ fn access_summary(submission_count: usize, measured_tokens: u32) -> BTreeMap<Str
     );
     summary.insert("measured_tokens".to_string(), Value::from(measured_tokens));
     summary
+}
+
+impl EvalScoreAccumulator {
+    fn record(&mut self, false_causality_trap: bool, comparison: &EvalScenarioComparison) {
+        self.janus.add(&comparison.janus);
+        self.raw.add(&comparison.raw);
+        self.delta.add(&comparison.delta);
+
+        match comparison.required_winner.as_str() {
+            "janus" => self.janus_scenario_wins += 1,
+            "raw" => self.raw_scenario_wins += 1,
+            _ => self.scenario_ties += 1,
+        }
+
+        if false_causality_trap {
+            self.trap_delta.add(&comparison.delta);
+            match comparison.required_winner.as_str() {
+                "janus" => self.trap_janus_wins += 1,
+                "raw" => self.trap_raw_wins += 1,
+                _ => self.trap_ties += 1,
+            }
+        }
+    }
+
+    fn delta_summary(&self) -> BTreeMap<String, Value> {
+        let mut summary = self.delta.average_map("avg");
+        summary.insert(
+            "janus_scenario_wins".to_string(),
+            Value::from(self.janus_scenario_wins),
+        );
+        summary.insert(
+            "raw_scenario_wins".to_string(),
+            Value::from(self.raw_scenario_wins),
+        );
+        summary.insert("scenario_ties".to_string(), Value::from(self.scenario_ties));
+        summary.insert(
+            "janus_required_metric_wins".to_string(),
+            Value::from(self.delta.janus_metric_wins()),
+        );
+        summary.insert(
+            "raw_required_metric_wins".to_string(),
+            Value::from(self.delta.raw_metric_wins()),
+        );
+        summary.insert(
+            "required_metric_ties".to_string(),
+            Value::from(self.delta.metric_ties()),
+        );
+        summary
+    }
+
+    fn false_causality_trap_summary(&self) -> BTreeMap<String, Value> {
+        let mut summary = self.trap_delta.average_map("avg");
+        summary.insert(
+            "fixture_count".to_string(),
+            Value::from(self.trap_delta.count),
+        );
+        summary.insert(
+            "janus_scenario_wins".to_string(),
+            Value::from(self.trap_janus_wins),
+        );
+        summary.insert(
+            "raw_scenario_wins".to_string(),
+            Value::from(self.trap_raw_wins),
+        );
+        summary.insert("scenario_ties".to_string(), Value::from(self.trap_ties));
+        summary
+    }
+}
+
+impl EvalPathScoreTotals {
+    fn add(&mut self, scores: &EvalPathScores) {
+        self.count += 1;
+        self.suspicious_entity_accuracy += scores.suspicious_entity_accuracy.score;
+        self.false_causality_risk += scores.false_causality_risk.score;
+        self.missing_data_awareness += scores.missing_data_awareness.score;
+        self.auditability += scores.auditability.score;
+        self.token_efficiency += scores.token_efficiency.score;
+        self.timeline_quality += scores.timeline_quality.score;
+        self.required_average += scores.required_average;
+    }
+
+    fn insert_averages(&self, target: &mut BTreeMap<String, Value>, prefix: &str) {
+        target.insert(
+            format!("{prefix}_required_score"),
+            json_score(self.required_average()),
+        );
+        target.insert(
+            format!("{prefix}_suspicious_entity_accuracy"),
+            json_score(self.average(self.suspicious_entity_accuracy)),
+        );
+        target.insert(
+            format!("{prefix}_false_causality_risk"),
+            json_score(self.average(self.false_causality_risk)),
+        );
+        target.insert(
+            format!("{prefix}_missing_data_awareness"),
+            json_score(self.average(self.missing_data_awareness)),
+        );
+        target.insert(
+            format!("{prefix}_auditability"),
+            json_score(self.average(self.auditability)),
+        );
+        target.insert(
+            format!("{prefix}_token_efficiency"),
+            json_score(self.average(self.token_efficiency)),
+        );
+        target.insert(
+            format!("{prefix}_timeline_quality"),
+            json_score(self.average(self.timeline_quality)),
+        );
+    }
+
+    fn required_average(&self) -> f64 {
+        self.average(self.required_average)
+    }
+
+    fn average(&self, value: f64) -> f64 {
+        if self.count == 0 {
+            0.0
+        } else {
+            value / self.count as f64
+        }
+    }
+}
+
+impl EvalScoreDeltaTotals {
+    fn add(&mut self, delta: &EvalScoreDelta) {
+        self.count += 1;
+        self.suspicious_entity_accuracy += delta.suspicious_entity_accuracy;
+        self.false_causality_risk += delta.false_causality_risk;
+        self.missing_data_awareness += delta.missing_data_awareness;
+        self.auditability += delta.auditability;
+        self.token_efficiency += delta.token_efficiency;
+        self.timeline_quality += delta.timeline_quality;
+        self.required_average += delta.required_average;
+    }
+
+    fn average_map(&self, prefix: &str) -> BTreeMap<String, Value> {
+        let mut summary = BTreeMap::new();
+        summary.insert(
+            format!("{prefix}_required_score"),
+            json_score(self.average(self.required_average)),
+        );
+        summary.insert(
+            format!("{prefix}_suspicious_entity_accuracy"),
+            json_score(self.average(self.suspicious_entity_accuracy)),
+        );
+        summary.insert(
+            format!("{prefix}_false_causality_risk"),
+            json_score(self.average(self.false_causality_risk)),
+        );
+        summary.insert(
+            format!("{prefix}_missing_data_awareness"),
+            json_score(self.average(self.missing_data_awareness)),
+        );
+        summary.insert(
+            format!("{prefix}_auditability"),
+            json_score(self.average(self.auditability)),
+        );
+        summary.insert(
+            format!("{prefix}_token_efficiency"),
+            json_score(self.average(self.token_efficiency)),
+        );
+        summary.insert(
+            format!("{prefix}_timeline_quality"),
+            json_score(self.average(self.timeline_quality)),
+        );
+        summary
+    }
+
+    fn janus_metric_wins(&self) -> usize {
+        self.required_metric_sums()
+            .into_iter()
+            .filter(|value| *value > 0.0)
+            .count()
+    }
+
+    fn raw_metric_wins(&self) -> usize {
+        self.required_metric_sums()
+            .into_iter()
+            .filter(|value| *value < 0.0)
+            .count()
+    }
+
+    fn metric_ties(&self) -> usize {
+        self.required_metric_sums()
+            .into_iter()
+            .filter(|value| value.abs() <= f64::EPSILON)
+            .count()
+    }
+
+    fn required_metric_sums(&self) -> [f64; 5] {
+        [
+            self.suspicious_entity_accuracy,
+            self.false_causality_risk,
+            self.missing_data_awareness,
+            self.auditability,
+            self.token_efficiency,
+        ]
+    }
+
+    fn average(&self, value: f64) -> f64 {
+        if self.count == 0 {
+            0.0
+        } else {
+            value / self.count as f64
+        }
+    }
+}
+
+fn score_scenario(
+    case: &FixtureCase,
+    janus: &EvalSubmission,
+    raw: &EvalSubmission,
+) -> EvalScenarioComparison {
+    let janus_scores = score_submission(case, janus);
+    let raw_scores = score_submission(case, raw);
+    let delta = score_delta(&janus_scores, &raw_scores);
+    let required_winner = if delta.required_average > 0.0 {
+        "janus"
+    } else if delta.required_average < 0.0 {
+        "raw"
+    } else {
+        "tie"
+    }
+    .to_string();
+
+    EvalScenarioComparison {
+        janus: janus_scores,
+        raw: raw_scores,
+        delta,
+        required_winner,
+    }
+}
+
+fn score_submission(case: &FixtureCase, submission: &EvalSubmission) -> EvalPathScores {
+    let suspicious_entity_accuracy = score_suspicious_entity_accuracy(case, submission);
+    let false_causality_risk = score_false_causality_risk(case, submission);
+    let missing_data_awareness = score_missing_data_awareness(case, submission);
+    let auditability = score_auditability(case, submission);
+    let timeline_quality = score_timeline_quality(case, submission);
+    let useful_average = average_scores([
+        suspicious_entity_accuracy.score,
+        false_causality_risk.score,
+        missing_data_awareness.score,
+        auditability.score,
+    ]);
+    let token_efficiency = score_token_efficiency(submission, useful_average);
+    let required_average = average_scores([
+        suspicious_entity_accuracy.score,
+        false_causality_risk.score,
+        missing_data_awareness.score,
+        auditability.score,
+        token_efficiency.score,
+    ]);
+
+    EvalPathScores {
+        suspicious_entity_accuracy,
+        false_causality_risk,
+        missing_data_awareness,
+        auditability,
+        token_efficiency,
+        timeline_quality,
+        required_average: round_score(required_average),
+    }
+}
+
+fn score_suspicious_entity_accuracy(
+    case: &FixtureCase,
+    submission: &EvalSubmission,
+) -> EvalMetricScore {
+    let primary = ground_truth_str(case, "primary_cause_entity");
+    let primary_rank = primary.and_then(|entity| entity_rank(submission, entity));
+    let mut score: f64 = match (primary, primary_rank) {
+        (Some("under-determined"), _) => {
+            if !submission.missing_data_refs().is_empty() {
+                0.75
+            } else {
+                0.25
+            }
+        }
+        (_, Some(1)) => 1.0,
+        (_, Some(2 | 3)) => 0.75,
+        (_, Some(_)) => 0.5,
+        (Some(_), None) => 0.0,
+        (None, _) => 1.0,
+    };
+
+    let avoid = false_causality_entities(case);
+    let top_avoid = top_candidate_entity(submission)
+        .as_deref()
+        .is_some_and(|entity| avoid.iter().any(|avoid| avoid == entity));
+    if top_avoid {
+        score = score.min(0.25);
+    }
+
+    metric_score(
+        score,
+        detail_map([
+            ("primary_cause_entity", optional_string_value(primary)),
+            ("primary_rank", optional_u32_value(primary_rank)),
+            (
+                "top_candidate",
+                optional_string_value(top_candidate_entity(submission).as_deref()),
+            ),
+            ("top_candidate_is_not_the_cause", Value::from(top_avoid)),
+        ]),
+    )
+}
+
+fn score_false_causality_risk(case: &FixtureCase, submission: &EvalSubmission) -> EvalMetricScore {
+    let avoid = false_causality_entities(case);
+    let primary_rank = ground_truth_str(case, "primary_cause_entity")
+        .and_then(|entity| entity_rank(submission, entity));
+    let avoid_rank = best_entity_rank(submission, &avoid);
+    let has_counter_evidence = !submission.counter_evidence_refs().is_empty();
+
+    let mut risk = match avoid_rank {
+        None => 0.0,
+        Some(1) => 1.0,
+        Some(rank) if primary_rank.is_none() => {
+            if rank <= 3 {
+                0.75
+            } else {
+                0.55
+            }
+        }
+        Some(rank) if primary_rank.is_some_and(|primary| rank < primary) => 0.85,
+        Some(_) if has_counter_evidence => 0.25,
+        Some(_) => 0.55,
+    };
+
+    if case.manifest.false_causality_trap && avoid_rank.is_some() && !has_counter_evidence {
+        risk = (risk + 0.15_f64).min(1.0_f64);
+    }
+
+    metric_score(
+        1.0 - risk,
+        detail_map([
+            ("risk", json_score(risk)),
+            ("entities_to_avoid", strings_value(&avoid)),
+            ("best_avoid_rank", optional_u32_value(avoid_rank)),
+            ("primary_rank", optional_u32_value(primary_rank)),
+            (
+                "counter_evidence_refs",
+                Value::from(submission.counter_evidence_refs().len()),
+            ),
+            (
+                "false_causality_trap",
+                Value::from(case.manifest.false_causality_trap),
+            ),
+        ]),
+    )
+}
+
+fn score_missing_data_awareness(
+    case: &FixtureCase,
+    submission: &EvalSubmission,
+) -> EvalMetricScore {
+    if !requires_missing_data_awareness(case) {
+        return metric_score(
+            1.0,
+            detail_map([("required_for_scenario", Value::from(false))]),
+        );
+    }
+
+    let expected_gap_refs = expected_gap_refs(case);
+    let visible_gap_ref_count = submission
+        .missing_data_refs()
+        .iter()
+        .filter(|source_ref| {
+            expected_gap_refs
+                .iter()
+                .any(|expected| expected == &source_ref.r#ref)
+        })
+        .count();
+    let gap_visible = visible_gap_ref_count > 0 || !submission.missing_data_refs().is_empty();
+    let primary_under_determined =
+        ground_truth_str(case, "primary_cause_entity") == Some("under-determined");
+    let uncertainty_visible = primary_under_determined
+        && (candidate_entity_visible(submission, "under-determined")
+            || !submission.missing_data_refs().is_empty());
+
+    let mut score = 0.0;
+    if gap_visible {
+        score += 0.70;
+    }
+    if !primary_under_determined || uncertainty_visible {
+        score += 0.30;
+    }
+
+    metric_score(
+        score,
+        detail_map([
+            ("required_for_scenario", Value::from(true)),
+            ("expected_gap_refs", strings_value(&expected_gap_refs)),
+            ("visible_gap_ref_count", Value::from(visible_gap_ref_count)),
+            (
+                "missing_data_ref_count",
+                Value::from(submission.missing_data_refs().len()),
+            ),
+            (
+                "primary_under_determined",
+                Value::from(primary_under_determined),
+            ),
+            ("uncertainty_visible", Value::from(uncertainty_visible)),
+        ]),
+    )
+}
+
+fn score_auditability(case: &FixtureCase, submission: &EvalSubmission) -> EvalMetricScore {
+    let index = ReferenceIndex::build(&case.input, &case.expected);
+    let refs = submission.evidence_refs();
+    if refs.is_empty() {
+        return metric_score(
+            0.0,
+            detail_map([
+                ("source_ref_count", Value::from(0)),
+                ("resolved_ref_count", Value::from(0)),
+            ]),
+        );
+    }
+
+    let resolved_count = refs
+        .iter()
+        .filter(|source_ref| index.resolve(&source_ref.r#ref).is_some())
+        .count();
+    let resolved_ratio = resolved_count as f64 / refs.len() as f64;
+    let selected_signals = refs
+        .iter()
+        .map(|source_ref| source_ref.signal.clone())
+        .collect::<BTreeSet<_>>();
+    let expected_signals = expected_source_signals(case);
+    let covered_expected_signals = expected_signals
+        .iter()
+        .filter(|signal| selected_signals.contains(*signal))
+        .count();
+    let signal_coverage = if expected_signals.is_empty() {
+        1.0
+    } else {
+        covered_expected_signals as f64 / expected_signals.len() as f64
+    };
+    let score = 0.75 * resolved_ratio + 0.25 * signal_coverage;
+
+    metric_score(
+        score,
+        detail_map([
+            ("source_ref_count", Value::from(refs.len())),
+            ("resolved_ref_count", Value::from(resolved_count)),
+            ("resolved_ratio", json_score(resolved_ratio)),
+            (
+                "selected_signals",
+                strings_value(&selected_signals.into_iter().collect::<Vec<_>>()),
+            ),
+            (
+                "expected_signals",
+                strings_value(&expected_signals.into_iter().collect::<Vec<_>>()),
+            ),
+            ("signal_coverage", json_score(signal_coverage)),
+        ]),
+    )
+}
+
+fn score_token_efficiency(submission: &EvalSubmission, useful_average: f64) -> EvalMetricScore {
+    let budget_tokens = submission.budget().max_tokens.max(1);
+    let utilization = submission.measured_tokens() as f64 / budget_tokens as f64;
+    let budget_penalty = (0.25 * utilization).min(0.25);
+    let score = useful_average * (1.0 - budget_penalty);
+    let useful_score_per_100_tokens = if submission.measured_tokens() == 0 {
+        0.0
+    } else {
+        useful_average * 100.0 / submission.measured_tokens() as f64
+    };
+
+    metric_score(
+        score,
+        detail_map([
+            ("measured_tokens", Value::from(submission.measured_tokens())),
+            ("max_tokens", Value::from(submission.budget().max_tokens)),
+            ("budget_utilization", json_score(utilization)),
+            ("useful_average", json_score(useful_average)),
+            (
+                "useful_score_per_100_tokens",
+                json_score(useful_score_per_100_tokens),
+            ),
+        ]),
+    )
+}
+
+fn score_timeline_quality(case: &FixtureCase, submission: &EvalSubmission) -> EvalMetricScore {
+    let events = submission.timeline_events();
+    if events.is_empty() {
+        return metric_score(
+            0.0,
+            detail_map([
+                ("event_count", Value::from(0)),
+                ("chronological", Value::from(false)),
+            ]),
+        );
+    }
+
+    let index = ReferenceIndex::build(&case.input, &case.expected);
+    let chronological = events.windows(2).all(|window| window[0].t <= window[1].t);
+    let source_backed_count = events
+        .iter()
+        .filter(|event| {
+            event
+                .source_ref
+                .as_ref()
+                .is_some_and(|source_ref| index.resolve(&source_ref.r#ref).is_some())
+        })
+        .count();
+    let source_backed_ratio = source_backed_count as f64 / events.len() as f64;
+    let expected = expected_timeline_events(case);
+    let covered_expected = expected
+        .iter()
+        .filter(|expected| {
+            events.iter().any(|event| {
+                event.entity == expected.entity
+                    && (event.marker == expected.marker
+                        || event
+                            .source_ref
+                            .as_ref()
+                            .is_some_and(|source_ref| source_ref.r#ref == expected.source_ref))
+            })
+        })
+        .count();
+    let expected_coverage = if expected.is_empty() {
+        1.0
+    } else {
+        covered_expected as f64 / expected.len() as f64
+    };
+    let chronological_score = if chronological { 1.0 } else { 0.0 };
+    let score = 0.40 * chronological_score + 0.30 * source_backed_ratio + 0.30 * expected_coverage;
+
+    metric_score(
+        score,
+        detail_map([
+            ("event_count", Value::from(events.len())),
+            ("chronological", Value::from(chronological)),
+            ("source_backed_count", Value::from(source_backed_count)),
+            ("source_backed_ratio", json_score(source_backed_ratio)),
+            ("expected_event_count", Value::from(expected.len())),
+            ("covered_expected_events", Value::from(covered_expected)),
+            ("expected_coverage", json_score(expected_coverage)),
+        ]),
+    )
+}
+
+fn score_delta(janus: &EvalPathScores, raw: &EvalPathScores) -> EvalScoreDelta {
+    EvalScoreDelta {
+        suspicious_entity_accuracy: score_difference(
+            janus.suspicious_entity_accuracy.score,
+            raw.suspicious_entity_accuracy.score,
+        ),
+        false_causality_risk: score_difference(
+            janus.false_causality_risk.score,
+            raw.false_causality_risk.score,
+        ),
+        missing_data_awareness: score_difference(
+            janus.missing_data_awareness.score,
+            raw.missing_data_awareness.score,
+        ),
+        auditability: score_difference(janus.auditability.score, raw.auditability.score),
+        token_efficiency: score_difference(
+            janus.token_efficiency.score,
+            raw.token_efficiency.score,
+        ),
+        timeline_quality: score_difference(
+            janus.timeline_quality.score,
+            raw.timeline_quality.score,
+        ),
+        required_average: score_difference(janus.required_average, raw.required_average),
+    }
+}
+
+fn metric_score(score: f64, details: BTreeMap<String, Value>) -> EvalMetricScore {
+    EvalMetricScore {
+        score: round_score(clamp_score(score)),
+        max_score: 1.0,
+        details,
+    }
+}
+
+fn score_difference(left: f64, right: f64) -> f64 {
+    round_score(left - right)
+}
+
+fn average_scores<const N: usize>(scores: [f64; N]) -> f64 {
+    if N == 0 {
+        0.0
+    } else {
+        scores.iter().sum::<f64>() / N as f64
+    }
+}
+
+fn clamp_score(score: f64) -> f64 {
+    score.clamp(0.0, 1.0)
+}
+
+fn round_score(score: f64) -> f64 {
+    (score * 1000.0).round() / 1000.0
+}
+
+fn json_score(score: f64) -> Value {
+    Value::from(round_score(score))
+}
+
+fn detail_map<const N: usize>(entries: [(&str, Value); N]) -> BTreeMap<String, Value> {
+    let mut details = BTreeMap::new();
+    for (key, value) in entries {
+        details.insert(key.to_string(), value);
+    }
+    details
+}
+
+fn ground_truth_str<'a>(case: &'a FixtureCase, key: &str) -> Option<&'a str> {
+    case.manifest.ground_truth.get(key).and_then(Value::as_str)
+}
+
+fn ground_truth_string_array(case: &FixtureCase, key: &str) -> Vec<String> {
+    case.manifest
+        .ground_truth
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn false_causality_entities(case: &FixtureCase) -> Vec<String> {
+    let mut entities = ground_truth_string_array(case, "not_the_cause");
+    if let Some(innocent_suspect) = ground_truth_str(case, "innocent_suspect") {
+        entities.push(innocent_suspect.to_string());
+    }
+    dedupe_strings(entities)
+}
+
+fn entity_rank(submission: &EvalSubmission, entity: &str) -> Option<u32> {
+    submission
+        .candidate_entities()
+        .iter()
+        .position(|candidate| candidate.entity == entity)
+        .map(|index| (index + 1) as u32)
+}
+
+fn best_entity_rank(submission: &EvalSubmission, entities: &[String]) -> Option<u32> {
+    entities
+        .iter()
+        .filter_map(|entity| entity_rank(submission, entity))
+        .min()
+}
+
+fn candidate_entity_visible(submission: &EvalSubmission, entity: &str) -> bool {
+    entity_rank(submission, entity).is_some()
+}
+
+fn top_candidate_entity(submission: &EvalSubmission) -> Option<String> {
+    submission
+        .candidate_entities()
+        .first()
+        .map(|candidate| candidate.entity.clone())
+}
+
+fn requires_missing_data_awareness(case: &FixtureCase) -> bool {
+    case.manifest.failure_class == "missing-data"
+        || case.input.get("telemetry_gaps").is_some()
+        || ground_truth_str(case, "primary_cause_entity") == Some("under-determined")
+        || !expected_gap_refs(case).is_empty()
+}
+
+fn expected_gap_refs(case: &FixtureCase) -> Vec<String> {
+    let mut refs = Vec::new();
+    if let Some(gap_ref) = ground_truth_str(case, "gap_ref") {
+        refs.push(gap_ref.to_string());
+    }
+    if let Some(gaps) = array_at(&case.input, "telemetry_gaps") {
+        for gap in gaps {
+            push_str_field(&mut refs, gap, "id");
+        }
+    }
+    if let Some(metrics) = array_at(&case.input, "metrics") {
+        for metric in metrics {
+            if let Some(gap_ref) = metric
+                .get("_gap")
+                .and_then(|gap| gap.get("ref"))
+                .and_then(Value::as_str)
+            {
+                refs.push(gap_ref.to_string());
+            }
+        }
+    }
+    dedupe_strings(refs)
+}
+
+fn expected_source_signals(case: &FixtureCase) -> BTreeSet<String> {
+    let mut signals = BTreeSet::new();
+    if let Some(items) = case
+        .expected
+        .pointer("/evidence_bundle/items")
+        .and_then(Value::as_array)
+    {
+        for item in items {
+            if let Some(source_refs) = item.get("source_refs").and_then(Value::as_array) {
+                for source_ref in source_refs {
+                    if let Some(signal) = str_field(source_ref, "signal") {
+                        signals.insert(signal.to_string());
+                    }
+                }
+            }
+        }
+    }
+    signals
+}
+
+#[derive(Debug, Clone)]
+struct ExpectedTimelineEvent {
+    marker: String,
+    entity: String,
+    source_ref: String,
+}
+
+fn expected_timeline_events(case: &FixtureCase) -> Vec<ExpectedTimelineEvent> {
+    let Some(events) = array_at(&case.expected, "timeline") else {
+        return Vec::new();
+    };
+
+    events
+        .iter()
+        .filter_map(|event| {
+            Some(ExpectedTimelineEvent {
+                marker: str_field(event, "marker")?.to_string(),
+                entity: str_field(event, "entity")?.to_string(),
+                source_ref: str_field(event, "source_ref")?.to_string(),
+            })
+        })
+        .collect()
+}
+
+fn optional_string_value(value: Option<&str>) -> Value {
+    value
+        .map(|value| Value::String(value.to_string()))
+        .unwrap_or(Value::Null)
+}
+
+fn optional_u32_value(value: Option<u32>) -> Value {
+    value.map(Value::from).unwrap_or(Value::Null)
+}
+
+fn strings_value(values: &[String]) -> Value {
+    Value::Array(values.iter().cloned().map(Value::String).collect())
 }
 
 fn janus_query_for_case(
@@ -672,12 +1575,12 @@ fn janus_query_for_case(
         budget: EvidenceQueryBudget {
             max_items: budget.max_items,
             max_tokens: budget.max_tokens,
-            min_counter_evidence_items: None,
+            min_counter_evidence_items: Some(1),
             reserve_tokens_for_raw_refs: None,
         },
         scenario_id: Some(case.manifest.id.clone()),
         entities: Vec::new(),
-        require_counter_evidence: false,
+        require_counter_evidence: true,
         require_raw_refs: true,
         freshness: FreshnessPreference::Any,
         privacy_scope: None,
@@ -1337,6 +2240,20 @@ fn raw_timeline_marker(kind: RawContextRecordKind) -> &'static str {
 
 fn resource_entity_aliases(input: &Value) -> BTreeMap<String, String> {
     let mut aliases = BTreeMap::new();
+    let mut rollout_service_names = BTreeSet::new();
+
+    if let Some(resources) = array_at(input, "resources") {
+        for resource in resources {
+            let Some(attributes) = resource.get("attributes").and_then(Value::as_object) else {
+                continue;
+            };
+            if attributes.get("rollout").and_then(Value::as_str).is_some()
+                && let Some(service_name) = attributes.get("service.name").and_then(Value::as_str)
+            {
+                rollout_service_names.insert(service_name.to_string());
+            }
+        }
+    }
 
     if let Some(resources) = array_at(input, "resources") {
         for resource in resources {
@@ -1351,9 +2268,37 @@ fn resource_entity_aliases(input: &Value) -> BTreeMap<String, String> {
             };
 
             let entity = match attributes.get("db.system").and_then(Value::as_str) {
-                Some("redis") => format!("infra:{service_name}"),
+                Some("redis")
+                    if attributes
+                        .get("cluster.name")
+                        .and_then(Value::as_str)
+                        .is_some() =>
+                {
+                    format!("infra:{service_name}")
+                }
+                Some("redis") => format!("db:{service_name}"),
                 Some(_) => format!("db:{service_name}"),
-                None => format!("service:{service_name}"),
+                None => {
+                    if let Some(rollout) = attributes.get("rollout").and_then(Value::as_str) {
+                        format!("service:{service_name}@{rollout}")
+                    } else if rollout_service_names.contains(service_name) {
+                        let has_identity = attributes
+                            .get("service.version")
+                            .and_then(Value::as_str)
+                            .is_some()
+                            && attributes
+                                .get("service.instance.id")
+                                .and_then(Value::as_str)
+                                .is_some();
+                        if has_identity {
+                            format!("service:{service_name}@stable")
+                        } else {
+                            format!("service:{service_name}@unresolved")
+                        }
+                    } else {
+                        format!("service:{service_name}")
+                    }
+                }
             };
             aliases.insert(resource_id.to_string(), entity);
         }
@@ -2091,6 +3036,90 @@ mod tests {
     }
 
     #[test]
+    fn full_report_populates_scores_and_aggregate_deltas() {
+        let corpus = test_corpus();
+        let report = build_comparative_eval_report(
+            &corpus,
+            &EvalFixtureSelector {
+                fixture_id: Some("coincidental-deploy-trap".to_string()),
+                ..EvalFixtureSelector::default()
+            },
+            EvalBudget::default(),
+            TEST_SHA,
+        )
+        .expect("full comparative report should build");
+
+        assert_eq!(report.summary.fixture_count, 1);
+        assert!(report.summary.janus["avg_required_score"].as_f64().unwrap() > 0.0);
+        assert!(report.summary.raw["avg_required_score"].as_f64().unwrap() > 0.0);
+        assert!(report.summary.delta.contains_key("avg_required_score"));
+        assert_eq!(report.summary.false_causality_traps["fixture_count"], 1);
+
+        let scores = scenario_scores(&report.scenarios[0]);
+        assert_eq!(scores.required_winner, "janus");
+        assert!(
+            scores.janus.false_causality_risk.score > scores.raw.false_causality_risk.score,
+            "Janus should score better on the trap's false-causality guard"
+        );
+    }
+
+    #[test]
+    fn janus_eval_query_requires_counter_evidence_uniformly() {
+        let corpus = test_corpus();
+        let case = case_by_id(&corpus, "coincidental-deploy-trap");
+
+        let submission = run_janus_eval_submission(case, EvalBudget::default())
+            .expect("Janus submission should build");
+
+        assert!(
+            !submission.counter_evidence_refs().is_empty(),
+            "uniform counter-evidence requirement should select source-backed counter evidence"
+        );
+    }
+
+    #[test]
+    fn resource_aliases_cover_expected_resource_entity_namespace() {
+        let corpus = test_corpus();
+
+        for case in &corpus.cases {
+            let aliases = resource_entity_aliases(&case.input);
+            let scored_entities = ground_truth_scored_entities(case);
+            let Some(entities) = array_at(&case.expected, "entities") else {
+                continue;
+            };
+
+            for entity in entities {
+                let Some(entity_id) = str_field(entity, "id") else {
+                    continue;
+                };
+                if !scored_entities.iter().any(|scored| scored == entity_id) {
+                    continue;
+                }
+                if !matches!(
+                    entity_id.split_once(':').map(|(prefix, _)| prefix),
+                    Some("service" | "db" | "infra")
+                ) {
+                    continue;
+                }
+                let Some(from_refs) = entity.get("from").and_then(Value::as_array) else {
+                    continue;
+                };
+
+                for from_ref in from_refs.iter().filter_map(Value::as_str) {
+                    if from_ref.starts_with("res:") {
+                        assert_eq!(
+                            aliases.get(from_ref).map(String::as_str),
+                            Some(entity_id),
+                            "{} resource alias {from_ref} should canonicalize to {entity_id}",
+                            case.manifest.id
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn raw_submission_is_deterministic_budgeted_and_source_backed() {
         let corpus = test_corpus();
         let case = case_by_id(&corpus, "coincidental-deploy-trap");
@@ -2207,5 +3236,31 @@ mod tests {
     fn raw_envelope(submission: &EvalSubmission) -> RawContextEnvelope {
         serde_json::from_value(submission.serialized_context().clone())
             .expect("raw context should deserialize")
+    }
+
+    fn scenario_scores(scenario: &ScenarioEvalReport) -> EvalScenarioComparison {
+        serde_json::from_value(
+            scenario
+                .comparison
+                .get("scores")
+                .cloned()
+                .expect("scenario should include scores"),
+        )
+        .expect("scenario scores should deserialize")
+    }
+
+    fn ground_truth_scored_entities(case: &FixtureCase) -> Vec<String> {
+        let mut entities = Vec::new();
+        if let Some(primary) = ground_truth_str(case, "primary_cause_entity")
+            && primary != "under-determined"
+        {
+            entities.push(primary.to_string());
+        }
+        entities.extend(ground_truth_string_array(case, "blast_radius"));
+        entities.extend(ground_truth_string_array(case, "not_the_cause"));
+        if let Some(innocent) = ground_truth_str(case, "innocent_suspect") {
+            entities.push(innocent.to_string());
+        }
+        dedupe_strings(entities)
     }
 }

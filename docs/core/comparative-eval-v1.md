@@ -221,6 +221,13 @@ The Janus submission should extract:
 - timeline hints from selected evidence item time windows and timeline-derived
   evidence.
 
+The V1 Janus eval query should set `require_counter_evidence = true` and
+`min_counter_evidence_items = 1` uniformly for every fixture. This is a static
+eval-query requirement, not a fixture-label conditional, so it does not use trap
+metadata or scoring gold as runtime input. It ensures the false-causality and
+auditability scorers can observe source-backed counter-evidence when the
+compiled pipeline can produce it.
+
 Janus path token cost must be recomputed from the serialized eval payload or
 serialized Evidence IR payload. Do not use fixture gold `token_cost` as the eval
 measurement.
@@ -267,6 +274,16 @@ fixture. A reasonable V1 raw pack includes:
 The pack should be sorted deterministically and trimmed by measured token cost.
 It may be strong at retrieving obvious raw symptoms, but it should not silently
 perform Janus's cross-signal reasoning.
+
+For entity scoring fairness, the raw baseline may canonicalize direct resource
+ids such as `res:<service>` into the fixture's canonical entity namespace using
+only attributes present on the raw `resources` records, such as `service.name`
+and `db.system`, plus direct disambiguators such as `rollout`,
+`service.instance.id`, `service.version`, and `cluster.name`. This is a
+deliberate concession to raw access so scoring does not penalize it for a
+namespace mismatch; it must be applied symmetrically to normalized Janus and raw
+candidate entities and must not infer relationships or fixture-specific entity
+names.
 
 For raw-baseline grouping, "dependency" means only a relationship already
 visible inside a raw record, such as span parent/child structure, a client span
