@@ -79,3 +79,128 @@ Observed results:
 The covered implementation was committed and pushed first as `f5b59c3 Add comparative eval scoring`; this review document's baseline SHA points to that pre-review-document tree and must remain frozen.
 
 <!-- Reviewer appends below; the Implementor must not edit past this line. -->
+
+## Review (by Claude)
+
+### Direction Verdict
+
+**CONTINUE on the scoring framework, but with one required redirect before slice 5: revert the
+compiler-side counter-evidence materialization and drop the hard `min_counter_evidence_items = 1`
+mandate from the eval query.** Implementation round, so milestone progress before local defects.
+The five scorers, typed score structs, symmetric scoring, oracle-only use of `expected`, and the
+O-ALIAS documentation are good and should stay. But the F-CE resolution went the wrong way: it
+adds new behavior *inside* `compile_evidence` that (a) changes the M6 compiler contract for every
+consumer, not just the eval, and (b) empirically degrades rather than strengthens Janus's headline
+trap result. Because slice 5 will gate `--fail-on-regression` on these numbers, this must be fixed
+and the scores re-baselined first. The milestone is not endangered — Janus's genuine advantage is
+*cleaner* without this change.
+
+Net action: **continue**, but treat F-MAT below as blocking for slice 5.
+
+I own part of this: my review-3/4 push to "set `require_counter_evidence = true` uniformly" pointed
+here. The implementation revealed that the *hard mandate* is the wrong lever — see F-MAT for the
+corrected recommendation.
+
+### Milestone Progress (judged first)
+
+The scoring substrate itself is solid and largely fair:
+
+- Five required metrics + report-only `timeline_quality`, composed into a `required_average`, with
+  typed `EvalMetricScore`/`EvalPathScores`/`EvalScoreDelta`/`EvalScenarioComparison` (O3 resolved).
+- Scoring is applied identically to both submissions; `expected.json` is used only as a scoring
+  oracle (signal-family coverage, `ReferenceIndex` resolution, expected timeline/gap refs) and is
+  never fed into either access path. Good.
+- O-ALIAS documented in the design as a deliberate, symmetric, attribute-only fairness concession.
+- Verified green on baseline `f5b59c3`: `cargo fmt --check`, `cargo clippy --all-targets
+  --all-features` clean; 16 `comparative_eval` tests and the full suite pass. Aggregate
+  `required_average`: Janus 0.890 vs raw 0.828; Janus wins 10/12, raw wins `traffic-shift-hotspot`
+  and `missing-data-gap` (honestly surfaced, not hidden — good).
+
+### F-MAT (high, direction-level) — the structural counter-evidence materialization is net-negative and out of place
+
+`push_structural_counter_evidence_candidates` runs whenever `required_counter_evidence_count(query)
+> 0`, so it is **not** an eval-only change — it alters how `compile_evidence`/`get_evidence_bundle`
+responds to `require_counter_evidence` for *every* caller (e.g. an MCP agent). That edges into the
+design's explicit out-of-scope item, "changing Evidence IR semantics to make the eval easier," and
+it was introduced in the same commit as the scorer that rewards it, without its own compiler-review
+topic.
+
+The mechanism is also semantically weak: for a low-ranked alternative with no genuine counter link,
+it builds a `Weakens` item whose `source_refs` are that entity's own **supporting** candidate refs
+(`counter_source_ids = &cause.supporting`). Relabeling supporting evidence as weakening evidence is
+not sound counter-evidence — genuine counter-evidence should *discriminate against* causality (flat
+metrics, dependency direction, onset-before-change), not reuse the entity's supporting signals.
+
+Most importantly, I measured what it actually does, and it hurts Janus more than it helps:
+
+- `coincidental-deploy-trap`: in review-4 (no counter requirement) Janus *suppressed* the innocent
+  suspect → `avoid_rank=None, risk=0, fcr=1.0`. Now the materialized weakens item **injects**
+  `service:search-ui` back into Janus's candidate set at rank 4 (candidate entities are derived from
+  *all* item entities, including weakens items) → `avoid_rank=4, risk=0.25, fcr=0.75`. The change
+  turned the cleanest possible result into a worse, self-referential one (suspect present *because*
+  of the counter item, then rescued *by* the counter item).
+- `traffic-shift-hotspot` (a raw win): the same injection puts an avoid entity at rank 3
+  (`risk=0.25`) that raw never surfaces (`risk=0`). The compiler change directly *caused* a Janus
+  loss here.
+- `retry-storm-amplification`: Janus's `fcr=1.0` comes from suspect *absence*, not counter-evidence;
+  the 6 materialized refs only inflate **auditability** (0.95 vs raw 0.85) via extra resolvable
+  refs — a ref-count effect, not an evidence-quality gain.
+
+So the materialization buys a little auditability margin and costs real false-causality quality,
+while making the marquee result circular. Janus's genuine win (innocent-suspect suppression) existed
+in review-4 *without* any of this.
+
+**Recommended fix:** remove `push_structural_counter_evidence_candidates`; set the eval query to
+`require_counter_evidence = true` *without* a hard `min_counter_evidence_items` mandate (i.e. "surface
+counter-evidence when the genuine pipeline produces it," not "fabricate one per fixture"), or revert
+to the review-4 query. Then re-baseline the report. I expect the two trap fixtures to *improve*
+(coincidental-deploy-trap back to `risk=0`) and the numbers to become defensible under a regression
+gate. If a real structural-counter-evidence capability is wanted in the compiler, give it its own
+reviewed topic (e.g. `false-causality-guard`) with discriminating provenance, not supporting-ref
+relabeling.
+
+### F-CAND (medium) — counter/weakens-only entities should not count as promoted candidates
+
+Independent of F-MAT: `candidate_entities_from_bundle` promotes an entity into the candidate list
+even when it appears *only* in a `Weakens`/`CounterEvidence` item. But a weakens item is Janus
+arguing *against* that entity as a cause, so counting it as a candidate (and then as `avoid_rank`)
+contradicts the intent. This is why a properly counter-argued suspect still scores `risk=0.25`
+instead of the design's other "best" outcome. The design says the innocent suspect being "absent
+**or** explicitly weakened by source-backed counter-evidence" is the best result, yet the scoring
+ranks present-and-countered (`0.75`) strictly below absent (`1.0`). Fix one of: (a) exclude
+weakens-only entities from the promoted candidate set, or (b) let a present-but-source-backed-
+countered suspect reach near-parity with absent in `false_causality_risk`. This should be settled
+with F-MAT since they interact.
+
+### Answers to the round's Review Focus
+
+1. Formulas are simple and fair for V1; the rank tiers and modest token penalty are fine.
+2. `false_causality_risk` as high-is-good with a high-is-bad `risk` detail is mildly confusing but
+   acceptable since the detail is labeled; low priority.
+3. **No** — the query-gated structural counter-evidence helper is too much compiler behavior for
+   the eval and is net-negative (F-MAT). Remove it; pursue genuine counter-evidence in its own
+   compiler topic if desired.
+4. Yes — the resource alias mapping is a fair, symmetric, attribute-only concession; it reads only
+   raw `resources` attributes and is documented as such. Keep the per-fixture namespace spot-check
+   as the corpus grows.
+5. Yes — using expected source-signal families for coverage while still requiring selected refs to
+   resolve through `ReferenceIndex` is acceptable oracle use, applied to both paths. (Note it
+   rewards ref count/coverage, which is why F-MAT's extra refs inflate it — another reason to
+   remove the materialization.)
+6. The raw wins are visible and honestly reported — good. But do **not** build
+   `--fail-on-regression` on the current numbers until F-MAT is resolved and the report is
+   re-baselined; otherwise the gate enforces artifacts.
+7. Keep `timeline_quality` report-only for V1 (agreed); do not move it into the required average
+   before regression gating.
+
+### Summary
+
+The scoring framework is the right shape and mostly fair, with O3 and O-ALIAS resolved and honest
+raw wins surfaced. But the F-CE resolution introduced a compiler-contract change
+(`push_structural_counter_evidence_candidates`) that is semantically unsound and empirically
+degrades Janus's cleanest trap result while only inflating auditability via ref count — and it
+changes behavior for all `get_evidence_bundle` consumers, not just the eval. Revert it and drop the
+hard counter-evidence mandate, fix the related candidate-from-weakens modeling (F-CAND), and
+re-baseline before slice 5 gates on these scores. This strengthens the milestone claim rather than
+weakening it. Because this round left actionable feedback, the next round (review-6) should carry
+the F-MAT/F-CAND fixes and the re-baselined report, then proceed to slice 5.
