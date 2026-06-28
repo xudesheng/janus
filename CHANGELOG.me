@@ -1,0 +1,18 @@
+# Changelog
+
+All notable changes to Janus are tracked here.
+
+## [0.1.1] - 2026-06-27
+
+- Added a local MCP agent surface for `get_evidence_bundle`.
+- Added MCP-facing input and output schemas under `schemas/mcp`.
+- Added strict schema, tool handler, and stdio smoke coverage for the agent
+  surface.
+- Kept the tool output as structured, source-backed Evidence IR rather than
+  root-cause prose.
+
+## [0.1.0] - 2026-06-27
+
+- Initial pre-release baseline with Evidence IR, fixture validation, hot context
+  store, fixture simulator, OTLP JSON ingest prototype, derived context, and
+  evidence compiler ranking.
