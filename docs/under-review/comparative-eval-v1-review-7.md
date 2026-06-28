@@ -86,3 +86,84 @@ Observed results:
 The covered implementation was committed and pushed first as `c731177 Add comparative eval regression gates`; this review document's baseline SHA points to that pre-review-document tree and must remain frozen.
 
 <!-- Reviewer appends below; the Implementor must not edit past this line. -->
+
+## Review (by Claude)
+
+### Direction Verdict
+
+**CONTINUE — slice 5 is complete, correct, and honest; the milestone success bar is now
+empirically met. Proceed to slice 6 (docs), which is the only remaining work.** Implementation
+round, so milestone progress before local defects. The regression policy follows the review-6
+guidance exactly: it gates at subgroup/aggregate level (never per scenario), enforces on *new*
+regressions, and keeps the two known raw wins visible through a transparent, report-emitted
+allowlist. No blocking defects. Importantly, this round is where the central Janus bet measurably
+pays off across the corpus.
+
+Next action: **continue** to slice 6 (documentation/examples) — the last slice. After it lands with
+no open findings, the topic should terminate and report completion, not spin further rounds.
+
+### Milestone Progress (judged first) — the bet is now demonstrated
+
+I verified the gate logic in code and reproduced the numbers on baseline `c731177`
+(`cargo fmt --check`, `cargo clippy --all-targets --all-features` clean; 18 `comparative_eval` tests
++ full suite pass; `--all --fail-on-regression` exits `0`):
+
+- **Janus improves 4 of 5 required metrics in aggregate and regresses none** (Janus−raw):
+  auditability `+0.053`, false-causality risk `+0.112`, suspicious-entity accuracy `+0.042`,
+  token efficiency `+0.038`, missing-data awareness `0.0` (tie). `raw_required_metric_wins = 0`.
+  Report-only `timeline_quality` is `-0.015` and correctly excluded from the gate.
+- **Nothing is masked.** Trap subgroup required delta `+0.109` with 0 raw wins; auditability is
+  positive in aggregate; the missing-data subgroup regression (`-0.035`, 1 raw win) and the
+  timeline dip are surfaced, not hidden. This satisfies the design's completion bar — "Janus
+  improving at least one roadmap target metric without hiding regressions, and without masking
+  false-causality-trap or auditability failures behind an aggregate score" — and then some.
+- **The gate actually enforces.** `regression_gate_fails_for_unexpected_raw_winner` flips one
+  scenario to a raw win and asserts `passed = false` with the scenario named and the failure
+  message containing `unexpected_raw_winners`. So the green result is a real pass, not a
+  happy-path tautology. The four fail conditions (aggregate delta, trap regression/raw-wins,
+  per-required-metric aggregate regression, unexpected raw winners) match my review-6 recommendation.
+- **O-ALIAS follow-through.** `resource_aliases_cover_expected_resource_entity_namespace` now
+  spot-checks the alias mapping against each fixture's scored ground-truth entities — the review-4
+  ask is closed.
+
+### Answers to the round's Review Focus
+
+1. **Yes — aligned with review-6.** Subgroup/aggregate gate, not per-scenario; the gate explicitly
+   does not require Janus to win every fixture, and the unexpected-raw-win test confirms it.
+2. **Acceptable for V1.** The `EXPECTED_RAW_WIN_SCENARIOS` constant is documented, emitted in
+   `summary.regression_gates`, and the gate fails on any non-allowlisted regression, so it hides
+   nothing. One low-severity follow-up (not blocking): make the allowlist configurable via a CLI
+   flag or config file in a later iteration, so changing the gate *policy* is not a source edit —
+   that better fits a "repeatable local gate." Fine as a constant for V1.
+3. **Keep `missing-data-gap` on the allowlist.** Your diagnosis resolves the review-6 concern: the
+   subgroup `missing_data_awareness` delta is `0.0` (a tie), so Janus is *not* worse at the
+   thematically important uncertainty handling — the raw win is driven by auditability and token
+   efficiency on that one fixture. Allowlisting it is correct; just make sure slice-6 docs state
+   *why* (auditability/token gap, not an uncertainty failure) so a reader does not misread it as
+   Janus failing at missing-data.
+4. **Sufficient for V1.** `regression_gates` carries aggregate + per-subgroup deltas, raw metric
+   wins, observed/expected/unexpected winners, `expected_raw_winners_not_observed`, and
+   `failed_gates`. Per-scenario required deltas already live under `scenarios[].comparison`, so CI
+   and review have what they need. No more is required before completion.
+5. **Yes — proceed to slice 6.**
+
+### Observations (non-blocking)
+
+- **Allowlist rot:** `expected_raw_winners_not_observed` is emitted but does not warn or fail when
+  an allowlisted fixture stops being a raw win (i.e. Janus improved and the entry is now stale).
+  Emitting it is enough for V1; a future stricter mode could surface it more loudly so the allowlist
+  is pruned. No action needed now.
+- **Topic is near done:** every Definition-of-Done item is satisfied today; slice 6 is documentation
+  only. The design does not list docs as a DoD criterion, but it is listed as slice 6, so finishing
+  it cleanly closes the topic. Keep slice 6 to docs/examples — do not reopen scorer or gate behavior
+  there.
+
+### Summary
+
+Slice 5 lands a well-designed, honest regression gate: subgroup/aggregate conditions, a transparent
+emitted allowlist, real enforcement on new regressions (test-proven), and the review-4 O-ALIAS and
+review-6 missing-data diagnoses both closed. The full run now demonstrates the milestone bet — Janus
+improves 4/5 required metrics with none regressing, both traps clean, and all regressions visible.
+Continue to slice 6 (docs); explain the allowlist rationale (especially missing-data-gap) there.
+This round leaves no blocking defects, so review-8 should carry slice 6 and then, if no findings
+remain, the topic should be reported complete per Round Termination rather than continuing to spin.
