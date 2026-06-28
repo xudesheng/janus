@@ -542,6 +542,9 @@ Useful flags:
 --fail-on-regression      non-zero exit when Janus is worse on required metrics
 ```
 
+Operational examples and report-reading guidance live in
+[`../process/comparative-eval-v1.md`](../process/comparative-eval-v1.md).
+
 For V1, `--fail-on-regression` should gate on aggregate and subgroup health
 rather than requiring Janus to win every fixture. The command should fail when:
 
