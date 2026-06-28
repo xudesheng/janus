@@ -112,9 +112,12 @@ V1 should distinguish harness correctness from Janus product victory:
 - `--fail-on-regression` may enforce a stricter required-metric policy for CI,
   release checks, or a later reviewer-approved completion gate.
 
-Reviewers should explicitly accept this policy or replace it. If reviewers want
-the topic to be "harness only" even when Janus improves no target metric, that
-should be recorded in the review verdict before implementation starts.
+This preserves the Milestone 8 acceptance criterion in `roadmap.md`: Janus must
+improve at least one target metric without hiding regressions in others. If
+reviewers want this topic to be "harness only" even when Janus improves no
+target metric, that is a roadmap change, not just a local review verdict. The
+roadmap should be updated in the same covered formal-doc tree before
+implementation proceeds under a harness-only policy.
 
 ## Scope
 
@@ -236,7 +239,7 @@ The baseline may use:
 - direct change-event proximity to the incident window;
 - direct metric deltas computed from raw metric points;
 - simple grouping for records that already share the same raw entity, service,
-  route, dependency, or trace id;
+  route, directly present dependency, or trace id;
 - source refs for selected raw records.
 
 The baseline must not use:
@@ -247,6 +250,8 @@ The baseline must not use:
 - Janus suspected-cause rankings;
 - derived context artifacts such as anomaly windows, log patterns, relationship
   graphs, window comparisons, related anomalies, or compiler scores;
+- inferred dependency edges or relationship direction not directly present on a
+  raw record;
 - fixture-specific hard-coded entity names or failure-class special cases.
 
 The baseline should select a compact raw context pack, not dump the whole
@@ -262,6 +267,13 @@ fixture. A reasonable V1 raw pack includes:
 The pack should be sorted deterministically and trimmed by measured token cost.
 It may be strong at retrieving obvious raw symptoms, but it should not silently
 perform Janus's cross-signal reasoning.
+
+For raw-baseline grouping, "dependency" means only a relationship already
+visible inside a raw record, such as span parent/child structure, a client span
+with `peer.service`, `db.system`, or similar call attributes, or a trace id that
+directly links spans. The baseline must not infer a relationship graph from
+cross-signal context, derive dependency direction from topology, or reuse Janus
+relationship records.
 
 ## Budget Model
 
@@ -298,10 +310,33 @@ If Janus uses an Evidence IR envelope and raw uses a raw-context envelope, both
 envelopes should include only material the downstream agent or evaluator would
 actually receive.
 
+Both adapters must call one shared serialization and measurement helper. That
+helper should use compact JSON, no pretty-printing, no fixture-gold token
+fields, and the same envelope-inclusion rules for both paths. If a path needs
+debug metadata such as dropped-candidate diagnostics, that metadata should be
+reported outside the measured agent payload unless both paths expose comparable
+diagnostics to the evaluator.
+
 ## Scoring Model
 
 V1 should produce per-scenario scores and aggregate summaries. Scores should be
 simple, inspectable, and resistant to overfitting.
+
+V1 should split metrics into required metrics and report-only metrics.
+
+Required metrics for the first completion gate:
+
+- suspicious-entity accuracy;
+- false-causality risk;
+- missing-data awareness;
+- auditability;
+- token efficiency.
+
+Timeline quality remains structural and report-only in V1. It should still
+validate and report whether useful timeline points are visible, chronologically
+ordered, and source-backed, but it should not be part of the initial "Janus
+improves at least one target metric" bar until reviewers approve a less brittle
+timeline scorer.
 
 ### Suspicious Entity Accuracy
 
@@ -419,6 +454,9 @@ Suggested JSON shape:
 {
   "schema_version": "comparative-eval/v1",
   "repo_sha": "...",
+  "fixture_registry": {
+    "schema_version": "fixtures/v1"
+  },
   "budget": { "max_items": 6, "max_tokens": 1200 },
   "summary": {
     "fixture_count": 12,
@@ -430,6 +468,8 @@ Suggested JSON shape:
   "scenarios": [
     {
       "id": "coincidental-deploy-trap",
+      "scenario_schema_version": "fixtures/v1",
+      "scenario_version": 1,
       "failure_class": "coincidental-correlation",
       "difficulty": "hard",
       "false_causality_trap": true,
@@ -440,6 +480,12 @@ Suggested JSON shape:
   ]
 }
 ```
+
+Each scenario entry must record the fixture scenario `schema_version` and
+`version`. The top-level report must also record the registry `schema_version`.
+`repo_sha` ties the run to the committed source tree, but per-scenario versions
+make fixture changes visible even when multiple fixtures share the same repo
+commit history.
 
 The report should be written under `target/` by default, for example:
 
@@ -524,6 +570,14 @@ Forbidden runtime inputs:
 Tests must make this boundary explicit. If a helper loads expected artifacts for
 scoring, the runtime adapters should not be able to access that helper.
 
+The implementation should make that boundary structural where Rust visibility
+allows it. Runtime adapter modules for Janus access and raw access should not
+import the scoring-oracle loader. The oracle loader should live behind the
+scoring/reporting boundary, with module visibility narrow enough that adapters
+cannot call it accidentally. Tests remain a second guard, but the preferred
+invariant is that adapter code cannot compile if it tries to use gold
+artifacts.
+
 ## Relationship To MCP
 
 The Janus path may call the internal `get_evidence_bundle` Rust boundary for
@@ -549,15 +603,18 @@ that slice explicitly.
 Recommended slices:
 
 1. Eval models and report schema: define `EvalSubmission`, score structs, report
-   structs, budget model, token estimator, and a CLI skeleton that loads the
+   structs, budget model, shared token estimator, required/report-only metric
+   classification, fixture-version fields, and a CLI skeleton that loads the
    fixture corpus and emits an empty-but-valid report.
 2. Janus adapter: run the compiled `get_evidence_bundle` path for selected
    fixtures and normalize Evidence IR into eval submissions without reading gold
    artifacts.
 3. Raw baseline adapter: select raw telemetry packs under the same budget using
-   reviewed raw selectors and normalize them into eval submissions.
+   reviewed raw selectors, group only on directly present raw-record
+   dependency links, and normalize them into eval submissions.
 4. Scoring: compare both submissions against ground truth and expected timeline
-   or audit artifacts; report per-scenario and aggregate metrics.
+   or audit artifacts; report per-scenario and aggregate metrics; keep timeline
+   quality structural/report-only in V1.
 5. Regression and trap reporting: add false-causality trap grouping, missing-data
    grouping, and optional `--fail-on-regression` behavior.
 6. Documentation and examples: add a concise command example and explain how to
@@ -576,14 +633,23 @@ Add tests that prove:
 - the raw baseline does not read expected artifacts or ground truth as runtime
   input;
 - raw baseline selection is deterministic;
+- raw baseline dependency grouping uses only links directly present in raw
+  records, not inferred or Janus-derived relationships;
 - both paths enforce the same item and token budgets;
-- measured token cost is computed from serialized eval material;
+- measured token cost is computed from serialized eval material through one
+  shared helper used by both paths;
+- report output records the fixture registry `schema_version` and each
+  scenario's `schema_version` and `version`;
 - scoring finds the primary cause when it appears at rank 1;
 - scoring penalizes `not_the_cause` or `innocent_suspect` at rank 1;
 - false-causality traps are summarized separately;
 - missing-data scenarios reward explicit missing-data awareness;
 - auditability scoring validates source refs through the fixture reference
   index;
+- required metrics are separated from report-only metrics, with timeline
+  quality report-only in V1;
+- runtime adapters cannot access the scoring-oracle loader for `expected.json`
+  or `scenario.json.ground_truth`;
 - generated reports validate against the V1 report shape;
 - the existing fixture validation, evidence compiler, MCP, and query tests
   continue to pass.
@@ -609,10 +675,17 @@ This topic is complete when:
 - Janus access uses compiled Evidence IR rather than fixture gold;
 - ground truth and expected artifacts are used only as scoring oracles;
 - the report includes per-scenario scores and aggregate summaries;
+- the report records the fixture registry `schema_version` and each scenario's
+  `schema_version` and `version`;
+- required metrics are separated from report-only metrics, with timeline
+  quality structural/report-only in V1;
 - false-causality trap fixtures are reported separately;
-- measured token cost is computed from serialized material for both paths;
+- measured token cost is computed from serialized material for both paths using
+  one shared helper;
 - source-ref auditability is scored;
 - missing-data awareness is scored;
+- Janus improves at least one required target metric without hiding regressions
+  in the other required metrics;
 - the report can show Janus wins and regressions honestly;
 - no LLM judge, new ingest protocol, persistence layer, dashboard, warm memory,
   or RCA prose generator is required;
@@ -629,9 +702,15 @@ Reviewers should focus on:
    agent-in-the-loop path is necessary now.
 3. Whether the raw-access baseline is fair enough to be meaningful without
    becoming another Janus evidence compiler.
-4. Whether token budget is measured on comparable serialized payloads.
-5. Whether the score dimensions map cleanly to Janus's core claim: accuracy,
+4. Whether raw dependency grouping is constrained tightly enough to direct
+   raw-record links.
+5. Whether token budget is measured on comparable serialized payloads through a
+   shared helper.
+6. Whether the score dimensions map cleanly to Janus's core claim: accuracy,
    false-causality reduction, auditability, missing-data awareness, and token
    efficiency.
-6. Whether the report can expose regressions without forcing premature product
-   claims.
+7. Whether timeline quality should remain structural/report-only in V1.
+8. Whether the report schema pins fixture versions strongly enough for
+   reproducibility.
+9. Whether the report can expose regressions while preserving the roadmap's
+   "improve at least one target metric" acceptance bar.
