@@ -221,12 +221,13 @@ The Janus submission should extract:
 - timeline hints from selected evidence item time windows and timeline-derived
   evidence.
 
-The V1 Janus eval query should set `require_counter_evidence = true` and
-`min_counter_evidence_items = 1` uniformly for every fixture. This is a static
-eval-query requirement, not a fixture-label conditional, so it does not use trap
-metadata or scoring gold as runtime input. It ensures the false-causality and
-auditability scorers can observe source-backed counter-evidence when the
-compiled pipeline can produce it.
+The V1 Janus eval query should not set a hard
+`min_counter_evidence_items` mandate. Counter-evidence should be surfaced and
+scored when the reviewed compiler pipeline selects genuine source-backed
+weakening evidence under the normal budget, but the eval harness must not force
+the compiler to fabricate one counter item per fixture. This keeps the
+false-causality scorer focused on the material the agent would actually receive
+and avoids changing Evidence IR behavior to satisfy the eval.
 
 Janus path token cost must be recomputed from the serialized eval payload or
 serialized Evidence IR payload. Do not use fixture gold `token_cost` as the eval

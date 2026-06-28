@@ -1575,12 +1575,12 @@ fn janus_query_for_case(
         budget: EvidenceQueryBudget {
             max_items: budget.max_items,
             max_tokens: budget.max_tokens,
-            min_counter_evidence_items: Some(1),
+            min_counter_evidence_items: None,
             reserve_tokens_for_raw_refs: None,
         },
         scenario_id: Some(case.manifest.id.clone()),
         entities: Vec::new(),
-        require_counter_evidence: true,
+        require_counter_evidence: false,
         require_raw_refs: true,
         freshness: FreshnessPreference::Any,
         privacy_scope: None,
@@ -2467,6 +2467,9 @@ fn candidate_entities_from_bundle(
     let mut drafts = BTreeMap::<String, CandidateEntityDraft>::new();
 
     for (item_index, item) in bundle.items.iter().enumerate() {
+        if is_counter_evidence_item(item) {
+            continue;
+        }
         for entity in &item.entities {
             let entity = canonical_entity(entity, aliases);
             let draft = drafts
@@ -2923,6 +2926,10 @@ mod tests {
                 r#ref: "search.error_rate@service:search".to_string(),
             }]
         );
+        assert!(
+            submission.candidate_entities().is_empty(),
+            "weakens-only entities should not be promoted as causal candidates"
+        );
     }
 
     #[test]
@@ -3064,17 +3071,15 @@ mod tests {
     }
 
     #[test]
-    fn janus_eval_query_requires_counter_evidence_uniformly() {
+    fn janus_eval_query_does_not_hard_require_counter_evidence() {
         let corpus = test_corpus();
         let case = case_by_id(&corpus, "coincidental-deploy-trap");
 
-        let submission = run_janus_eval_submission(case, EvalBudget::default())
-            .expect("Janus submission should build");
+        let query =
+            janus_query_for_case(case, &EvalBudget::default()).expect("Janus query should build");
 
-        assert!(
-            !submission.counter_evidence_refs().is_empty(),
-            "uniform counter-evidence requirement should select source-backed counter evidence"
-        );
+        assert!(!query.require_counter_evidence);
+        assert_eq!(query.budget.min_counter_evidence_items, None);
     }
 
     #[test]
