@@ -8,10 +8,10 @@ use crate::{
         EvidenceQuery, EvidenceQueryBudget, EvidenceQueryIntent, FreshnessPreference,
         GetEvidenceBundleError, get_evidence_bundle,
     },
-    references::source_signal_name,
+    references::{metric_series_ref, source_signal_name},
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
@@ -73,21 +73,21 @@ pub struct EvalMetricDefinition {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvalSubmission {
-    pub scenario_id: String,
-    pub access_path: EvalAccessPath,
-    pub budget: EvalBudget,
-    pub serialized_context: Value,
-    pub measured_tokens: u32,
+    scenario_id: String,
+    access_path: EvalAccessPath,
+    budget: EvalBudget,
+    serialized_context: Value,
+    measured_tokens: u32,
     #[serde(default)]
-    pub candidate_entities: Vec<EvalCandidateEntity>,
+    candidate_entities: Vec<EvalCandidateEntity>,
     #[serde(default)]
-    pub timeline_events: Vec<EvalTimelineEvent>,
+    timeline_events: Vec<EvalTimelineEvent>,
     #[serde(default)]
-    pub evidence_refs: Vec<EvalSourceRef>,
+    evidence_refs: Vec<EvalSourceRef>,
     #[serde(default)]
-    pub counter_evidence_refs: Vec<EvalSourceRef>,
+    counter_evidence_refs: Vec<EvalSourceRef>,
     #[serde(default)]
-    pub missing_data_refs: Vec<EvalSourceRef>,
+    missing_data_refs: Vec<EvalSourceRef>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -178,6 +178,50 @@ pub struct PayloadMeasurement {
     pub measured_tokens: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawContextEnvelope {
+    scenario_id: String,
+    question: String,
+    time_window: TimeWindow,
+    records: Vec<RawContextRecord>,
+    dropped_record_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawContextRecord {
+    kind: RawContextRecordKind,
+    id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    t: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    entities: Vec<String>,
+    #[serde(default)]
+    source_refs: Vec<EvalSourceRef>,
+    summary: String,
+    payload: Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RawContextRecordKind {
+    Change,
+    Log,
+    Trace,
+    MetricDelta,
+    TelemetryGap,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct RawCandidateRecord {
+    priority: u8,
+    score: f64,
+    sort_time: String,
+    sort_id: String,
+    record: RawContextRecord,
+}
+
 #[derive(Debug)]
 pub enum ComparativeEvalError {
     FixtureCorpusLoad(FixtureCorpusLoadError),
@@ -189,6 +233,12 @@ pub enum ComparativeEvalError {
     JanusAccess {
         scenario_id: String,
         source: Box<GetEvidenceBundleError>,
+    },
+    BudgetExceeded {
+        scenario_id: String,
+        access_path: EvalAccessPath,
+        measured_tokens: u32,
+        max_tokens: u32,
     },
     SerializePayload(serde_json::Error),
     TokenEstimateOverflow {
@@ -247,6 +297,46 @@ impl EvalSubmission {
             missing_data_refs: input.missing_data_refs,
         })
     }
+
+    pub fn scenario_id(&self) -> &str {
+        &self.scenario_id
+    }
+
+    pub fn access_path(&self) -> EvalAccessPath {
+        self.access_path
+    }
+
+    pub fn budget(&self) -> &EvalBudget {
+        &self.budget
+    }
+
+    pub fn serialized_context(&self) -> &Value {
+        &self.serialized_context
+    }
+
+    pub fn measured_tokens(&self) -> u32 {
+        self.measured_tokens
+    }
+
+    pub fn candidate_entities(&self) -> &[EvalCandidateEntity] {
+        &self.candidate_entities
+    }
+
+    pub fn timeline_events(&self) -> &[EvalTimelineEvent] {
+        &self.timeline_events
+    }
+
+    pub fn evidence_refs(&self) -> &[EvalSourceRef] {
+        &self.evidence_refs
+    }
+
+    pub fn counter_evidence_refs(&self) -> &[EvalSourceRef] {
+        &self.counter_evidence_refs
+    }
+
+    pub fn missing_data_refs(&self) -> &[EvalSourceRef] {
+        &self.missing_data_refs
+    }
 }
 
 pub fn metric_definitions() -> Vec<EvalMetricDefinition> {
@@ -278,6 +368,59 @@ pub fn metric_definitions() -> Vec<EvalMetricDefinition> {
     ]
 }
 
+pub fn load_comparative_eval_report(
+    root: impl AsRef<Path>,
+    selector: &EvalFixtureSelector,
+    budget: EvalBudget,
+    repo_sha: impl Into<String>,
+) -> Result<ComparativeEvalReport, ComparativeEvalError> {
+    let corpus = FixtureCorpus::load(root).map_err(ComparativeEvalError::FixtureCorpusLoad)?;
+    build_comparative_eval_report(&corpus, selector, budget, repo_sha)
+}
+
+pub fn build_comparative_eval_report(
+    corpus: &FixtureCorpus,
+    selector: &EvalFixtureSelector,
+    budget: EvalBudget,
+    repo_sha: impl Into<String>,
+) -> Result<ComparativeEvalReport, ComparativeEvalError> {
+    let cases = selected_cases(corpus, selector)?;
+    let mut scenarios = Vec::new();
+    let mut total_janus_tokens = 0u32;
+    let mut total_raw_tokens = 0u32;
+
+    for case in &cases {
+        let janus_submission = run_janus_eval_submission(case, budget.clone())?;
+        total_janus_tokens = total_janus_tokens.saturating_add(janus_submission.measured_tokens());
+
+        let raw_submission = run_raw_eval_submission(case, budget.clone())?;
+        total_raw_tokens = total_raw_tokens.saturating_add(raw_submission.measured_tokens());
+
+        let mut report = scenario_report(case);
+        insert_submission(&mut report.janus, &janus_submission)?;
+        insert_submission(&mut report.raw, &raw_submission)?;
+        scenarios.push(report);
+    }
+
+    Ok(ComparativeEvalReport {
+        schema_version: COMPARATIVE_EVAL_SCHEMA_VERSION.to_string(),
+        repo_sha: repo_sha.into(),
+        fixture_registry: EvalFixtureRegistryReport {
+            schema_version: corpus.registry.schema_version.clone(),
+        },
+        budget,
+        metrics: metric_definitions(),
+        summary: ComparativeEvalSummary {
+            fixture_count: cases.len(),
+            janus: access_summary(cases.len(), total_janus_tokens),
+            raw: access_summary(cases.len(), total_raw_tokens),
+            delta: BTreeMap::new(),
+            false_causality_traps: BTreeMap::new(),
+        },
+        scenarios,
+    })
+}
+
 pub fn load_comparative_eval_report_with_janus(
     root: impl AsRef<Path>,
     selector: &EvalFixtureSelector,
@@ -300,22 +443,12 @@ pub fn build_comparative_eval_report_with_janus(
 
     for case in &cases {
         let submission = run_janus_eval_submission(case, budget.clone())?;
-        total_janus_tokens = total_janus_tokens.saturating_add(submission.measured_tokens);
+        total_janus_tokens = total_janus_tokens.saturating_add(submission.measured_tokens());
 
         let mut report = scenario_report(case);
-        report.janus.insert(
-            "submission".to_string(),
-            serde_json::to_value(&submission).map_err(ComparativeEvalError::SerializePayload)?,
-        );
+        insert_submission(&mut report.janus, &submission)?;
         scenarios.push(report);
     }
-
-    let mut janus_summary = BTreeMap::new();
-    janus_summary.insert("submission_count".to_string(), Value::from(cases.len()));
-    janus_summary.insert(
-        "measured_tokens".to_string(),
-        Value::from(total_janus_tokens),
-    );
 
     Ok(ComparativeEvalReport {
         schema_version: COMPARATIVE_EVAL_SCHEMA_VERSION.to_string(),
@@ -327,7 +460,7 @@ pub fn build_comparative_eval_report_with_janus(
         metrics: metric_definitions(),
         summary: ComparativeEvalSummary {
             fixture_count: cases.len(),
-            janus: janus_summary,
+            janus: access_summary(cases.len(), total_janus_tokens),
             raw: BTreeMap::new(),
             delta: BTreeMap::new(),
             false_causality_traps: BTreeMap::new(),
@@ -336,7 +469,8 @@ pub fn build_comparative_eval_report_with_janus(
     })
 }
 
-pub fn build_empty_comparative_eval_report(
+#[cfg(test)]
+fn build_empty_comparative_eval_report(
     corpus: &FixtureCorpus,
     selector: &EvalFixtureSelector,
     budget: EvalBudget,
@@ -370,13 +504,29 @@ pub fn run_janus_eval_submission(
     budget: EvalBudget,
 ) -> Result<EvalSubmission, ComparativeEvalError> {
     let query = janus_query_for_case(case, &budget)?;
+    let aliases = resource_entity_aliases(&case.input);
     let bundle =
         get_evidence_bundle(query).map_err(|source| ComparativeEvalError::JanusAccess {
             scenario_id: case.manifest.id.clone(),
             source: Box::new(source),
         })?;
 
-    normalize_janus_bundle(&case.manifest.id, budget, bundle)
+    normalize_janus_bundle(&case.manifest.id, budget, bundle, &aliases)
+}
+
+pub fn run_raw_eval_submission(
+    case: &FixtureCase,
+    budget: EvalBudget,
+) -> Result<EvalSubmission, ComparativeEvalError> {
+    let time_window: TimeWindow = serde_json::from_value(case.manifest.time_window.clone())
+        .map_err(|source| ComparativeEvalError::InvalidScenarioTimeWindow {
+            scenario_id: case.manifest.id.clone(),
+            source,
+        })?;
+    let aliases = resource_entity_aliases(&case.input);
+    let candidates = raw_candidate_records(case, &time_window, &aliases);
+    let envelope = select_raw_context(case, time_window, &budget, candidates)?;
+    normalize_raw_context(&case.manifest.id, budget, envelope)
 }
 
 pub fn measure_serialized_payload<T: Serialize>(
@@ -428,15 +578,23 @@ pub fn format_text_report(report: &ComparativeEvalReport) -> String {
             .and_then(Value::as_u64)
             .map(|tokens| format!(", janus_tokens={tokens}"))
             .unwrap_or_default();
+        let raw_tokens = scenario
+            .raw
+            .get("submission")
+            .and_then(|submission| submission.get("measured_tokens"))
+            .and_then(Value::as_u64)
+            .map(|tokens| format!(", raw_tokens={tokens}"))
+            .unwrap_or_default();
 
         output.push_str(&format!(
-            "- {} v{} ({}, {}, trap={}{})\n",
+            "- {} v{} ({}, {}, trap={}{}{})\n",
             scenario.id,
             scenario.scenario_version,
             scenario.failure_class,
             scenario.difficulty,
             scenario.false_causality_trap,
-            janus_tokens
+            janus_tokens,
+            raw_tokens
         ));
     }
 
@@ -474,6 +632,27 @@ fn scenario_report(case: &FixtureCase) -> ScenarioEvalReport {
     }
 }
 
+fn insert_submission(
+    target: &mut BTreeMap<String, Value>,
+    submission: &EvalSubmission,
+) -> Result<(), ComparativeEvalError> {
+    target.insert(
+        "submission".to_string(),
+        serde_json::to_value(submission).map_err(ComparativeEvalError::SerializePayload)?,
+    );
+    Ok(())
+}
+
+fn access_summary(submission_count: usize, measured_tokens: u32) -> BTreeMap<String, Value> {
+    let mut summary = BTreeMap::new();
+    summary.insert(
+        "submission_count".to_string(),
+        Value::from(submission_count),
+    );
+    summary.insert("measured_tokens".to_string(), Value::from(measured_tokens));
+    summary
+}
+
 fn janus_query_for_case(
     case: &FixtureCase,
     budget: &EvalBudget,
@@ -509,16 +688,17 @@ fn normalize_janus_bundle(
     scenario_id: &str,
     budget: EvalBudget,
     bundle: EvidenceBundle,
+    aliases: &BTreeMap<String, String>,
 ) -> Result<EvalSubmission, ComparativeEvalError> {
-    let candidate_entities = candidate_entities_from_bundle(&bundle);
-    let timeline_events = timeline_events_from_bundle(&bundle);
+    let candidate_entities = candidate_entities_from_bundle(&bundle, aliases);
+    let timeline_events = timeline_events_from_bundle(&bundle, aliases);
     let evidence_refs = source_refs_for_items(&bundle.items, |_| true);
     let counter_evidence_refs = source_refs_for_items(&bundle.items, is_counter_evidence_item);
     let missing_data_refs = source_refs_for_items(&bundle.items, is_missing_data_item);
     let serialized_context =
         serde_json::to_value(&bundle).map_err(ComparativeEvalError::SerializePayload)?;
 
-    EvalSubmission::from_serialized_context(EvalSubmissionInput {
+    let submission = EvalSubmission::from_serialized_context(EvalSubmissionInput {
         scenario_id: scenario_id.to_string(),
         access_path: EvalAccessPath::Janus,
         budget,
@@ -528,14 +708,822 @@ fn normalize_janus_bundle(
         evidence_refs,
         counter_evidence_refs,
         missing_data_refs,
-    })
+    })?;
+    ensure_submission_budget(&submission)?;
+    Ok(submission)
 }
 
-fn candidate_entities_from_bundle(bundle: &EvidenceBundle) -> Vec<EvalCandidateEntity> {
+fn normalize_raw_context(
+    scenario_id: &str,
+    budget: EvalBudget,
+    envelope: RawContextEnvelope,
+) -> Result<EvalSubmission, ComparativeEvalError> {
+    let candidate_entities = candidate_entities_from_raw_records(&envelope.records);
+    let timeline_events = timeline_events_from_raw_records(&envelope.records);
+    let evidence_refs = source_refs_from_raw_records(&envelope.records, |_| true);
+    let counter_evidence_refs = Vec::new();
+    let missing_data_refs = source_refs_from_raw_records(&envelope.records, |record| {
+        record.kind == RawContextRecordKind::TelemetryGap
+            || record
+                .source_refs
+                .iter()
+                .any(|source_ref| source_ref.signal == "telemetry_gap")
+    });
+    let serialized_context =
+        serde_json::to_value(&envelope).map_err(ComparativeEvalError::SerializePayload)?;
+
+    let submission = EvalSubmission::from_serialized_context(EvalSubmissionInput {
+        scenario_id: scenario_id.to_string(),
+        access_path: EvalAccessPath::Raw,
+        budget,
+        serialized_context,
+        candidate_entities,
+        timeline_events,
+        evidence_refs,
+        counter_evidence_refs,
+        missing_data_refs,
+    })?;
+    ensure_submission_budget(&submission)?;
+    Ok(submission)
+}
+
+fn raw_candidate_records(
+    case: &FixtureCase,
+    time_window: &TimeWindow,
+    aliases: &BTreeMap<String, String>,
+) -> Vec<RawCandidateRecord> {
+    let mut candidates = Vec::new();
+    push_raw_change_candidates(case, time_window, aliases, &mut candidates);
+    push_raw_gap_candidates(case, time_window, aliases, &mut candidates);
+    push_raw_log_candidates(case, time_window, aliases, &mut candidates);
+    push_raw_trace_candidates(case, time_window, aliases, &mut candidates);
+    push_raw_metric_candidates(case, time_window, aliases, &mut candidates);
+
+    candidates.sort_by(|left, right| {
+        left.priority
+            .cmp(&right.priority)
+            .then_with(|| right.score.total_cmp(&left.score))
+            .then_with(|| left.sort_time.cmp(&right.sort_time))
+            .then_with(|| left.sort_id.cmp(&right.sort_id))
+    });
+
+    candidates
+}
+
+fn push_raw_change_candidates(
+    case: &FixtureCase,
+    time_window: &TimeWindow,
+    aliases: &BTreeMap<String, String>,
+    candidates: &mut Vec<RawCandidateRecord>,
+) {
+    let Some(changes) = array_at(&case.input, "changes") else {
+        return;
+    };
+
+    for (index, change) in changes.iter().enumerate() {
+        let Some(t) = str_field(change, "t") else {
+            continue;
+        };
+        if !timestamp_in_window(t, time_window) {
+            continue;
+        }
+
+        let id = str_field(change, "id")
+            .map(ToString::to_string)
+            .unwrap_or_else(|| format!("raw-change-{index}"));
+        let entities = canonical_entities(entities_from_raw_value(change), aliases);
+        let summary = format!(
+            "{} change for {}: {}",
+            str_field(change, "kind").unwrap_or("unknown"),
+            display_entities(&entities),
+            str_field(change, "summary").unwrap_or("")
+        );
+        let record = RawContextRecord {
+            kind: RawContextRecordKind::Change,
+            id: id.clone(),
+            t: Some(t.to_string()),
+            entities,
+            source_refs: vec![EvalSourceRef {
+                signal: "change".to_string(),
+                r#ref: id.clone(),
+            }],
+            summary,
+            payload: change.clone(),
+        };
+        candidates.push(RawCandidateRecord {
+            priority: 0,
+            score: 1.0,
+            sort_time: t.to_string(),
+            sort_id: id,
+            record,
+        });
+    }
+}
+
+fn push_raw_gap_candidates(
+    case: &FixtureCase,
+    time_window: &TimeWindow,
+    aliases: &BTreeMap<String, String>,
+    candidates: &mut Vec<RawCandidateRecord>,
+) {
+    let mut seen_gap_refs = BTreeSet::new();
+
+    if let Some(gaps) = array_at(&case.input, "telemetry_gaps") {
+        for (index, gap) in gaps.iter().enumerate() {
+            let Some(start) = str_field(gap, "start") else {
+                continue;
+            };
+            let Some(end) = str_field(gap, "end") else {
+                continue;
+            };
+            if !window_overlaps(start, end, time_window) {
+                continue;
+            }
+
+            let id = str_field(gap, "id")
+                .map(ToString::to_string)
+                .unwrap_or_else(|| format!("raw-gap-{index}"));
+            seen_gap_refs.insert(id.clone());
+            let entities = canonical_entities(entities_from_raw_value(gap), aliases);
+            let record = RawContextRecord {
+                kind: RawContextRecordKind::TelemetryGap,
+                id: id.clone(),
+                t: Some(start.to_string()),
+                entities,
+                source_refs: vec![EvalSourceRef {
+                    signal: "telemetry_gap".to_string(),
+                    r#ref: id.clone(),
+                }],
+                summary: str_field(gap, "note")
+                    .unwrap_or("telemetry gap overlaps the incident window")
+                    .to_string(),
+                payload: gap.clone(),
+            };
+            candidates.push(RawCandidateRecord {
+                priority: 1,
+                score: 1.0,
+                sort_time: start.to_string(),
+                sort_id: id,
+                record,
+            });
+        }
+    }
+
+    let Some(metrics) = array_at(&case.input, "metrics") else {
+        return;
+    };
+
+    for (index, metric) in metrics.iter().enumerate() {
+        let Some(gap) = metric.get("_gap") else {
+            continue;
+        };
+        let Some(start) = str_field(gap, "start") else {
+            continue;
+        };
+        let Some(end) = str_field(gap, "end") else {
+            continue;
+        };
+        if !window_overlaps(start, end, time_window) {
+            continue;
+        }
+
+        let Some(gap_ref) = str_field(gap, "ref") else {
+            continue;
+        };
+        if seen_gap_refs.contains(gap_ref) {
+            continue;
+        }
+
+        let metric_name = str_field(metric, "name").unwrap_or("metric");
+        let entity = str_field(metric, "entity").unwrap_or("unknown");
+        let canonical = canonical_entity(entity, aliases);
+        let id = format!("raw-metric-gap-{index}-{gap_ref}");
+        let record = RawContextRecord {
+            kind: RawContextRecordKind::TelemetryGap,
+            id: id.clone(),
+            t: Some(start.to_string()),
+            entities: vec![canonical.clone()],
+            source_refs: vec![EvalSourceRef {
+                signal: "telemetry_gap".to_string(),
+                r#ref: gap_ref.to_string(),
+            }],
+            summary: format!("{metric_name} has a telemetry gap for {canonical}"),
+            payload: json_object([
+                ("metric", Value::String(metric_name.to_string())),
+                ("entity", Value::String(canonical)),
+                ("gap", gap.clone()),
+            ]),
+        };
+        candidates.push(RawCandidateRecord {
+            priority: 1,
+            score: 0.95,
+            sort_time: start.to_string(),
+            sort_id: id,
+            record,
+        });
+    }
+}
+
+fn push_raw_log_candidates(
+    case: &FixtureCase,
+    time_window: &TimeWindow,
+    aliases: &BTreeMap<String, String>,
+    candidates: &mut Vec<RawCandidateRecord>,
+) {
+    let Some(logs) = array_at(&case.input, "logs") else {
+        return;
+    };
+
+    for (index, log) in logs.iter().enumerate() {
+        let Some(t) = str_field(log, "t") else {
+            continue;
+        };
+        if !timestamp_in_window(t, time_window) {
+            continue;
+        }
+
+        let severity = str_field(log, "severity").unwrap_or("");
+        let severity_score = match severity {
+            "ERROR" => 1.0,
+            "WARN" | "WARNING" => 0.65,
+            _ => continue,
+        };
+        let id = str_field(log, "id")
+            .map(ToString::to_string)
+            .unwrap_or_else(|| format!("raw-log-{index}"));
+        let entities = canonical_entities(entities_from_raw_value(log), aliases);
+        let body = str_field(log, "body").unwrap_or("");
+        let record = RawContextRecord {
+            kind: RawContextRecordKind::Log,
+            id: id.clone(),
+            t: Some(t.to_string()),
+            entities,
+            source_refs: vec![EvalSourceRef {
+                signal: "log".to_string(),
+                r#ref: id.clone(),
+            }],
+            summary: format!("{severity} log: {body}"),
+            payload: log.clone(),
+        };
+        candidates.push(RawCandidateRecord {
+            priority: if severity == "ERROR" { 2 } else { 4 },
+            score: severity_score,
+            sort_time: t.to_string(),
+            sort_id: id,
+            record,
+        });
+    }
+}
+
+fn push_raw_trace_candidates(
+    case: &FixtureCase,
+    time_window: &TimeWindow,
+    aliases: &BTreeMap<String, String>,
+    candidates: &mut Vec<RawCandidateRecord>,
+) {
+    let Some(traces) = array_at(&case.input, "traces") else {
+        return;
+    };
+
+    for (index, trace) in traces.iter().enumerate() {
+        let Some(trace_id) = str_field(trace, "trace_id") else {
+            continue;
+        };
+        let Some(spans) = array_at(trace, "spans") else {
+            continue;
+        };
+
+        let mut failed_spans = Vec::new();
+        let mut source_refs = Vec::new();
+        let mut entities = Vec::new();
+        let mut starts = Vec::new();
+
+        for span in spans {
+            let Some(start) = str_field(span, "start") else {
+                continue;
+            };
+            if !timestamp_in_window(start, time_window) {
+                continue;
+            }
+            starts.push(start.to_string());
+
+            if str_field(span, "status") == Some("ERROR") {
+                failed_spans.push(compact_span_payload(span, aliases));
+            }
+
+            if let Some(span_id) = str_field(span, "span_id") {
+                source_refs.push(EvalSourceRef {
+                    signal: "trace".to_string(),
+                    r#ref: format!("{trace_id}/{span_id}"),
+                });
+            }
+            entities.extend(canonical_entities(entities_from_span(span), aliases));
+        }
+
+        if failed_spans.is_empty() {
+            continue;
+        }
+
+        starts.sort();
+        let t = starts
+            .first()
+            .cloned()
+            .unwrap_or_else(|| time_window.start.clone());
+        let id = format!("raw-trace-{index}-{trace_id}");
+        let entities = dedupe_strings(entities);
+        let record = RawContextRecord {
+            kind: RawContextRecordKind::Trace,
+            id: id.clone(),
+            t: Some(t.clone()),
+            entities: entities.clone(),
+            source_refs: dedupe_eval_refs(source_refs),
+            summary: format!(
+                "failed trace {trace_id} touches {} with {} failed span(s)",
+                display_entities(&entities),
+                failed_spans.len()
+            ),
+            payload: json_object([
+                ("trace_id", Value::String(trace_id.to_string())),
+                (
+                    "exemplar_of",
+                    trace
+                        .get("exemplar_of")
+                        .cloned()
+                        .unwrap_or_else(|| Value::String("unknown".to_string())),
+                ),
+                ("failed_spans", Value::Array(failed_spans)),
+            ]),
+        };
+        candidates.push(RawCandidateRecord {
+            priority: 3,
+            score: 1.0,
+            sort_time: t,
+            sort_id: id,
+            record,
+        });
+    }
+}
+
+fn push_raw_metric_candidates(
+    case: &FixtureCase,
+    time_window: &TimeWindow,
+    aliases: &BTreeMap<String, String>,
+    candidates: &mut Vec<RawCandidateRecord>,
+) {
+    let Some(metrics) = array_at(&case.input, "metrics") else {
+        return;
+    };
+
+    for (index, metric) in metrics.iter().enumerate() {
+        let Some(name) = str_field(metric, "name") else {
+            continue;
+        };
+        let Some(entity) = str_field(metric, "entity") else {
+            continue;
+        };
+        let Some(points) = array_at(metric, "points") else {
+            continue;
+        };
+
+        let mut selected_points = points
+            .iter()
+            .filter(|point| {
+                str_field(point, "t")
+                    .is_some_and(|timestamp| timestamp_in_window(timestamp, time_window))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if selected_points.len() < 2 {
+            selected_points = points.clone();
+        }
+        selected_points.sort_by(|left, right| {
+            str_field(left, "t")
+                .unwrap_or("")
+                .cmp(str_field(right, "t").unwrap_or(""))
+        });
+
+        let Some((first_t, first_v)) = point_time_value(selected_points.first()) else {
+            continue;
+        };
+        let Some((last_t, last_v)) = point_time_value(selected_points.last()) else {
+            continue;
+        };
+        let delta = (last_v - first_v).abs();
+        if delta <= 0.0 {
+            continue;
+        }
+        let relative_delta = delta / first_v.abs().max(0.001);
+        let score = relative_delta.max(delta);
+        let canonical = canonical_entity(entity, aliases);
+        let metric_ref = metric_series_ref(name, entity);
+        let id = format!("raw-metric-{index}-{metric_ref}");
+        let record = RawContextRecord {
+            kind: RawContextRecordKind::MetricDelta,
+            id: id.clone(),
+            t: Some(last_t.to_string()),
+            entities: vec![canonical.clone()],
+            source_refs: vec![EvalSourceRef {
+                signal: "metric".to_string(),
+                r#ref: metric_ref,
+            }],
+            summary: format!("{name} for {canonical} changed from {first_v:.3} to {last_v:.3}"),
+            payload: json_object([
+                ("name", Value::String(name.to_string())),
+                ("entity", Value::String(canonical)),
+                (
+                    "unit",
+                    metric
+                        .get("unit")
+                        .cloned()
+                        .unwrap_or_else(|| Value::String("unknown".to_string())),
+                ),
+                (
+                    "first",
+                    json_object([
+                        ("t", Value::String(first_t.to_string())),
+                        ("v", Value::from(first_v)),
+                    ]),
+                ),
+                (
+                    "last",
+                    json_object([
+                        ("t", Value::String(last_t.to_string())),
+                        ("v", Value::from(last_v)),
+                    ]),
+                ),
+                ("absolute_delta", Value::from(delta)),
+                ("relative_delta", Value::from(relative_delta)),
+            ]),
+        };
+        candidates.push(RawCandidateRecord {
+            priority: 5,
+            score,
+            sort_time: last_t.to_string(),
+            sort_id: id,
+            record,
+        });
+    }
+}
+
+fn select_raw_context(
+    case: &FixtureCase,
+    time_window: TimeWindow,
+    budget: &EvalBudget,
+    candidates: Vec<RawCandidateRecord>,
+) -> Result<RawContextEnvelope, ComparativeEvalError> {
+    let total_candidates = candidates.len();
+    let mut selected = Vec::new();
+
+    for candidate in candidates {
+        if selected.len() >= budget.max_items as usize {
+            continue;
+        }
+
+        let mut trial_records = selected.clone();
+        trial_records.push(candidate.record);
+        let trial = raw_context_envelope(
+            case,
+            time_window.clone(),
+            trial_records.clone(),
+            total_candidates.saturating_sub(trial_records.len()),
+        );
+        let trial_value =
+            serde_json::to_value(&trial).map_err(ComparativeEvalError::SerializePayload)?;
+        let measurement = measure_serialized_payload(&trial_value)?;
+        if measurement.measured_tokens <= budget.max_tokens {
+            selected = trial_records;
+        }
+    }
+
+    let dropped_record_count = total_candidates.saturating_sub(selected.len());
+    let envelope = raw_context_envelope(case, time_window, selected, dropped_record_count);
+    let value = serde_json::to_value(&envelope).map_err(ComparativeEvalError::SerializePayload)?;
+    let measurement = measure_serialized_payload(&value)?;
+    if measurement.measured_tokens > budget.max_tokens {
+        return Err(ComparativeEvalError::BudgetExceeded {
+            scenario_id: case.manifest.id.clone(),
+            access_path: EvalAccessPath::Raw,
+            measured_tokens: measurement.measured_tokens,
+            max_tokens: budget.max_tokens,
+        });
+    }
+
+    Ok(envelope)
+}
+
+fn raw_context_envelope(
+    case: &FixtureCase,
+    time_window: TimeWindow,
+    records: Vec<RawContextRecord>,
+    dropped_record_count: usize,
+) -> RawContextEnvelope {
+    RawContextEnvelope {
+        scenario_id: case.manifest.id.clone(),
+        question: case.manifest.question.clone(),
+        time_window,
+        records,
+        dropped_record_count,
+    }
+}
+
+fn ensure_submission_budget(submission: &EvalSubmission) -> Result<(), ComparativeEvalError> {
+    if submission.measured_tokens() > submission.budget().max_tokens {
+        return Err(ComparativeEvalError::BudgetExceeded {
+            scenario_id: submission.scenario_id().to_string(),
+            access_path: submission.access_path(),
+            measured_tokens: submission.measured_tokens(),
+            max_tokens: submission.budget().max_tokens,
+        });
+    }
+
+    Ok(())
+}
+
+fn candidate_entities_from_raw_records(records: &[RawContextRecord]) -> Vec<EvalCandidateEntity> {
+    let mut drafts = BTreeMap::<String, CandidateEntityDraft>::new();
+
+    for (record_index, record) in records.iter().enumerate() {
+        for entity in &record.entities {
+            let score = raw_record_entity_score(record.kind);
+            let draft = drafts
+                .entry(entity.clone())
+                .or_insert_with(|| CandidateEntityDraft {
+                    entity: entity.clone(),
+                    first_item_index: record_index,
+                    score,
+                });
+            draft.first_item_index = draft.first_item_index.min(record_index);
+            draft.score = draft.score.max(score);
+        }
+    }
+
+    let mut ranked = drafts.into_values().collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        left.first_item_index
+            .cmp(&right.first_item_index)
+            .then_with(|| right.score.total_cmp(&left.score))
+            .then_with(|| left.entity.cmp(&right.entity))
+    });
+
+    ranked
+        .into_iter()
+        .enumerate()
+        .map(|(index, draft)| EvalCandidateEntity {
+            entity: draft.entity,
+            rank: Some((index + 1) as u32),
+            score: Some(draft.score),
+        })
+        .collect()
+}
+
+fn timeline_events_from_raw_records(records: &[RawContextRecord]) -> Vec<EvalTimelineEvent> {
+    let mut events = records
+        .iter()
+        .filter_map(|record| {
+            record.t.as_ref().map(|t| EvalTimelineEvent {
+                t: t.clone(),
+                marker: raw_timeline_marker(record.kind).to_string(),
+                entity: record
+                    .entities
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "unknown".to_string()),
+                source_ref: record.source_refs.first().cloned(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    // Fixture timestamps are normalized UTC strings, so lexical ordering is stable here.
+    events.sort_by(|left, right| {
+        left.t
+            .cmp(&right.t)
+            .then_with(|| left.marker.cmp(&right.marker))
+            .then_with(|| left.entity.cmp(&right.entity))
+    });
+
+    events
+}
+
+fn source_refs_from_raw_records(
+    records: &[RawContextRecord],
+    predicate: impl Fn(&RawContextRecord) -> bool,
+) -> Vec<EvalSourceRef> {
+    let mut refs = Vec::new();
+    for record in records.iter().filter(|record| predicate(record)) {
+        refs.extend(record.source_refs.iter().cloned());
+    }
+    dedupe_eval_refs(refs)
+}
+
+fn raw_record_entity_score(kind: RawContextRecordKind) -> f64 {
+    match kind {
+        RawContextRecordKind::Change => 1.0,
+        RawContextRecordKind::TelemetryGap => 0.95,
+        RawContextRecordKind::Log => 0.9,
+        RawContextRecordKind::Trace => 0.85,
+        RawContextRecordKind::MetricDelta => 0.8,
+    }
+}
+
+fn raw_timeline_marker(kind: RawContextRecordKind) -> &'static str {
+    match kind {
+        RawContextRecordKind::Change => "change",
+        RawContextRecordKind::TelemetryGap => "data-gap",
+        RawContextRecordKind::Log
+        | RawContextRecordKind::Trace
+        | RawContextRecordKind::MetricDelta => "symptom",
+    }
+}
+
+fn resource_entity_aliases(input: &Value) -> BTreeMap<String, String> {
+    let mut aliases = BTreeMap::new();
+
+    if let Some(resources) = array_at(input, "resources") {
+        for resource in resources {
+            let Some(resource_id) = str_field(resource, "id") else {
+                continue;
+            };
+            let Some(attributes) = resource.get("attributes").and_then(Value::as_object) else {
+                continue;
+            };
+            let Some(service_name) = attributes.get("service.name").and_then(Value::as_str) else {
+                continue;
+            };
+
+            let entity = match attributes.get("db.system").and_then(Value::as_str) {
+                Some("redis") => format!("infra:{service_name}"),
+                Some(_) => format!("db:{service_name}"),
+                None => format!("service:{service_name}"),
+            };
+            aliases.insert(resource_id.to_string(), entity);
+        }
+    }
+
+    aliases
+}
+
+fn canonical_entities(entities: Vec<String>, aliases: &BTreeMap<String, String>) -> Vec<String> {
+    dedupe_strings(
+        entities
+            .iter()
+            .map(|entity| canonical_entity(entity, aliases))
+            .collect(),
+    )
+}
+
+fn canonical_entity(entity: &str, aliases: &BTreeMap<String, String>) -> String {
+    aliases
+        .get(entity)
+        .cloned()
+        .unwrap_or_else(|| entity.to_string())
+}
+
+fn entities_from_raw_value(value: &Value) -> Vec<String> {
+    let mut entities = Vec::new();
+    push_str_field(&mut entities, value, "entity");
+    push_str_field(&mut entities, value, "resource");
+    push_str_array_field(&mut entities, value, "entities");
+    push_str_array_field(&mut entities, value, "affected_entities");
+    dedupe_strings(entities)
+}
+
+fn entities_from_span(span: &Value) -> Vec<String> {
+    let mut entities = entities_from_raw_value(span);
+    if let Some(attributes) = span.get("attributes").and_then(Value::as_object) {
+        if let Some(peer) = attributes.get("peer.service").and_then(Value::as_str) {
+            entities.push(format!("service:{peer}"));
+        }
+        if let Some(db_system) = attributes.get("db.system").and_then(Value::as_str) {
+            if let Some(resource) = str_field(span, "resource") {
+                entities.push(resource.to_string());
+            } else {
+                entities.push(format!("db:{db_system}"));
+            }
+        }
+    }
+    dedupe_strings(entities)
+}
+
+fn compact_span_payload(span: &Value, aliases: &BTreeMap<String, String>) -> Value {
+    let mut payload = Map::new();
+
+    for key in [
+        "span_id",
+        "parent_id",
+        "name",
+        "kind",
+        "start",
+        "end",
+        "status",
+    ] {
+        if let Some(value) = span.get(key) {
+            payload.insert(key.to_string(), value.clone());
+        }
+    }
+    if let Some(resource) = str_field(span, "resource") {
+        payload.insert(
+            "entity".to_string(),
+            Value::String(canonical_entity(resource, aliases)),
+        );
+    }
+    if let Some(attributes) = span.get("attributes") {
+        payload.insert("attributes".to_string(), attributes.clone());
+    }
+
+    Value::Object(payload)
+}
+
+fn point_time_value(point: Option<&Value>) -> Option<(&str, f64)> {
+    let point = point?;
+    let t = str_field(point, "t")?;
+    let v = point.get("v")?.as_f64()?;
+    Some((t, v))
+}
+
+fn timestamp_in_window(timestamp: &str, window: &TimeWindow) -> bool {
+    window.start.as_str() <= timestamp && timestamp <= window.end.as_str()
+}
+
+fn window_overlaps(start: &str, end: &str, window: &TimeWindow) -> bool {
+    start <= window.end.as_str() && window.start.as_str() <= end
+}
+
+fn array_at<'a>(value: &'a Value, key: &str) -> Option<&'a Vec<Value>> {
+    value.get(key).and_then(Value::as_array)
+}
+
+fn str_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    value.get(key).and_then(Value::as_str)
+}
+
+fn push_str_field(entities: &mut Vec<String>, value: &Value, field: &str) {
+    if let Some(entity) = str_field(value, field)
+        && !entity.trim().is_empty()
+    {
+        entities.push(entity.to_string());
+    }
+}
+
+fn push_str_array_field(entities: &mut Vec<String>, value: &Value, field: &str) {
+    if let Some(values) = value.get(field).and_then(Value::as_array) {
+        for value in values {
+            if let Some(entity) = value.as_str()
+                && !entity.trim().is_empty()
+            {
+                entities.push(entity.to_string());
+            }
+        }
+    }
+}
+
+fn dedupe_strings(values: Vec<String>) -> Vec<String> {
+    let mut deduped = Vec::new();
+    for value in values {
+        if !deduped.contains(&value) {
+            deduped.push(value);
+        }
+    }
+    deduped
+}
+
+fn dedupe_eval_refs(values: Vec<EvalSourceRef>) -> Vec<EvalSourceRef> {
+    let mut seen = BTreeSet::<(String, String)>::new();
+    let mut deduped = Vec::new();
+
+    for value in values {
+        if seen.insert((value.signal.clone(), value.r#ref.clone())) {
+            deduped.push(value);
+        }
+    }
+
+    deduped
+}
+
+fn display_entities(entities: &[String]) -> String {
+    if entities.is_empty() {
+        "unknown".to_string()
+    } else {
+        entities.join(", ")
+    }
+}
+
+fn json_object<const N: usize>(entries: [(&str, Value); N]) -> Value {
+    let mut object = Map::new();
+    for (key, value) in entries {
+        object.insert(key.to_string(), value);
+    }
+    Value::Object(object)
+}
+
+fn candidate_entities_from_bundle(
+    bundle: &EvidenceBundle,
+    aliases: &BTreeMap<String, String>,
+) -> Vec<EvalCandidateEntity> {
     let mut drafts = BTreeMap::<String, CandidateEntityDraft>::new();
 
     for (item_index, item) in bundle.items.iter().enumerate() {
         for entity in &item.entities {
+            let entity = canonical_entity(entity, aliases);
             let draft = drafts
                 .entry(entity.clone())
                 .or_insert_with(|| CandidateEntityDraft {
@@ -567,7 +1555,10 @@ fn candidate_entities_from_bundle(bundle: &EvidenceBundle) -> Vec<EvalCandidateE
         .collect()
 }
 
-fn timeline_events_from_bundle(bundle: &EvidenceBundle) -> Vec<EvalTimelineEvent> {
+fn timeline_events_from_bundle(
+    bundle: &EvidenceBundle,
+    aliases: &BTreeMap<String, String>,
+) -> Vec<EvalTimelineEvent> {
     let mut events = bundle
         .items
         .iter()
@@ -577,12 +1568,13 @@ fn timeline_events_from_bundle(bundle: &EvidenceBundle) -> Vec<EvalTimelineEvent
             entity: item
                 .entities
                 .first()
-                .cloned()
+                .map(|entity| canonical_entity(entity, aliases))
                 .unwrap_or_else(|| "unknown".to_string()),
             source_ref: item.source_refs.iter().next().map(eval_source_ref),
         })
         .collect::<Vec<_>>();
 
+    // Fixture timestamps are normalized UTC strings, so lexical ordering is stable here.
     events.sort_by(|left, right| {
         left.t
             .cmp(&right.t)
@@ -688,6 +1680,15 @@ impl fmt::Display for ComparativeEvalError {
                 scenario_id,
                 source,
             } => write!(formatter, "Janus access failed for {scenario_id}: {source}"),
+            ComparativeEvalError::BudgetExceeded {
+                scenario_id,
+                access_path,
+                measured_tokens,
+                max_tokens,
+            } => write!(
+                formatter,
+                "{access_path:?} access exceeded eval budget for {scenario_id}: measured_tokens={measured_tokens}, max_tokens={max_tokens}"
+            ),
             ComparativeEvalError::SerializePayload(error) => {
                 write!(formatter, "failed to serialize measured payload: {error}")
             }
@@ -706,6 +1707,7 @@ impl std::error::Error for ComparativeEvalError {
             ComparativeEvalError::JanusAccess { source, .. } => Some(source.as_ref()),
             ComparativeEvalError::SerializePayload(error) => Some(error),
             ComparativeEvalError::NoFixturesSelected
+            | ComparativeEvalError::BudgetExceeded { .. }
             | ComparativeEvalError::TokenEstimateOverflow { .. } => None,
         }
     }
@@ -895,26 +1897,26 @@ mod tests {
         .expect("Janus report should build");
 
         let submission = janus_submission(&report.scenarios[0]);
-        let measurement = measure_serialized_payload(&submission.serialized_context)
+        let measurement = measure_serialized_payload(submission.serialized_context())
             .expect("serialized context should measure");
 
-        assert_eq!(submission.scenario_id, "deploy-bad-rollout");
-        assert_eq!(submission.access_path, EvalAccessPath::Janus);
-        assert_eq!(submission.budget, budget);
-        assert_eq!(submission.measured_tokens, measurement.measured_tokens);
+        assert_eq!(submission.scenario_id(), "deploy-bad-rollout");
+        assert_eq!(submission.access_path(), EvalAccessPath::Janus);
+        assert_eq!(submission.budget(), &budget);
+        assert_eq!(submission.measured_tokens(), measurement.measured_tokens);
         assert!(
             submission
-                .serialized_context
+                .serialized_context()
                 .get("items")
                 .and_then(Value::as_array)
                 .is_some_and(|items| !items.is_empty())
         );
-        assert!(!submission.candidate_entities.is_empty());
-        assert!(!submission.evidence_refs.is_empty());
-        assert!(!submission.timeline_events.is_empty());
+        assert!(!submission.candidate_entities().is_empty());
+        assert!(!submission.evidence_refs().is_empty());
+        assert!(!submission.timeline_events().is_empty());
         assert!(
             submission
-                .timeline_events
+                .timeline_events()
                 .windows(2)
                 .all(|events| events[0].t <= events[1].t)
         );
@@ -965,11 +1967,12 @@ mod tests {
                 max_tokens: 500,
             },
             bundle,
+            &BTreeMap::new(),
         )
         .expect("Janus bundle should normalize");
 
         assert_eq!(
-            submission.counter_evidence_refs,
+            submission.counter_evidence_refs(),
             vec![EvalSourceRef {
                 signal: "metric".to_string(),
                 r#ref: "search.error_rate@service:search".to_string(),
@@ -992,8 +1995,177 @@ mod tests {
         .expect("Janus submission should build");
 
         assert!(
-            !submission.missing_data_refs.is_empty(),
+            !submission.missing_data_refs().is_empty(),
             "missing-data refs should be normalized when the compiled bundle selects them"
+        );
+    }
+
+    #[test]
+    fn janus_candidate_entities_dedupe_direct_resource_aliases() {
+        let mut aliases = BTreeMap::new();
+        aliases.insert(
+            "res:redis-cache".to_string(),
+            "infra:redis-cache".to_string(),
+        );
+        let time_window = TimeWindow {
+            start: "2026-06-08T15:00:00Z".to_string(),
+            end: "2026-06-08T15:05:00Z".to_string(),
+        };
+        let bundle = EvidenceBundle {
+            question: Some("What is failing?".to_string()),
+            hypothesis: None,
+            time_window: time_window.clone(),
+            budget: EvidenceBudget {
+                max_items: 1,
+                max_tokens: 500,
+                tokens_used: 42,
+                items_dropped: 0,
+                note: None,
+            },
+            items: vec![EvidenceItem {
+                id: "ev-1".to_string(),
+                claim: "redis-cache is unhealthy".to_string(),
+                kind: EvidenceKind::MetricAnomaly,
+                direction: EvidenceDirection::Supports,
+                strength: UnitInterval(0.8),
+                time_window,
+                entities: vec![
+                    "infra:redis-cache".to_string(),
+                    "res:redis-cache".to_string(),
+                ],
+                source_refs: SourceRefs(vec![SourceRef {
+                    signal: SourceSignal::Metric,
+                    r#ref: "cache.hit_ratio@infra:redis-cache".to_string(),
+                }]),
+                freshness: EvidenceFreshness::Settled,
+                missing_data: Vec::new(),
+                token_cost: 42,
+                privacy_scope: "default".to_string(),
+                confidence: BTreeMap::new(),
+                note: None,
+            }],
+        };
+
+        let submission = normalize_janus_bundle(
+            "alias-case",
+            EvalBudget {
+                max_items: 1,
+                max_tokens: 500,
+            },
+            bundle,
+            &aliases,
+        )
+        .expect("Janus bundle should normalize");
+
+        assert_eq!(submission.candidate_entities().len(), 1);
+        assert_eq!(
+            submission.candidate_entities()[0].entity,
+            "infra:redis-cache"
+        );
+    }
+
+    #[test]
+    fn full_report_populates_janus_and_raw_submissions() {
+        let corpus = test_corpus();
+        let report = build_comparative_eval_report(
+            &corpus,
+            &EvalFixtureSelector {
+                fixture_id: Some("deploy-bad-rollout".to_string()),
+                ..EvalFixtureSelector::default()
+            },
+            EvalBudget::default(),
+            TEST_SHA,
+        )
+        .expect("full comparative report should build");
+
+        assert_eq!(report.summary.fixture_count, 1);
+        assert_eq!(report.summary.janus["submission_count"], 1);
+        assert_eq!(report.summary.raw["submission_count"], 1);
+
+        let scenario = &report.scenarios[0];
+        assert_eq!(
+            janus_submission(scenario).access_path(),
+            EvalAccessPath::Janus
+        );
+        assert_eq!(raw_submission(scenario).access_path(), EvalAccessPath::Raw);
+    }
+
+    #[test]
+    fn raw_submission_is_deterministic_budgeted_and_source_backed() {
+        let corpus = test_corpus();
+        let case = case_by_id(&corpus, "coincidental-deploy-trap");
+        let budget = EvalBudget {
+            max_items: 4,
+            max_tokens: 900,
+        };
+
+        let first =
+            run_raw_eval_submission(case, budget.clone()).expect("raw submission should build");
+        let second = run_raw_eval_submission(case, budget.clone())
+            .expect("raw submission should be deterministic");
+        let envelope = raw_envelope(&first);
+
+        assert_eq!(first, second);
+        assert_eq!(first.access_path(), EvalAccessPath::Raw);
+        assert_eq!(first.budget(), &budget);
+        assert!(first.measured_tokens() <= budget.max_tokens);
+        assert!(envelope.records.len() <= budget.max_items as usize);
+        assert!(!first.candidate_entities().is_empty());
+        assert!(!first.evidence_refs().is_empty());
+        assert!(first.evidence_refs().iter().all(|source_ref| {
+            matches!(
+                source_ref.signal.as_str(),
+                "change" | "log" | "trace" | "metric" | "telemetry_gap"
+            )
+        }));
+    }
+
+    #[test]
+    fn raw_submission_ignores_expected_and_ground_truth() {
+        let corpus = test_corpus();
+        let case = case_by_id(&corpus, "deploy-bad-rollout");
+        let mut poisoned = case.clone();
+        poisoned.manifest.ground_truth = json!({
+            "primary_cause_entity": "service:poison",
+            "not_the_cause": ["service:checkout"]
+        });
+        poisoned.expected = json!({
+            "evidence_bundle": {
+                "items": [
+                    {
+                        "id": "ev-poison",
+                        "entities": ["service:poison"]
+                    }
+                ]
+            }
+        });
+
+        let original = run_raw_eval_submission(case, EvalBudget::default())
+            .expect("raw submission should build");
+        let poisoned = run_raw_eval_submission(&poisoned, EvalBudget::default())
+            .expect("poisoned oracle fields should not affect raw submission");
+
+        assert_eq!(original.serialized_context(), poisoned.serialized_context());
+        assert_eq!(original.candidate_entities(), poisoned.candidate_entities());
+    }
+
+    #[test]
+    fn raw_submission_surfaces_telemetry_gaps_as_missing_data_refs() {
+        let corpus = test_corpus();
+        let case = case_by_id(&corpus, "missing-data-gap");
+
+        let submission = run_raw_eval_submission(
+            case,
+            EvalBudget {
+                max_items: 6,
+                max_tokens: 1_200,
+            },
+        )
+        .expect("raw submission should build");
+
+        assert!(
+            !submission.missing_data_refs().is_empty(),
+            "raw telemetry gaps should be normalized as missing-data refs"
         );
     }
 
@@ -1019,5 +2191,21 @@ mod tests {
                 .expect("scenario should include a Janus submission"),
         )
         .expect("Janus submission should deserialize")
+    }
+
+    fn raw_submission(scenario: &ScenarioEvalReport) -> EvalSubmission {
+        serde_json::from_value(
+            scenario
+                .raw
+                .get("submission")
+                .cloned()
+                .expect("scenario should include a raw submission"),
+        )
+        .expect("raw submission should deserialize")
+    }
+
+    fn raw_envelope(submission: &EvalSubmission) -> RawContextEnvelope {
+        serde_json::from_value(submission.serialized_context().clone())
+            .expect("raw context should deserialize")
     }
 }
