@@ -1,5 +1,6 @@
 use janus::comparative_eval::{
     EvalBudget, EvalFixtureSelector, format_text_report, load_comparative_eval_report,
+    regression_gate_failure_message,
 };
 use std::{
     env, fs,
@@ -27,6 +28,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut format = OutputFormat::Text;
     let mut output = PathBuf::from("target/eval/comparative-eval-v1.json");
     let mut all = false;
+    let mut fail_on_regression = false;
     let mut index = 0;
 
     while index < args.len() {
@@ -74,6 +76,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 output = PathBuf::from(required_value(&args, index, "--output")?);
                 index += 2;
             }
+            "--fail-on-regression" => {
+                fail_on_regression = true;
+                index += 1;
+            }
             "-h" | "--help" => {
                 print_usage();
                 return Ok(());
@@ -103,6 +109,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     match format {
         OutputFormat::Json => println!("{json}"),
         OutputFormat::Text => print!("{}", format_text_report(&report)),
+    }
+
+    if fail_on_regression && let Some(message) = regression_gate_failure_message(&report) {
+        return Err(message.into());
     }
 
     Ok(())
@@ -172,6 +182,6 @@ fn print_usage() {
          [--capability <tag>] [--failure-class <class>] \
          [--difficulty <baseline|hard>] [--trap <true|false>] \
          [--max-items <n>] [--max-tokens <n>] [--format json|text] \
-         [--output <path>]"
+         [--output <path>] [--fail-on-regression]"
     );
 }

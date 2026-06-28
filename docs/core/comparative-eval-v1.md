@@ -481,7 +481,9 @@ Suggested JSON shape:
     "janus": {},
     "raw": {},
     "delta": {},
-    "false_causality_traps": {}
+    "false_causality_traps": {},
+    "missing_data": {},
+    "regression_gates": {}
   },
   "scenarios": [
     {
@@ -539,6 +541,21 @@ Useful flags:
 --output <path>           write JSON report
 --fail-on-regression      non-zero exit when Janus is worse on required metrics
 ```
+
+For V1, `--fail-on-regression` should gate on aggregate and subgroup health
+rather than requiring Janus to win every fixture. The command should fail when:
+
+- aggregate required-score delta is negative beyond a small tolerance;
+- false-causality trap fixtures regress as a subgroup or any trap fixture is a
+  raw win;
+- a required metric regresses in aggregate;
+- a non-allowlisted fixture becomes a raw win.
+
+Known raw wins may be allowlisted as expected regressions only when they remain
+visible in the report. The initial expected-regression allowlist is
+`traffic-shift-hotspot` and `missing-data-gap`; both should stay visible in the
+regression-gate summary so they remain pressure to improve Janus rather than
+silent exemptions.
 
 The first implementation can keep argument parsing simple. It should still avoid
 hard-coded fixture ids or hidden defaults that make the report irreproducible.

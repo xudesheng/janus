@@ -21,6 +21,8 @@ use std::{
 pub const COMPARATIVE_EVAL_SCHEMA_VERSION: &str = "comparative-eval/v1";
 pub const DEFAULT_MAX_ITEMS: u32 = 6;
 pub const DEFAULT_MAX_TOKENS: u32 = 1200;
+const REGRESSION_GATE_TOLERANCE: f64 = 0.001;
+const EXPECTED_RAW_WIN_SCENARIOS: [&str; 2] = ["traffic-shift-hotspot", "missing-data-gap"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -198,6 +200,8 @@ pub struct ComparativeEvalSummary {
     pub raw: BTreeMap<String, Value>,
     pub delta: BTreeMap<String, Value>,
     pub false_causality_traps: BTreeMap<String, Value>,
+    pub missing_data: BTreeMap<String, Value>,
+    pub regression_gates: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -270,12 +274,16 @@ struct EvalScoreAccumulator {
     raw: EvalPathScoreTotals,
     delta: EvalScoreDeltaTotals,
     trap_delta: EvalScoreDeltaTotals,
+    missing_data_delta: EvalScoreDeltaTotals,
     janus_scenario_wins: usize,
     raw_scenario_wins: usize,
     scenario_ties: usize,
     trap_janus_wins: usize,
     trap_raw_wins: usize,
     trap_ties: usize,
+    missing_data_janus_wins: usize,
+    missing_data_raw_wins: usize,
+    missing_data_ties: usize,
 }
 
 #[derive(Debug, Default)]
@@ -482,7 +490,11 @@ pub fn build_comparative_eval_report(
         insert_submission(&mut report.raw, &raw_submission)?;
         let comparison = score_scenario(case, &janus_submission, &raw_submission);
         insert_comparison(&mut report.comparison, &comparison)?;
-        score_accumulator.record(report.false_causality_trap, &comparison);
+        score_accumulator.record(
+            report.false_causality_trap,
+            is_missing_data_regression_scenario(case),
+            &comparison,
+        );
         scenarios.push(report);
     }
 
@@ -496,6 +508,13 @@ pub fn build_comparative_eval_report(
         .insert_averages(&mut raw_summary, "avg");
     let delta_summary = score_accumulator.delta_summary();
     let trap_summary = score_accumulator.false_causality_trap_summary();
+    let missing_data_summary = score_accumulator.missing_data_summary();
+    let regression_gates = regression_gate_summary(
+        &delta_summary,
+        &trap_summary,
+        &missing_data_summary,
+        &scenarios,
+    );
 
     Ok(ComparativeEvalReport {
         schema_version: COMPARATIVE_EVAL_SCHEMA_VERSION.to_string(),
@@ -511,6 +530,8 @@ pub fn build_comparative_eval_report(
             raw: raw_summary,
             delta: delta_summary,
             false_causality_traps: trap_summary,
+            missing_data: missing_data_summary,
+            regression_gates,
         },
         scenarios,
     })
@@ -559,6 +580,8 @@ pub fn build_comparative_eval_report_with_janus(
             raw: BTreeMap::new(),
             delta: BTreeMap::new(),
             false_causality_traps: BTreeMap::new(),
+            missing_data: BTreeMap::new(),
+            regression_gates: BTreeMap::new(),
         },
         scenarios,
     })
@@ -589,6 +612,8 @@ fn build_empty_comparative_eval_report(
             raw: BTreeMap::new(),
             delta: BTreeMap::new(),
             false_causality_traps: BTreeMap::new(),
+            missing_data: BTreeMap::new(),
+            regression_gates: BTreeMap::new(),
         },
         scenarios,
     })
@@ -673,6 +698,31 @@ pub fn format_text_report(report: &ComparativeEvalReport) -> String {
             score_value_text(janus_score),
             score_value_text(raw_score),
             score_value_text(delta_score)
+        ));
+    }
+    if let Some(passed) = report
+        .summary
+        .regression_gates
+        .get("passed")
+        .and_then(Value::as_bool)
+    {
+        let expected_count = report
+            .summary
+            .regression_gates
+            .get("expected_raw_winners")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        let unexpected_count = report
+            .summary
+            .regression_gates
+            .get("unexpected_raw_winners")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        output.push_str(&format!(
+            "regression_gates: passed={}, expected_raw_wins={}, unexpected_raw_wins={}\n",
+            passed, expected_count, unexpected_count
         ));
     }
     output.push_str("scenarios:\n");
@@ -801,7 +851,12 @@ fn access_summary(submission_count: usize, measured_tokens: u32) -> BTreeMap<Str
 }
 
 impl EvalScoreAccumulator {
-    fn record(&mut self, false_causality_trap: bool, comparison: &EvalScenarioComparison) {
+    fn record(
+        &mut self,
+        false_causality_trap: bool,
+        missing_data: bool,
+        comparison: &EvalScenarioComparison,
+    ) {
         self.janus.add(&comparison.janus);
         self.raw.add(&comparison.raw);
         self.delta.add(&comparison.delta);
@@ -818,6 +873,15 @@ impl EvalScoreAccumulator {
                 "janus" => self.trap_janus_wins += 1,
                 "raw" => self.trap_raw_wins += 1,
                 _ => self.trap_ties += 1,
+            }
+        }
+
+        if missing_data {
+            self.missing_data_delta.add(&comparison.delta);
+            match comparison.required_winner.as_str() {
+                "janus" => self.missing_data_janus_wins += 1,
+                "raw" => self.missing_data_raw_wins += 1,
+                _ => self.missing_data_ties += 1,
             }
         }
     }
@@ -849,22 +913,214 @@ impl EvalScoreAccumulator {
     }
 
     fn false_causality_trap_summary(&self) -> BTreeMap<String, Value> {
-        let mut summary = self.trap_delta.average_map("avg");
-        summary.insert(
-            "fixture_count".to_string(),
-            Value::from(self.trap_delta.count),
-        );
-        summary.insert(
-            "janus_scenario_wins".to_string(),
-            Value::from(self.trap_janus_wins),
-        );
-        summary.insert(
-            "raw_scenario_wins".to_string(),
-            Value::from(self.trap_raw_wins),
-        );
-        summary.insert("scenario_ties".to_string(), Value::from(self.trap_ties));
-        summary
+        subgroup_summary(
+            &self.trap_delta,
+            self.trap_janus_wins,
+            self.trap_raw_wins,
+            self.trap_ties,
+        )
     }
+
+    fn missing_data_summary(&self) -> BTreeMap<String, Value> {
+        subgroup_summary(
+            &self.missing_data_delta,
+            self.missing_data_janus_wins,
+            self.missing_data_raw_wins,
+            self.missing_data_ties,
+        )
+    }
+}
+
+fn subgroup_summary(
+    delta: &EvalScoreDeltaTotals,
+    janus_wins: usize,
+    raw_wins: usize,
+    ties: usize,
+) -> BTreeMap<String, Value> {
+    let mut summary = delta.average_map("avg");
+    summary.insert("fixture_count".to_string(), Value::from(delta.count));
+    summary.insert("janus_scenario_wins".to_string(), Value::from(janus_wins));
+    summary.insert("raw_scenario_wins".to_string(), Value::from(raw_wins));
+    summary.insert("scenario_ties".to_string(), Value::from(ties));
+    summary
+}
+
+pub fn regression_gate_failure_message(report: &ComparativeEvalReport) -> Option<String> {
+    let gates = evaluate_regression_gates(report);
+    if gates
+        .get("passed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+
+    let failed = gates
+        .get("failed_gates")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    Some(format!(
+        "comparative eval regression gates failed: {failed}"
+    ))
+}
+
+pub fn evaluate_regression_gates(report: &ComparativeEvalReport) -> BTreeMap<String, Value> {
+    regression_gate_summary(
+        &report.summary.delta,
+        &report.summary.false_causality_traps,
+        &report.summary.missing_data,
+        &report.scenarios,
+    )
+}
+
+fn regression_gate_summary(
+    delta_summary: &BTreeMap<String, Value>,
+    trap_summary: &BTreeMap<String, Value>,
+    missing_data_summary: &BTreeMap<String, Value>,
+    scenarios: &[ScenarioEvalReport],
+) -> BTreeMap<String, Value> {
+    let aggregate_required_delta = score_from_map(delta_summary, "avg_required_score");
+    let trap_required_delta = score_from_map(trap_summary, "avg_required_score");
+    let missing_data_required_delta = score_from_map(missing_data_summary, "avg_required_score");
+    let trap_fixture_count = usize_from_map(trap_summary, "fixture_count");
+    let trap_raw_wins = usize_from_map(trap_summary, "raw_scenario_wins");
+    let missing_data_raw_wins = usize_from_map(missing_data_summary, "raw_scenario_wins");
+    let raw_metric_wins = usize_from_map(delta_summary, "raw_required_metric_wins");
+    let observed_raw_winners = raw_winning_scenarios(scenarios);
+    let selected_scenarios = scenarios
+        .iter()
+        .map(|scenario| scenario.id.clone())
+        .collect::<BTreeSet<_>>();
+    let expected_allowlist = EXPECTED_RAW_WIN_SCENARIOS
+        .iter()
+        .map(|scenario| (*scenario).to_string())
+        .collect::<Vec<_>>();
+    let expected_allowlist_set = expected_allowlist.iter().cloned().collect::<BTreeSet<_>>();
+    let expected_raw_winners = observed_raw_winners
+        .iter()
+        .filter(|scenario| expected_allowlist_set.contains(*scenario))
+        .cloned()
+        .collect::<Vec<_>>();
+    let unexpected_raw_winners = observed_raw_winners
+        .iter()
+        .filter(|scenario| !expected_allowlist_set.contains(*scenario))
+        .cloned()
+        .collect::<Vec<_>>();
+    let expected_not_observed = expected_allowlist
+        .iter()
+        .filter(|scenario| {
+            selected_scenarios.contains(*scenario)
+                && !observed_raw_winners
+                    .iter()
+                    .any(|observed| observed == *scenario)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let mut failed_gates = Vec::new();
+    if aggregate_required_delta < -REGRESSION_GATE_TOLERANCE {
+        failed_gates.push("aggregate_required_average".to_string());
+    }
+    if trap_fixture_count > 0
+        && (trap_required_delta < -REGRESSION_GATE_TOLERANCE || trap_raw_wins > 0)
+    {
+        failed_gates.push("false_causality_traps".to_string());
+    }
+    if raw_metric_wins > 0 {
+        failed_gates.push("required_metric_aggregate".to_string());
+    }
+    if !unexpected_raw_winners.is_empty() {
+        failed_gates.push("unexpected_raw_winners".to_string());
+    }
+
+    let mut summary = BTreeMap::new();
+    summary.insert("passed".to_string(), Value::from(failed_gates.is_empty()));
+    summary.insert(
+        "tolerance".to_string(),
+        json_score(REGRESSION_GATE_TOLERANCE),
+    );
+    summary.insert(
+        "aggregate_required_delta".to_string(),
+        json_score(aggregate_required_delta),
+    );
+    summary.insert(
+        "false_causality_trap_required_delta".to_string(),
+        json_score(trap_required_delta),
+    );
+    summary.insert(
+        "false_causality_trap_raw_wins".to_string(),
+        Value::from(trap_raw_wins),
+    );
+    summary.insert(
+        "missing_data_required_delta".to_string(),
+        json_score(missing_data_required_delta),
+    );
+    summary.insert(
+        "missing_data_raw_wins".to_string(),
+        Value::from(missing_data_raw_wins),
+    );
+    summary.insert(
+        "raw_required_metric_wins".to_string(),
+        Value::from(raw_metric_wins),
+    );
+    summary.insert("failed_gates".to_string(), strings_value(&failed_gates));
+    summary.insert(
+        "observed_raw_winners".to_string(),
+        strings_value(&observed_raw_winners),
+    );
+    summary.insert(
+        "expected_raw_win_allowlist".to_string(),
+        strings_value(&expected_allowlist),
+    );
+    summary.insert(
+        "expected_raw_winners".to_string(),
+        strings_value(&expected_raw_winners),
+    );
+    summary.insert(
+        "expected_raw_winners_not_observed".to_string(),
+        strings_value(&expected_not_observed),
+    );
+    summary.insert(
+        "unexpected_raw_winners".to_string(),
+        strings_value(&unexpected_raw_winners),
+    );
+    summary
+}
+
+fn raw_winning_scenarios(scenarios: &[ScenarioEvalReport]) -> Vec<String> {
+    scenarios
+        .iter()
+        .filter(|scenario| {
+            scenario
+                .comparison
+                .get("scores")
+                .and_then(|scores| scores.get("required_winner"))
+                .and_then(Value::as_str)
+                == Some("raw")
+        })
+        .map(|scenario| scenario.id.clone())
+        .collect()
+}
+
+fn score_from_map(values: &BTreeMap<String, Value>, key: &str) -> f64 {
+    values.get(key).and_then(Value::as_f64).unwrap_or(0.0)
+}
+
+fn usize_from_map(values: &BTreeMap<String, Value>, key: &str) -> usize {
+    values
+        .get(key)
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(0)
 }
 
 impl EvalPathScoreTotals {
@@ -1472,6 +1728,11 @@ fn requires_missing_data_awareness(case: &FixtureCase) -> bool {
         || case.input.get("telemetry_gaps").is_some()
         || ground_truth_str(case, "primary_cause_entity") == Some("under-determined")
         || !expected_gap_refs(case).is_empty()
+}
+
+fn is_missing_data_regression_scenario(case: &FixtureCase) -> bool {
+    case.manifest.failure_class == "missing-data"
+        || ground_truth_str(case, "primary_cause_entity") == Some("under-determined")
 }
 
 fn expected_gap_refs(case: &FixtureCase) -> Vec<String> {
@@ -3071,6 +3332,73 @@ mod tests {
     }
 
     #[test]
+    fn full_report_populates_regression_groups_and_allows_expected_raw_wins() {
+        let corpus = test_corpus();
+        let report = build_comparative_eval_report(
+            &corpus,
+            &EvalFixtureSelector::default(),
+            EvalBudget::default(),
+            TEST_SHA,
+        )
+        .expect("full comparative report should build");
+
+        assert_eq!(report.summary.false_causality_traps["fixture_count"], 2);
+        assert_eq!(report.summary.false_causality_traps["raw_scenario_wins"], 0);
+        assert_eq!(report.summary.missing_data["fixture_count"], 1);
+        assert_eq!(report.summary.missing_data["raw_scenario_wins"], 1);
+        assert_eq!(report.summary.regression_gates["passed"], true);
+        assert!(regression_gate_failure_message(&report).is_none());
+        assert_eq!(
+            strings_from_value(&report.summary.regression_gates["expected_raw_winners"]),
+            vec![
+                "traffic-shift-hotspot".to_string(),
+                "missing-data-gap".to_string()
+            ]
+        );
+        assert!(
+            strings_from_value(&report.summary.regression_gates["unexpected_raw_winners"])
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn regression_gate_fails_for_unexpected_raw_winner() {
+        let corpus = test_corpus();
+        let mut report = build_comparative_eval_report(
+            &corpus,
+            &EvalFixtureSelector {
+                fixture_id: Some("deploy-bad-rollout".to_string()),
+                ..EvalFixtureSelector::default()
+            },
+            EvalBudget::default(),
+            TEST_SHA,
+        )
+        .expect("full comparative report should build");
+        let scores = report.scenarios[0]
+            .comparison
+            .get_mut("scores")
+            .and_then(Value::as_object_mut)
+            .expect("scenario scores should be an object");
+        scores.insert(
+            "required_winner".to_string(),
+            Value::String("raw".to_string()),
+        );
+
+        let gates = evaluate_regression_gates(&report);
+
+        assert_eq!(gates["passed"], false);
+        assert_eq!(
+            strings_from_value(&gates["unexpected_raw_winners"]),
+            vec!["deploy-bad-rollout".to_string()]
+        );
+        assert!(
+            regression_gate_failure_message(&report)
+                .expect("unexpected raw winner should fail the gate")
+                .contains("unexpected_raw_winners")
+        );
+    }
+
+    #[test]
     fn janus_eval_query_does_not_hard_require_counter_evidence() {
         let corpus = test_corpus();
         let case = case_by_id(&corpus, "coincidental-deploy-trap");
@@ -3252,6 +3580,20 @@ mod tests {
                 .expect("scenario should include scores"),
         )
         .expect("scenario scores should deserialize")
+    }
+
+    fn strings_from_value(value: &Value) -> Vec<String> {
+        value
+            .as_array()
+            .expect("value should be an array")
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .expect("array item should be a string")
+                    .to_string()
+            })
+            .collect()
     }
 
     fn ground_truth_scored_entities(case: &FixtureCase) -> Vec<String> {
