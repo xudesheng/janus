@@ -75,3 +75,90 @@ Observed results:
 The covered implementation was committed and pushed first as `10bebaf Fix comparative eval counter evidence baseline`; this review document's baseline SHA points to that pre-review-document tree and must remain frozen.
 
 <!-- Reviewer appends below; the Implementor must not edit past this line. -->
+
+## Review (by Claude)
+
+### Direction Verdict
+
+**CONTINUE — F-MAT and F-CAND are fully resolved and the score baseline is now clean and
+defensible; proceed to slice 5.** Implementation round, so milestone progress before local defects.
+This round did exactly what review-5 required: it reverted the compiler-side counter-evidence
+materialization, dropped the hard counter mandate from the eval query without touching the public
+`require_counter_evidence` contract, stopped weakens-only entities from being promoted as causal
+candidates, and re-baselined. I verified each change against the diff and by re-running the eval —
+the contamination is gone, the trap result is genuinely clean, and the remaining raw wins are real
+and honestly surfaced. No new blocking defects.
+
+Next action: **continue** to slice 5 (regression grouping + `--fail-on-regression`).
+
+### Verification of the fixes (judged first)
+
+- **F-MAT — compiler revert is exact.** The `evidence_compiler.rs` diff restores the index to
+  `a6b7b0c` (its pre-slice-4 hash): `push_structural_counter_evidence_candidates` and its call are
+  entirely gone, and `compile_evidence` is back to generate → rank → select with no query-gated
+  injection. The M6 compiler contract is byte-identical to before slice 4, so no
+  `get_evidence_bundle` consumer sees changed behavior. The eval query is now
+  `require_counter_evidence = false`, `min_counter_evidence_items = None`.
+- **F-CAND — weakens-only entities no longer promoted.** `candidate_entities_from_bundle` skips
+  `is_counter_evidence_item` items, while counter refs, audit refs, and timeline hints are still
+  derived from separate passes, so counter-evidence stays auditable without inflating the causal
+  candidate set. Tests assert both the empty-candidate case and the no-hard-requirement query.
+- **Re-baseline reproduced** on baseline `10bebaf` (`cargo fmt --check`, `cargo clippy
+  --all-targets --all-features` clean; 16 `comparative_eval` tests and the full 36-test library
+  suite + integration/doc tests pass):
+  - Aggregate required average Janus `0.877` vs raw `0.828` (Δ `0.049`), wins 10/2.
+  - `coincidental-deploy-trap`: Janus `0.949` vs raw `0.770`, `false_causality_risk = 1.0`,
+    `risk = 0`, `avoid_rank = None`, `counter_evidence_refs = 0`, candidates
+    `[infra:redis-cache, service:search-api, db:catalog-pg]` — the innocent suspect is absent again
+    and there is no fabricated counter material. This is the clean suppression result, exactly as
+    predicted when the redirect was raised.
+  - `traffic-shift-hotspot` raw win is now genuine: `service:orders` sits at candidate rank 3 as a
+    *supported* candidate (`cev = 0`), i.e. a real, modest false-causality weakness in Janus's own
+    ranking, not an injection artifact. Honest.
+
+The numbers dropped slightly from the contaminated 0.890 to 0.877 (the auditability ref-count
+inflation is gone), the two trap fixtures *improved*, and the win/loss structure is unchanged. The
+baseline is now sound to gate on.
+
+### Answers to the round's Review Focus
+
+1. **Yes — F-MAT fully resolved.** No compiler materialization, no eval hard minimum, public
+   `require_counter_evidence` contract untouched (verified by the byte-identical compiler revert).
+2. **Yes — F-CAND fully resolved.** Counter/weakens-only evidence stays auditable but no longer
+   creates promoted causal candidates; asserted by test.
+3. The design policy reads clearly: counter-evidence is scored only when the normal compiled
+   pipeline selects genuine source-backed weakening evidence under budget. Good.
+4. **Yes — the re-baselined scores are now defensible** to build slice 5 on. The wins are genuine
+   (trap suppression, ranking accuracy) and the regressions are real and visible.
+5. **`--fail-on-regression` should gate at the subgroup/aggregate level, not per scenario.** The
+   design explicitly wants raw wins on individual fixtures to stay *visible*, not to be hidden, and
+   wants the trap and missing-data groups reported separately so an aggregate cannot mask them. So
+   gate on: (a) aggregate `required_average` delta ≥ 0; (b) the false-causality-trap subgroup delta
+   ≥ 0 (or each trap fixture remaining a Janus win); and optionally (c) no per-required-metric
+   aggregate regression beyond a small tolerance. Do **not** require Janus to win every scenario —
+   that would fail on the honest raw wins the design says are useful information.
+6. **Declare the persistent raw wins as an explicit, tracked expected-regression allowlist**, not a
+   silent exemption and not a hard fail. `--fail-on-regression` should pass when only allowlisted
+   scenarios regress, but fail when a *new* scenario regresses or a listed one changes character.
+   That keeps regressions honest (design requirement) while not blocking progress on known,
+   accepted gaps — and it creates visible pressure to eventually close `traffic-shift-hotspot` and
+   `missing-data-gap`.
+
+### Observation (non-blocking, for slice 5)
+
+`missing-data-gap` is a raw win (Janus 0.866 vs raw 0.901) even though honest-uncertainty handling
+is supposed to be a Janus strength. Both paths score `false_causality_risk = 1.0`; raw edges ahead
+on auditability (1.0 vs ~0.94). Worth diagnosing in slice 5 whether this is a scoring artifact
+(raw's ref set happens to resolve/cover more) or a genuine Janus gap on a thematically important
+scenario — before it gets locked into the expected-regression allowlist. Not a defect in this
+round; the result is honestly reported.
+
+### Summary
+
+The required redirect is fully and cleanly resolved: compiler reverted byte-for-byte, eval query
+de-mandated without changing public contract semantics, weakens-only candidates excluded, and the
+report re-baselined to genuine numbers (Janus 0.877 vs raw 0.828, both traps clean Janus wins via
+real suppression, raw wins honest). The baseline is defensible for regression gating. Continue to
+slice 5; gate at subgroup/aggregate level with an explicit expected-regression allowlist, and
+diagnose the `missing-data-gap` raw win. Review-7 is expected as the next implementation round,
+since slices 5–6 remain.
