@@ -19,6 +19,12 @@ use std::{
     path::{Component, Path},
 };
 
+pub const REQUIREMENT_RAW_REFS: &str = "raw_refs";
+pub const REQUIREMENT_COUNTER_EVIDENCE: &str = "counter_evidence";
+pub const REQUIREMENT_HOT_CONTEXT_TIME_WINDOW: &str = "hot_context_time_window";
+pub const REQUIREMENT_HOT_CONTEXT_ENTITIES: &str = "hot_context_entities";
+pub const REQUIREMENT_HOT_CONTEXT_TIME_WINDOW_ENTITIES: &str = "hot_context_time_window_entities";
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EvidenceQuery {
@@ -336,7 +342,7 @@ fn map_compile_error(error: EvidenceCompileError) -> GetEvidenceBundleError {
     }
 }
 
-fn default_require_raw_refs() -> bool {
+pub fn default_require_raw_refs() -> bool {
     true
 }
 
@@ -369,7 +375,7 @@ fn ensure_required_raw_refs(
 
     if bundle.items.iter().any(|item| item.source_refs.is_empty()) {
         return Err(GetEvidenceBundleError::UnsatisfiedRequirement {
-            requirement: "raw_refs",
+            requirement: REQUIREMENT_RAW_REFS,
             message: "require_raw_refs was true but at least one item has no source refs"
                 .to_string(),
         });
@@ -400,7 +406,7 @@ fn ensure_required_counter_evidence(
 
     if actual_count < required_count as usize {
         return Err(GetEvidenceBundleError::UnsatisfiedRequirement {
-            requirement: "counter_evidence",
+            requirement: REQUIREMENT_COUNTER_EVIDENCE,
             message: format!(
                 "required at least {required_count} counter-evidence items, found {actual_count}"
             ),
@@ -443,7 +449,7 @@ fn ensure_query_context_selects(
 
     if time_matches.is_empty() {
         return Err(GetEvidenceBundleError::UnsatisfiedRequirement {
-            requirement: "hot_context_time_window",
+            requirement: REQUIREMENT_HOT_CONTEXT_TIME_WINDOW,
             message: "query time window matched no hot-store records".to_string(),
         });
     }
@@ -456,7 +462,7 @@ fn ensure_query_context_selects(
 
         if entity_matches.is_empty() {
             return Err(GetEvidenceBundleError::UnsatisfiedRequirement {
-                requirement: "hot_context_entities",
+                requirement: REQUIREMENT_HOT_CONTEXT_ENTITIES,
                 message: format!(
                     "query entities matched no hot-store records: {:?}",
                     query.entities
@@ -472,7 +478,7 @@ fn ensure_query_context_selects(
 
         if combined_matches.is_empty() {
             return Err(GetEvidenceBundleError::UnsatisfiedRequirement {
-                requirement: "hot_context_time_window_entities",
+                requirement: REQUIREMENT_HOT_CONTEXT_TIME_WINDOW_ENTITIES,
                 message: format!(
                     "query time window and entities matched no shared hot-store records: {:?}",
                     query.entities
