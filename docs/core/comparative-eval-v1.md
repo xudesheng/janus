@@ -90,6 +90,32 @@ Current proposed V1 direction:
 - treat this milestone as an eval harness milestone, not a product-quality claim
   that Janus wins every fixture.
 
+## Approval And Completion Policy
+
+This topic should seek whole-design approval before implementation.
+Phase-by-phase implementation is allowed only if every active reviewer
+explicitly approves a named slice in their `Direction Verdict` and states that
+any unresolved design questions are outside that slice. Without that explicit
+slice approval, no Rust implementation starts.
+
+V1 should distinguish harness correctness from Janus product victory:
+
+- harness correctness is mandatory: both access paths must run under the same
+  budget, gold artifacts must be scoring-only, and the report must show wins
+  and regressions honestly;
+- the proposed milestone success bar is that the first completed run shows
+  Janus improving at least one roadmap target metric without hiding regressions,
+  and without masking false-causality-trap or auditability failures behind an
+  aggregate score;
+- the default CLI should exit non-zero for harness, schema, runtime, or
+  validation failures, not merely because one raw-access scenario beats Janus;
+- `--fail-on-regression` may enforce a stricter required-metric policy for CI,
+  release checks, or a later reviewer-approved completion gate.
+
+Reviewers should explicitly accept this policy or replace it. If reviewers want
+the topic to be "harness only" even when Janus improves no target metric, that
+should be recorded in the review verdict before implementation starts.
+
 ## Scope
 
 In scope:
