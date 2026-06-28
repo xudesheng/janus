@@ -62,3 +62,115 @@ Repository checks performed:
 - The covered formal design change was committed and pushed first as `9da1f1f Clarify comparative eval design gate`; this review document's baseline SHA points to that pre-review-document tree and must remain frozen.
 
 <!-- Reviewer appends below; the Implementor must not edit past this line. -->
+
+## Review (by Claude)
+
+### Direction Verdict
+
+**AGREE — continue, with whole-design approval.** This is a design-discussion round, so
+the gate is agreement, not defect-counting. I agree with the design direction and the
+proposed V1 shape. The covered work is on the critical path: `comparative-eval-v1` is
+roadmap Milestone 8, the correct next topic after `mcp-agent-surface` (M7), and it is the
+roadmap's first direct test of the central Janus bet ("fewer, more accurate, more auditable
+evidence under the same budget"). The design is internally coherent, grounded in the real
+fixtures and the real Evidence IR types, and ready to govern implementation.
+
+Approval scope: **whole design**, slices 1–6 may proceed in their stated order. I am not
+restricting this to a named slice. Two findings below (F1 completion-policy/roadmap, F2
+fixture-version pinning) should be resolved in the formal design or answered in review-1
+**before the scoring slice (4) and reporting slice (5)**; they do not block slice 1 (models
+/report schema) or slices 2–3 (adapters).
+
+Gate caveat: this is one reviewer's agreement. The design's own Design Review Gate requires
+**every active reviewer** to agree before Rust starts. My `continue` does not by itself
+unblock coding — the Implementor must still collect agreement from all other active
+reviewers (and resolve any of their findings) before slice 1.
+
+Next action: **continue.**
+
+### Why I agree (grounded checks)
+
+I verified the design is not hand-wavy:
+
+- **Topic fit / critical path:** roadmap `Milestone 8` is `comparative-eval-v1`, listed #9
+  (last) in the near-term review order after `mcp-agent-surface`. Correct sequencing.
+- **Oracle fields exist:** `coincidental-deploy-trap/scenario.json` carries
+  `false_causality_trap: true`, `ground_truth.primary_cause_entity`, `innocent_suspect`,
+  `not_the_cause`, `blast_radius`, `failure_class`, `difficulty`. `missing-data-gap` carries
+  `primary_cause_entity: "under-determined"` and `inputs: [... "telemetry_gaps"]`. The
+  design's scoring inputs map onto fields that actually exist, including the
+  `under-determined` sentinel the missing-data scoring relies on.
+- **Required fixtures exist:** all five named ids (`deploy-bad-rollout`,
+  `coincidental-deploy-trap`, `retry-storm-amplification`, `ambiguous-entity-resolution`,
+  `missing-data-gap`) are present, plus blast-radius scenarios
+  (`downstream-outage-cascade`, `dependency-db-degradation`). The corpus is 12 fixtures,
+  matching the report example's `fixture_count`.
+- **Janus adapter is buildable:** `EvidenceKind::CounterEvidence`/`MissingData` and
+  `EvidenceDirection::Weakens`/`Contradicts` exist in `src/evidence.rs`; `source_refs` and
+  suspected-cause output exist in the compiler. The planned Evidence IR extraction is real,
+  not aspirational.
+- **Baseline SHA discipline:** baseline `9da1f1f` is the pre-review-document tree; HEAD
+  `4886610` (this review-0 commit) is pushed and tracks `origin/comparative-eval-v1`. The
+  baseline correctly points at the prior tree and is frozen. Good.
+
+On the design's explicit gate questions: deterministic local evaluator (no LLM judge) for
+V1 — **agree** (matches "evaluation before scale"; avoids prompt drift, keeps the harness
+the artifact). Raw baseline fair, not a strawman — **agree** with one refinement (F3).
+Default fails on harness/schema/runtime, `--fail-on-regression` opt-in — **agree**.
+Token cost from serialized payload bytes / 4 (not fixture gold `token_cost`) — **agree**
+with one refinement (F5).
+
+### Findings (refinements, none blocking my agreement)
+
+**F1 — medium — Completion policy must not silently weaken a roadmap acceptance criterion.**
+The roadmap (a formal doc, higher milestone-source precedence than this design doc) already
+commits Milestone 8 acceptance to "Janus improves at least one target metric without hiding
+regressions in others." The design's `Approval And Completion Policy` proposes the same bar
+but adds that reviewers "may" make the topic "harness only" even if Janus improves no metric.
+That option, if taken, would contradict `roadmap.md` and is therefore not a mere verdict note
+— it would require editing the roadmap too. I **accept the proposed policy as written**
+(metric-improvement bar required) precisely because it matches the roadmap. Recommendation:
+keep the metric bar; if any reviewer wants harness-only, treat it as a roadmap change, not a
+review-verdict footnote.
+
+**F2 — medium — Report schema does not yet satisfy "results tied to fixture versions."**
+Roadmap M8 acceptance requires results tied to fixture versions; the report schema records
+`repo_sha` but no per-fixture version. Each `scenario.json` has `version` and
+`schema_version`. The report should pin each scenario's `version` (and the registry
+`schema_version`) so a run is reproducible against fixture versions. Add this to the report
+schema in slice 1 so it is not retrofitted later.
+
+**F3 — low/medium — Constrain raw-baseline "dependency" grouping to directly-present edges.**
+The allowed raw selectors include "simple grouping for records that already share the same
+raw entity, service, route, dependency, or trace id." Grouping by *dependency* is borderline:
+dependency *direction* is exactly the cross-signal reasoning Janus is supposed to win on
+(e.g. `retry-storm-amplification`). Clarify that the baseline may group only on a dependency
+edge **directly present on a raw record** (span parent/child, a db-client call attribute),
+never an inferred or derived edge. Otherwise the baseline can quietly reconstruct Janus's
+relationship graph and the amplification-direction win becomes meaningless.
+
+**F4 — low — Pin required-vs-report-only metrics before the scoring slice.**
+The design lists six dimensions but does not crisply split scored-required from report-only.
+Recommend: suspicious-entity accuracy, false-causality risk, auditability, missing-data
+awareness, and token efficiency are scored/required; timeline quality stays structural and
+**report-only in V1** (exact structural timeline scoring is the fuzziest and most overfit-
+prone). Lock this before slice 4 so the completion bar (F1) has a concrete metric set.
+
+**F5 — low — Use one shared serializer + token estimator for both paths.**
+Comparability of `measured_tokens` depends on both envelopes serializing at the same
+granularity. Have both adapters route through a single shared serialize+estimate helper so
+the measurement cannot drift between paths (e.g. one path including pretty-printing or extra
+envelope fields the other omits).
+
+**F6 — low — Enforce the gold boundary with module visibility, not just a test.**
+The design's rule ("if a helper loads expected artifacts for scoring, the runtime adapters
+should not be able to access that helper") is the right invariant. Make it structural:
+scoring/oracle loading lives in a module the adapter modules cannot import, so the boundary
+is a compile-time fact, with the planned test as a second guard.
+
+### Summary
+
+Design is sound, on critical path, and well-grounded. I agree with the direction and grant
+whole-design approval for slices 1–6. F1 and F2 should land in the design or review-1 before
+the scoring/reporting slices; F3–F6 are refinements for the relevant slices. Coding still
+waits on agreement from every other active reviewer per the design's Review Gate.
