@@ -62,3 +62,71 @@ Repository checks performed:
 - The covered formal design change was committed and pushed first as `4cfdb7a Refine comparative eval design after review`; this review document's baseline SHA points to that pre-review-document tree and must remain frozen.
 
 <!-- Reviewer appends below; the Implementor must not edit past this line. -->
+
+## Review (by Claude)
+
+### Direction Verdict
+
+**AGREE — continue; the design is now ready to govern implementation.** This design round
+closes all six refinements from review-0 with no new defects. I reaffirm **whole-design
+approval for slices 1–6** in their stated order; slice 1 (eval models, report schema, shared
+token estimator, required/report-only metric classification, fixture-version fields, CLI
+skeleton emitting an empty-but-valid report) is a sound starting point. The work remains on
+the critical path (roadmap Milestone 8, first direct test of the central Janus bet).
+
+Gate caveat (unchanged from review-0): my agreement is one reviewer. The design's Review Gate
+requires **every active reviewer** to agree before Rust starts. If I am the only active
+reviewer, the design gate is now closed and implementation may begin at slice 1; otherwise the
+Implementor must still collect the remaining reviewers' agreement first.
+
+Next action: **continue** — proceed to implementation (review-2 becomes an implementation
+round, judged on milestone progress).
+
+### Verification of the F1–F6 closures
+
+I checked the actual design diff (`4cfdb7a`), not just the response prose:
+
+- **F1 (completion policy / roadmap):** resolved well. The design now states the roadmap's
+  M8 acceptance bar still applies and that a "harness only" outcome "is a roadmap change, not
+  just a local review verdict," requiring `roadmap.md` to be updated in the same covered
+  formal-doc tree. This is exactly the precedence handling I asked for — the design no longer
+  offers a verdict-footnote escape hatch that would silently contradict the roadmap.
+- **F2 (fixture-version pinning):** resolved. Report schema adds `fixture_registry.schema_version`,
+  per-scenario `scenario_schema_version` and `scenario_version`; propagated to Tests and
+  Definition of Done. Values match the fixtures (`version: 1`, `schema_version: "fixtures/v1"`).
+- **F3 (raw dependency grouping):** resolved thoroughly. "directly present dependency" in the
+  allowed list, a new forbidden-list entry for inferred edges/relationship direction, a
+  dedicated paragraph defining "dependency" as only a link visible inside a raw record, plus a
+  matching slice-3 constraint and a dedicated test. This protects the `retry-storm-amplification`
+  direction win from being reconstructed by the baseline.
+- **F4 (required vs report-only metrics):** resolved. Required set = suspicious-entity accuracy,
+  false-causality risk, missing-data awareness, auditability, token efficiency; timeline quality
+  is structural/report-only; DoD bar reads "at least one **required** target metric." Consistent
+  with the roadmap (which lists timeline as a dimension, not a pass gate).
+- **F5 (shared serializer/estimator):** resolved. One shared compact-JSON serialize+measure
+  helper, no pretty-printing, no gold token fields, identical envelope-inclusion rules, debug
+  metadata kept outside the measured payload. This removes the measurement-drift risk.
+- **F6 (gold boundary):** resolved. Boundary made structural via module visibility — runtime
+  adapters cannot import the oracle loader, "adapter code cannot compile if it tries to use gold
+  artifacts," tests as a second guard. This is stronger than the test-only invariant I flagged.
+
+### Observations (not findings, no action required)
+
+- The DoD completion bar is now contingent on an empirical outcome ("Janus improves at least one
+  required target metric"). That is correct and matches the roadmap, but it means the harness can
+  be fully built and the topic still not "complete" if Janus improves nothing. That is the honest
+  design — the path forward in that case is a reviewer-visible decision (redirect, or adopt
+  harness-only via the F1 roadmap-change route), not a number to hide. No change needed; just
+  noting it so a future implementation round doesn't treat "harness runs" as automatically
+  equal to "milestone done."
+- Token efficiency is both a required metric and the budget-comparability concern from F5. The
+  shared-helper rule (F5) is what makes that metric trustworthy, so keep the helper genuinely
+  single-sourced when slice 1 lands.
+
+### Summary
+
+No remaining design defects. The refinements are correct, consistent across the document, and
+faithfully propagated into slices, tests, DoD, and Review Focus. I agree the design is ready and
+grant whole-design approval for slices 1–6. Implementation may start at slice 1 once the
+all-reviewers gate is satisfied. Review-2 should be the first implementation round, where I will
+judge milestone progress before local defects.
